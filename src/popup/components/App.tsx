@@ -113,7 +113,8 @@ const App: React.FC = () => {
   };
 
   const handleLeadTimeMsChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPreferences(prev => ({ ...prev, leadTimeMs: parseInt(e.target.value) || 200 }));
+    const value = parseInt(e.target.value);
+    setPreferences(prev => ({ ...prev, leadTimeMs: isNaN(value) ? 200 : value }));
   };
 
   const handleMaxRetriesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -210,7 +211,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="p-4 w-96">
+    <div className="p-4 w-full">
       <h1 className="text-xl font-bold mb-4 text-center text-gray-800">Tock Reservation Filler</h1>
 
       <form onSubmit={handleSubmit} onKeyDown={handleKeyDown}>
@@ -272,14 +273,14 @@ const App: React.FC = () => {
               </label>
               <input
                 type="number"
-                value={preferences.leadTimeMs || 200}
+                value={preferences.leadTimeMs ?? 200}
                 onChange={handleLeadTimeMsChange}
-                min="100"
+                min="0"
                 max="5000"
                 step="100"
                 className="input text-sm"
               />
-              <p className="text-xs text-gray-500 mt-1">How many milliseconds before drop time to search (100-5000)</p>
+              <p className="text-xs text-gray-500 mt-1">How many milliseconds before drop time to search (0-5000)</p>
             </div>
 
             <div>
@@ -332,12 +333,30 @@ const App: React.FC = () => {
                 <p className="text-xs text-blue-600 mt-1">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries}</p>
               </div>
             ) : activeTimer?.status === 'completed' ? (
-              <div className="p-3 bg-green-50 rounded-md">
-                <p className="text-sm font-medium text-green-800">Completed Successfully!</p>
+              <div className="space-y-2">
+                <div className="p-3 bg-green-50 rounded-md">
+                  <p className="text-sm font-medium text-green-800">Completed Successfully!</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancelTimer}
+                  className="btn w-full text-sm"
+                >
+                  Schedule New Timer
+                </button>
               </div>
             ) : activeTimer?.status === 'failed' ? (
-              <div className="p-3 bg-red-50 rounded-md">
-                <p className="text-sm font-medium text-red-800">Failed After {activeTimer.maxRetries} Attempts</p>
+              <div className="space-y-2">
+                <div className="p-3 bg-red-50 rounded-md">
+                  <p className="text-sm font-medium text-red-800">Failed After {activeTimer.maxRetries} Attempts</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancelTimer}
+                  className="btn w-full text-sm"
+                >
+                  Schedule New Timer
+                </button>
               </div>
             ) : (
               <button
