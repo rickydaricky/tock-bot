@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Tock Reservation Form Filler",
+  "version": "1.0.0",
+  "description": "Automatically fill in Tock reservation forms with preferred party size, date, and time",
+  "permissions": ["activeTab", "storage", "alarms"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.exploretock.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+} 
