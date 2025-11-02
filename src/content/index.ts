@@ -1,7 +1,11 @@
-import { Message, TockPreferences } from '../types';
+import { Message, TockPreferences, Platform } from '../types';
 import { TockFormFiller } from './form-filler';
+import { OpenTableFormFiller } from './opentable-form-filler';
+import { detectPlatform, getPlatformDisplayName } from '../utils/platform';
 
-console.log('Tock Form Filler Content Script Loaded');
+// Detect which platform we're on
+const currentPlatform = detectPlatform(window.location.href);
+console.log(`Form Filler Content Script Loaded - Platform: ${currentPlatform ? getPlatformDisplayName(currentPlatform) : 'Unknown'}`);
 
 // Listen for messages from the popup and background script
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
@@ -37,14 +41,39 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
   }
 });
 
-// Handle form filling
+// Handle form filling with platform-specific form filler
 const handleFormFill = async (preferences: TockPreferences): Promise<boolean> => {
   try {
-    const formFiller = new TockFormFiller({
-      preferences,
-      waitForForm: true,
-      autoSubmit: true,
-    });
+    if (!currentPlatform) {
+      console.error('Unable to determine platform from URL');
+      return false;
+    }
+
+    let formFiller: TockFormFiller | OpenTableFormFiller;
+
+    switch (currentPlatform) {
+      case 'tock':
+        console.log('Using Tock form filler');
+        formFiller = new TockFormFiller({
+          preferences,
+          waitForForm: true,
+          autoSubmit: true, // Auto-click search and book buttons
+        });
+        break;
+
+      case 'opentable':
+        console.log('Using OpenTable form filler');
+        formFiller = new OpenTableFormFiller({
+          preferences,
+          waitForForm: true,
+          autoSubmit: true, // Auto-click first available time slot
+        });
+        break;
+
+      default:
+        console.error(`Unknown platform: ${currentPlatform}`);
+        return false;
+    }
 
     return await formFiller.fill();
   } catch (error) {

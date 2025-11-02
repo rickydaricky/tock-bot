@@ -1,3 +1,5 @@
+export type Platform = 'tock' | 'opentable';
+
 export interface TockPreferences {
   partySize: number;
   date: string; // Format: YYYY-MM-DD
