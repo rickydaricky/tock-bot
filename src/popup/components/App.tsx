@@ -2,9 +2,10 @@ import React, { useEffect, useState } from 'react';
 import PartySize from './PartySize';
 import DatePicker from './DatePicker';
 import TimePicker from './TimePicker';
-import { TockPreferences, ActiveTimer } from '../../types';
+import { TockPreferences, ActiveTimer, Platform } from '../../types';
 import { loadPreferences, savePreferences } from '../../utils/storage';
 import { sendFillFormMessage, sendCancelTimerMessage, sendGetTimerStatusMessage } from '../../utils/messaging';
+import { detectPlatform, getPlatformDisplayName } from '../../utils/platform';
 
 const App: React.FC = () => {
   const [preferences, setPreferences] = useState<TockPreferences>({
@@ -21,16 +22,27 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [activeTimer, setActiveTimer] = useState<ActiveTimer | null>(null);
   const [countdown, setCountdown] = useState<string>('');
+  const [platform, setPlatform] = useState<Platform | null>(null);
 
-  // Load saved preferences and timer status on mount
+  // Load saved preferences, timer status, and detect platform on mount
   useEffect(() => {
     const fetchData = async () => {
       try {
+        // Load preferences
         const savedPreferences = await loadPreferences();
         setPreferences(savedPreferences);
 
+        // Get timer status
         const timerStatus = await sendGetTimerStatusMessage();
         setActiveTimer(timerStatus);
+
+        // Detect platform from active tab URL
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const currentTab = tabs[0];
+        if (currentTab?.url) {
+          const detectedPlatform = detectPlatform(currentTab.url);
+          setPlatform(detectedPlatform);
+        }
       } catch (error) {
         console.error('Error loading data:', error);
         setStatus('Error loading saved preferences');
@@ -210,9 +222,13 @@ const App: React.FC = () => {
     }
   };
 
+  const pageTitle = platform
+    ? `${getPlatformDisplayName(platform)} Reservation Filler`
+    : 'Reservation Filler';
+
   return (
     <div className="p-4 w-full">
-      <h1 className="text-xl font-bold mb-4 text-center text-gray-800">Tock Reservation Filler</h1>
+      <h1 className="text-xl font-bold mb-4 text-center text-gray-800">{pageTitle}</h1>
 
       <form onSubmit={handleSubmit} onKeyDown={handleKeyDown}>
         <PartySize value={preferences.partySize} onChange={handlePartySizeChange} />

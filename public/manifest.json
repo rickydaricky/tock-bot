@@ -1,15 +1,34 @@
 {
   "manifest_version": 3,
-  "name": "Tock Reservation Form Filler",
+  "name": "Tock & OpenTable Reservation Form Filler",
   "version": "1.0.0",
-  "description": "Automatically fill in Tock reservation forms with preferred party size, date, and time",
+  "description": "Automatically fill in Tock and OpenTable reservation forms with preferred party size, date, and time",
   "permissions": ["activeTab", "storage", "alarms"],
   "action": {
     "default_popup": "popup.html"
   },
   "content_scripts": [
     {
-      "matches": ["*://*.exploretock.com/*"],
+      "matches": [
+        "*://*.exploretock.com/*",
+        "*://*.opentable.com/*",
+        "*://*.opentable.co.uk/*",
+        "*://*.opentable.ca/*",
+        "*://*.opentable.jp/*",
+        "*://*.opentable.de/*",
+        "*://*.opentable.es/*",
+        "*://*.opentable.fr/*",
+        "*://*.opentable.it/*",
+        "*://*.opentable.nl/*",
+        "*://*.opentable.com.au/*",
+        "*://*.opentable.com.mx/*",
+        "*://*.opentable.ie/*",
+        "*://*.opentable.sg/*",
+        "*://*.opentable.hk/*",
+        "*://*.opentable.ae/*",
+        "*://*.opentable.co.th/*",
+        "*://*.opentable.com.tw/*"
+      ],
       "js": ["content.js"]
     }
   ],
