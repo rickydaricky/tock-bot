@@ -2,6 +2,8 @@
 import { Message, TockPreferences, ActiveTimer } from '../types';
 import { DEFAULT_PREFERENCES, saveActiveTimer, loadActiveTimer, clearActiveTimer, loadPreferences } from '../utils/storage';
 import { sendAutoFillFormMessage } from '../utils/messaging';
+import { detectPlatform } from '../utils/platform';
+import { buildTockSearchUrl } from '../utils/url-builder';
 
 console.log('Tock Form Filler Background Script Loaded');
 
@@ -57,6 +59,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 // Handle alarm trigger - execute the form filling
 async function handleAlarmTrigger(alarmName: string) {
+  const alarmFireTime = Date.now();
+  console.log(`⏰ [TIMING] Alarm fired at: ${new Date(alarmFireTime).toISOString()}`);
+  
   const activeTimer = await loadActiveTimer();
 
   if (!activeTimer || activeTimer.alarmName !== alarmName) {
@@ -71,6 +76,12 @@ async function handleAlarmTrigger(alarmName: string) {
   try {
     // Get preferences
     const preferences = await loadPreferences();
+    
+    // Add alarm fire time to preferences for timing measurement
+    preferences.alarmFireTime = alarmFireTime;
+
+    const backgroundProcessingTime = Date.now();
+    console.log(`⏰ [TIMING] Background processing complete (delta: ${(backgroundProcessingTime - alarmFireTime).toFixed(2)}ms)`);
 
     // Attempt to fill the form on the target tab
     if (activeTimer.tabId) {
@@ -97,9 +108,49 @@ async function handleAlarmTrigger(alarmName: string) {
   }
 }
 
+// Wait for a tab to finish reloading
+async function waitForTabReload(tabId: number): Promise<void> {
+  return new Promise((resolve) => {
+    const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(listener);
+        // Add a small buffer delay for stability
+        setTimeout(() => resolve(), 150);
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
 // Attempt to fill the form on a specific tab
 async function attemptFormFill(tabId: number, preferences: TockPreferences): Promise<{ success: boolean }> {
   try {
+    // Get the tab to check its URL
+    const tab = await chrome.tabs.get(tabId);
+
+    if (!tab.url) {
+      console.error('Tab URL not available');
+      return { success: false };
+    }
+
+    // Check if this is a Tock page
+    const platform = detectPlatform(tab.url);
+
+    if (platform === 'tock') {
+      console.log('🔄 Tock platform detected - refreshing page to fetch fresh availability data');
+      const refreshStartTime = Date.now();
+
+      // Refresh the page to get fresh data from server
+      await chrome.tabs.reload(tabId);
+
+      // Wait for the page to finish reloading
+      await waitForTabReload(tabId);
+
+      const refreshEndTime = Date.now();
+      console.log(`⏰ [TIMING] Page refresh completed (delta: ${refreshEndTime - refreshStartTime}ms)`);
+    }
+
+    // Now send the auto-fill message
     const result = await sendAutoFillFormMessage(preferences, tabId);
     return result;
   } catch (error) {
@@ -183,6 +234,29 @@ async function scheduleTimer(preferences: TockPreferences, tabId: number): Promi
 
   await saveActiveTimer(timer);
   console.log('Timer scheduled:', timer);
+
+  // For Tock: Navigate to search URL immediately so page is ready for refresh
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.url) {
+      const platform = detectPlatform(tab.url);
+
+      if (platform === 'tock') {
+        const searchUrl = buildTockSearchUrl(tab.url, preferences);
+
+        if (searchUrl) {
+          console.log('🔗 Navigating to Tock search URL:', searchUrl);
+          await chrome.tabs.update(tabId, { url: searchUrl });
+        } else {
+          console.warn('Failed to build Tock search URL, will use form filling approach');
+        }
+      }
+      // For OpenTable: Do nothing, keep current behavior
+    }
+  } catch (error) {
+    console.error('Error navigating to search URL:', error);
+    // Continue anyway - form filler will handle it
+  }
 
   return timer;
 }

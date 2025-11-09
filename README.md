@@ -9,6 +9,8 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 - **Intelligent Time Matching**: Selects the time slot that matches (or is closest to) your preferred time
 - **One-Click Submission**: Fills and submits the form with a single click
 - **Scheduled Automation**: Set a drop time to automatically search and book reservations at a specific time
+- **Optimized for Tock**: Direct URL navigation approach for ultra-fast execution (~1-2 seconds faster than form filling)
+- **Fresh Data Guarantee**: Page refresh ensures you're always working with the latest availability from the server
 - **Persistent Preferences**: Saves your settings for future use
 - **Dynamic UI**: Extension popup title adapts based on whether you're on Tock or OpenTable
 
@@ -55,12 +57,14 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 3. Check "Enable Automatic Search"
 4. Set your preferences:
    - **Reservation Drop Time**: The exact time when reservations open (in your local timezone)
-   - **Search Before Drop**: How many milliseconds before the drop time to start searching (default: 200ms)
-   - **Maximum Retry Attempts**: How many times to retry if the first attempt fails
+   - **Search Before Drop**: How many milliseconds before the drop time to start searching (default: 0ms - refreshes exactly at drop time)
+   - **Maximum Retry Attempts**: How many times to retry if the first attempt fails (default: 0 - optimized for single-shot speed)
    - **Retry Interval**: How long to wait between retry attempts (in seconds)
 5. Click "Schedule Timer"
-6. The extension will automatically fill and submit the form at the specified time
+6. The extension will automatically prepare and execute the booking at the specified time
 7. You can monitor the countdown and cancel the timer if needed
+
+**Tock-Specific Behavior**: When scheduling a timer on Tock, the extension immediately navigates to the search results page with your preferences in the URL. When the drop time arrives, it refreshes the page to load fresh availability data and clicks the "Book" button. This is significantly faster (~1-2 seconds) than form filling.
 
 ### Supported Platforms
 
@@ -82,7 +86,11 @@ A Chrome extension that automatically fills in and submits reservation forms on 
     - `opentable-form-filler.ts` - OpenTable form filling implementation
     - `index.ts` - Platform detection and routing
   - `background/` - Background service worker for scheduled automation
-  - `utils/` - Utility functions including platform detection and storage
+  - `utils/` - Utility functions including:
+    - `platform.ts` - Platform detection
+    - `storage.ts` - Chrome storage helpers
+    - `messaging.ts` - Message passing utilities
+    - `url-builder.ts` - Tock search URL construction and detection
   - `types/` - TypeScript type definitions
 
 ## Technologies Used
@@ -99,9 +107,25 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 The extension automatically detects whether you're on a Tock or OpenTable page by analyzing the URL and routes to the appropriate form filler implementation.
 
 ### Tock Implementation
+
+**Manual Mode:**
 - Uses direct DOM manipulation to fill form fields
 - Interacts with custom Tock UI components
 - Auto-clicks the search and book buttons
+
+**Automatic Mode (Optimized for Speed):**
+- Immediately navigates to the search URL when timer is scheduled
+  - Example: `https://www.exploretock.com/restaurant-name/search?date=2025-11-07&size=2&time=20%3A00`
+- Tab waits at the search page until drop time
+- At drop time, refreshes the page to fetch fresh availability data from the server
+- Skips all form filling and goes straight to clicking the "Book" button
+- This approach is ~1-2 seconds faster because:
+  - No form element waiting
+  - No form filling steps
+  - No search button navigation delay
+  - Direct refresh loads latest availability from Tock's servers
+
+**Why the refresh is necessary:** Tock uses client-side routing (SPA), so the search button doesn't make a fresh server request. Without a page refresh, the script would work with stale cached data loaded before the reservation drop.
 
 ### OpenTable Implementation
 - Finds hidden `<select>` elements for party size, date, and time

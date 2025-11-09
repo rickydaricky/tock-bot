@@ -7,8 +7,8 @@ export const DEFAULT_PREFERENCES: TockPreferences = {
   time: '12:00', // Default to noon
   autoSearchEnabled: false,
   dropTime: undefined,
-  leadTimeMs: 200, // 200ms before drop time
-  maxRetries: 10,
+  leadTimeMs: 0, // Refresh exactly at drop time (not before, to ensure fresh data)
+  maxRetries: 0, // No retries by default (optimized for speed)
   retryIntervalSeconds: 1,
 };
 

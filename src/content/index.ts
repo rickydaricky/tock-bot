@@ -28,6 +28,12 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
   // Handle automatic form fill triggered by background script timer
   if (message.type === 'AUTO_FILL_FORM') {
     const preferences = message.payload as TockPreferences;
+    const messageReceivedTime = Date.now();
+    
+    if (preferences.alarmFireTime) {
+      console.log(`⏰ [TIMING] Content script received message (delta from alarm: ${(messageReceivedTime - preferences.alarmFireTime).toFixed(2)}ms)`);
+    }
+    
     handleFormFill(preferences)
       .then((success) => {
         sendResponse({ success });

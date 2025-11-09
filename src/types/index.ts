@@ -10,6 +10,8 @@ export interface TockPreferences {
   leadTimeMs?: number; // Milliseconds before drop time to search
   maxRetries?: number;
   retryIntervalSeconds?: number;
+  // Timing measurement
+  alarmFireTime?: number; // Timestamp when alarm fired (for performance measurement)
 }
 
 export interface Message {

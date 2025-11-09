@@ -1,4 +1,5 @@
 import { FormElements, FormFillerOptions, TockPreferences } from '../types';
+import { isTockSearchUrl } from '../utils/url-builder';
 
 export class TockFormFiller {
   private preferences: TockPreferences;
@@ -19,8 +20,40 @@ export class TockFormFiller {
    */
   public async fill(): Promise<boolean> {
     try {
+      const fillStartTime = Date.now();
+
+      if (this.preferences.alarmFireTime) {
+        console.log(`⏰ [TIMING] Form filling started (delta from alarm: ${(fillStartTime - this.preferences.alarmFireTime).toFixed(2)}ms)`);
+      }
+
       console.log(`Starting form fill with preferences:`, this.preferences);
-      
+
+      // Check if we're already on the search results page
+      const currentUrl = window.location.href;
+      const isSearchPage = isTockSearchUrl(currentUrl);
+
+      if (isSearchPage) {
+        console.log('🎯 Already on Tock search page - skipping form fill, going straight to booking');
+
+        if (this.autoSubmit) {
+          // Wait for and click book button if available
+          console.log('Looking for book button...');
+          const bookButtonClicked = await this.waitForAndClickBookButton();
+          if (bookButtonClicked) {
+            console.log('Successfully clicked the book button!');
+            return true;
+          } else {
+            console.log('Could not find or click the book button.');
+            return false;
+          }
+        }
+
+        return true;
+      }
+
+      // Not on search page - use normal form filling flow
+      console.log('On restaurant page - using form filling approach');
+
       // If set to wait for form, keep trying to find it
       if (this.waitForForm) {
         const formElements = await this.waitForFormElements();
@@ -123,23 +156,48 @@ export class TockFormFiller {
     try {
       // Set party size
       if (elements.partySize) {
+        const partySizeStart = Date.now();
         await this.setPartySize(elements.partySize, this.preferences.partySize);
+        const partySizeEnd = Date.now();
+        
+        if (this.preferences.alarmFireTime) {
+          console.log(`⏰ [TIMING] Party size set (took: ${(partySizeEnd - partySizeStart).toFixed(2)}ms, total delta: ${(partySizeEnd - this.preferences.alarmFireTime).toFixed(2)}ms)`);
+        }
       }
 
       // Set date
       if (elements.dateButton) {
         this.dateButtonRef = elements.dateButton; // Store reference for later use
+        const dateStart = Date.now();
         await this.setDate(elements.dateButton, this.preferences.date);
+        const dateEnd = Date.now();
+        
+        if (this.preferences.alarmFireTime) {
+          console.log(`⏰ [TIMING] Date set (took: ${(dateEnd - dateStart).toFixed(2)}ms, total delta: ${(dateEnd - this.preferences.alarmFireTime).toFixed(2)}ms)`);
+        }
       }
 
       // Set time
       if (elements.timeSelect) {
+        const timeStart = Date.now();
         await this.setTime(elements.timeSelect, this.preferences.time);
+        const timeEnd = Date.now();
+        
+        if (this.preferences.alarmFireTime) {
+          console.log(`⏰ [TIMING] Time set (took: ${(timeEnd - timeStart).toFixed(2)}ms, total delta: ${(timeEnd - this.preferences.alarmFireTime).toFixed(2)}ms)`);
+        }
       }
 
       // Click search button if autoSubmit is true
       if (this.autoSubmit && elements.searchButton) {
+        const searchClickTime = Date.now();
         console.log('Clicking search button...');
+        
+        if (this.preferences.alarmFireTime) {
+          console.log(`⏰ [TIMING] ✨ SEARCH BUTTON CLICKED at: ${new Date(searchClickTime).toISOString()}`);
+          console.log(`⏰ [TIMING] ⚡ TOTAL DELAY FROM ALARM TO SEARCH CLICK: ${(searchClickTime - this.preferences.alarmFireTime).toFixed(2)}ms`);
+        }
+        
         elements.searchButton.click();
         
         // Small delay to allow the page to start loading the search results
