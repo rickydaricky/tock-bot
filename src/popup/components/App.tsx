@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import PartySize from './PartySize';
 import DatePicker from './DatePicker';
+import DateSelectionCalendar from './DateSelectionCalendar';
 import TimePicker from './TimePicker';
 import { TockPreferences, ActiveTimer, Platform } from '../../types';
 import { loadPreferences, savePreferences } from '../../utils/storage';
@@ -12,10 +13,14 @@ const App: React.FC = () => {
     partySize: 2,
     date: new Date().toISOString().split('T')[0],
     time: '19:00',
+    useFirstAvailableAfter: false,
+    dateSelectionMode: 'range',
+    maxDaysToScan: 7,
+    selectedDates: [],
     autoSearchEnabled: false,
     dropTime: undefined,
     leadTimeMs: 200,
-    maxRetries: 10,
+    maxRetries: 0,
     retryIntervalSeconds: 1,
   });
   const [status, setStatus] = useState<string>('');
@@ -116,6 +121,28 @@ const App: React.FC = () => {
     setPreferences(prev => ({ ...prev, time: value }));
   };
 
+  const handleUseFirstAvailableAfterChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setPreferences(prev => ({ ...prev, useFirstAvailableAfter: e.target.checked }));
+  };
+
+  const handleMaxDaysToScanChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseInt(e.target.value);
+    setPreferences(prev => ({ ...prev, maxDaysToScan: isNaN(value) ? 7 : value }));
+  };
+
+  const handleSelectedDatesChange = (dates: string[]) => {
+    setPreferences(prev => ({ ...prev, selectedDates: dates }));
+  };
+
+  const handleDateSelectionModeChange = (mode: 'range' | 'specific') => {
+    setPreferences(prev => ({
+      ...prev,
+      dateSelectionMode: mode,
+      // Clear the data from the non-active mode
+      ...(mode === 'range' ? { selectedDates: [] } : { maxDaysToScan: 7 })
+    }));
+  };
+
   const handleAutoSearchEnabledChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setPreferences(prev => ({ ...prev, autoSearchEnabled: e.target.checked }));
   };
@@ -130,7 +157,8 @@ const App: React.FC = () => {
   };
 
   const handleMaxRetriesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPreferences(prev => ({ ...prev, maxRetries: parseInt(e.target.value) || 10 }));
+    const value = parseInt(e.target.value);
+    setPreferences(prev => ({ ...prev, maxRetries: isNaN(value) ? 0 : value }));
   };
 
   const handleRetryIntervalChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -233,6 +261,93 @@ const App: React.FC = () => {
       <form onSubmit={handleSubmit} onKeyDown={handleKeyDown}>
         <PartySize value={preferences.partySize} onChange={handlePartySizeChange} />
         <DatePicker value={preferences.date} onChange={handleDateChange} />
+
+        <div className="mb-4">
+          <label className="flex items-center cursor-pointer">
+            <input
+              type="checkbox"
+              checked={preferences.useFirstAvailableAfter || false}
+              onChange={handleUseFirstAvailableAfterChange}
+              className="mr-2 h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+            />
+            <span className="text-sm font-medium text-gray-700">Use first available date</span>
+          </label>
+
+          {preferences.useFirstAvailableAfter && (
+            <p className="text-xs text-amber-600 mt-2 ml-6 p-2 bg-amber-50 border border-amber-200 rounded">
+              Note: Fallback dates only work for months at or after the primary date's month. Navigating to earlier months is not yet supported.
+            </p>
+          )}
+
+          {preferences.useFirstAvailableAfter && (
+            <div className="mt-2 ml-6 space-y-3">
+              {/* Mode toggle */}
+              <div className="flex gap-2 mb-3">
+                <button
+                  type="button"
+                  onClick={() => handleDateSelectionModeChange('range')}
+                  className={`flex-1 px-3 py-2 text-xs font-medium rounded border transition-colors ${
+                    preferences.dateSelectionMode === 'range'
+                      ? 'bg-blue-500 text-white border-blue-600'
+                      : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                  }`}
+                >
+                  Date Range
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleDateSelectionModeChange('specific')}
+                  className={`flex-1 px-3 py-2 text-xs font-medium rounded border transition-colors ${
+                    preferences.dateSelectionMode === 'specific'
+                      ? 'bg-blue-500 text-white border-blue-600'
+                      : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                  }`}
+                >
+                  Specific Dates
+                </button>
+              </div>
+
+              {/* Range mode */}
+              {preferences.dateSelectionMode === 'range' && (
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">
+                    Days to scan before/after primary
+                  </label>
+                  <input
+                    type="number"
+                    value={preferences.maxDaysToScan ?? 7}
+                    onChange={handleMaxDaysToScanChange}
+                    min="0"
+                    max="30"
+                    className="input text-sm w-20"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    {preferences.maxDaysToScan === 0
+                      ? 'Only checks primary date'
+                      : `Scans ±${preferences.maxDaysToScan ?? 7} days from primary date`}
+                  </p>
+                </div>
+              )}
+
+              {/* Specific dates mode */}
+              {preferences.dateSelectionMode === 'specific' && (
+                <div>
+                  <DateSelectionCalendar
+                    primaryDate={preferences.date}
+                    selectedDates={preferences.selectedDates || []}
+                    onSelectedDatesChange={handleSelectedDatesChange}
+                  />
+                  <p className="text-xs text-gray-500 mt-2">
+                    {(preferences.selectedDates && preferences.selectedDates.length > 0)
+                      ? `Will check ${preferences.selectedDates.length} selected ${preferences.selectedDates.length === 1 ? 'date' : 'dates'}`
+                      : 'Select dates to check for availability'}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
         <TimePicker value={preferences.time} onChange={handleTimeChange} />
 
         <button
@@ -274,13 +389,33 @@ const App: React.FC = () => {
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 Reservation Drop Time (Local Time)
               </label>
-              <input
-                type="datetime-local"
-                value={preferences.dropTime || ''}
-                onChange={handleDropTimeChange}
-                className="input text-sm"
-                step="1"
-              />
+              <div className="flex gap-2">
+                <input
+                  type="datetime-local"
+                  value={preferences.dropTime || ''}
+                  onChange={handleDropTimeChange}
+                  className="input text-sm flex-1"
+                  step="1"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const now = new Date();
+                    const year = now.getFullYear();
+                    const month = String(now.getMonth() + 1).padStart(2, '0');
+                    const day = String(now.getDate()).padStart(2, '0');
+                    const hours = String(now.getHours()).padStart(2, '0');
+                    const minutes = String(now.getMinutes()).padStart(2, '0');
+                    const seconds = String(now.getSeconds()).padStart(2, '0');
+                    const formattedNow = `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+                    setPreferences(prev => ({ ...prev, dropTime: formattedNow }));
+                  }}
+                  className="px-3 py-1 text-xs font-medium text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded border border-blue-300 hover:border-blue-400 transition-colors whitespace-nowrap"
+                  aria-label="Set drop time to right now"
+                >
+                  Right Now
+                </button>
+              </div>
             </div>
 
             <div>
@@ -305,9 +440,9 @@ const App: React.FC = () => {
               </label>
               <input
                 type="number"
-                value={preferences.maxRetries || 10}
+                value={preferences.maxRetries ?? 0}
                 onChange={handleMaxRetriesChange}
-                min="1"
+                min="0"
                 max="100"
                 className="input text-sm"
               />
@@ -355,7 +490,7 @@ const App: React.FC = () => {
                 </div>
                 <button
                   type="button"
-                  onClick={handleCancelTimer}
+                  onClick={handleScheduleTimer}
                   className="btn w-full text-sm"
                 >
                   Schedule New Timer

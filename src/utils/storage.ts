@@ -5,6 +5,9 @@ export const DEFAULT_PREFERENCES: TockPreferences = {
   partySize: 2,
   date: new Date().toISOString().split('T')[0], // Today's date in YYYY-MM-DD format
   time: '12:00', // Default to noon
+  useFirstAvailableAfter: false, // Auto-scan disabled by default
+  maxDaysToScan: 7, // Default to scanning ±7 days around primary date
+  selectedDates: [], // No specific dates selected by default
   autoSearchEnabled: false,
   dropTime: undefined,
   leadTimeMs: 0, // Refresh exactly at drop time (not before, to ensure fresh data)

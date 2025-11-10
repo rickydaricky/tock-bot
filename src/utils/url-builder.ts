@@ -47,6 +47,54 @@ export function buildTockSearchUrl(baseUrl: string, preferences: TockPreferences
 }
 
 /**
+ * Builds a Tock search URL with a specific date override
+ * Used for cycling through fallback dates
+ */
+export function buildTockSearchUrlWithDate(
+  baseUrl: string,
+  preferences: TockPreferences,
+  overrideDate: string
+): string | null {
+  try {
+    const url = new URL(baseUrl);
+
+    // Extract restaurant slug from pathname
+    const pathParts = url.pathname.split('/').filter(p => p.length > 0);
+
+    if (pathParts.length === 0) {
+      console.error('Could not extract restaurant slug from URL:', baseUrl);
+      return null;
+    }
+
+    const restaurantSlug = pathParts[0];
+
+    // Validate date format (YYYY-MM-DD)
+    if (!overrideDate || !/^\d{4}-\d{2}-\d{2}$/.test(overrideDate)) {
+      console.error('Invalid date format:', overrideDate);
+      return null;
+    }
+
+    // Format time as HH:MM
+    const time = preferences.time;
+    if (!time) {
+      console.error('No time specified in preferences');
+      return null;
+    }
+
+    // Build search URL with override date
+    const searchUrl = new URL(`https://www.exploretock.com/${restaurantSlug}/search`);
+    searchUrl.searchParams.set('date', overrideDate);
+    searchUrl.searchParams.set('size', preferences.partySize.toString());
+    searchUrl.searchParams.set('time', time);
+
+    return searchUrl.toString();
+  } catch (error) {
+    console.error('Error building Tock search URL with date:', error);
+    return null;
+  }
+}
+
+/**
  * Checks if a URL is a Tock search URL
  */
 export function isTockSearchUrl(url: string): boolean {

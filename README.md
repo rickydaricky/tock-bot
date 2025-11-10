@@ -6,10 +6,17 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 
 - **Multi-Platform Support**: Works with both Tock and OpenTable reservation systems
 - **Smart Form Filling**: Automatically fills in party size, date, and time
+- **Visual Calendar Selection**: Interactive calendar with drag-to-select for choosing multiple specific dates
+- **Bidirectional Auto-Scan**: Automatically try dates before AND after your primary date (±N days)
+- **Flexible Date Strategies**:
+  - Use primary date only
+  - Select specific dates via calendar (overrides auto-scan)
+  - Auto-scan ±N days from primary (if no calendar dates selected)
+- **Intelligent Availability Filtering**: Only tries dates that Tock shows as available (skips disabled/sold out dates)
 - **Intelligent Time Matching**: Selects the time slot that matches (or is closest to) your preferred time
 - **One-Click Submission**: Fills and submits the form with a single click
 - **Scheduled Automation**: Set a drop time to automatically search and book reservations at a specific time
-- **Optimized for Tock**: Direct URL navigation approach for ultra-fast execution (~1-2 seconds faster than form filling)
+- **Optimized for Tock**: Direct calendar interaction for ultra-fast date switching
 - **Fresh Data Guarantee**: Page refresh ensures you're always working with the latest availability from the server
 - **Persistent Preferences**: Saves your settings for future use
 - **Dynamic UI**: Extension popup title adapts based on whether you're on Tock or OpenTable
@@ -56,6 +63,15 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 2. Open the extension popup
 3. Check "Enable Automatic Search"
 4. Set your preferences:
+   - **Party Size & Primary Date**: Your preferred party size and first-choice date
+   - **Use First Available Date** (Optional): Check this to enable flexible date searching
+     - **Days to Scan**: Set how many days before/after your primary date to scan (e.g., 7 means ±7 days)
+     - **Calendar Selection**: Click "Or select specific dates" to open an interactive calendar
+       - **Single Click**: Click individual dates to select them
+       - **Drag Selection**: Click and drag across dates to select entire ranges sequentially
+       - Drag from unselected → selects the range
+       - Drag from selected → deselects the range
+       - **Calendar dates override auto-scan**: If you select specific dates, the scan range is ignored
    - **Reservation Drop Time**: The exact time when reservations open (in your local timezone)
    - **Search Before Drop**: How many milliseconds before the drop time to start searching (default: 0ms - refreshes exactly at drop time)
    - **Maximum Retry Attempts**: How many times to retry if the first attempt fails (default: 0 - optimized for single-shot speed)
@@ -64,7 +80,20 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 6. The extension will automatically prepare and execute the booking at the specified time
 7. You can monitor the countdown and cancel the timer if needed
 
-**Tock-Specific Behavior**: When scheduling a timer on Tock, the extension immediately navigates to the search results page with your preferences in the URL. When the drop time arrives, it refreshes the page to load fresh availability data and clicks the "Book" button. This is significantly faster (~1-2 seconds) than form filling.
+**Tock-Specific Behavior with Date Selection**:
+- The extension navigates to the search page with your primary date
+- At drop time, it refreshes the page to fetch fresh availability
+- It parses the calendar to find which dates actually have availability (marked with `is-available` class)
+- Date selection logic:
+  - If **calendar dates selected**: Only tries those specific dates
+  - If **no calendar dates**: Tries all dates within ±N days of primary
+  - Always filters to only try dates that Tock shows as available
+- For each available date, it:
+  - Clicks the calendar date button
+  - Checks for a "Book" button at your preferred time
+  - If found, clicks it and completes the booking
+  - If not found, moves to the next available date immediately (no delays)
+- **Key advantage**: Only tries dates that Tock shows as available, automatically skipping sold out or disabled dates
 
 ### Supported Platforms
 
@@ -98,6 +127,7 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 - TypeScript
 - React 18
 - Tailwind CSS
+- date-fns (for calendar date manipulation)
 - Chrome Extensions API (Manifest V3)
 - Webpack
 
@@ -113,17 +143,37 @@ The extension automatically detects whether you're on a Tock or OpenTable page b
 - Interacts with custom Tock UI components
 - Auto-clicks the search and book buttons
 
-**Automatic Mode (Optimized for Speed):**
-- Immediately navigates to the search URL when timer is scheduled
-  - Example: `https://www.exploretock.com/restaurant-name/search?date=2025-11-07&size=2&time=20%3A00`
-- Tab waits at the search page until drop time
-- At drop time, refreshes the page to fetch fresh availability data from the server
-- Skips all form filling and goes straight to clicking the "Book" button
-- This approach is ~1-2 seconds faster because:
-  - No form element waiting
-  - No form filling steps
-  - No search button navigation delay
-  - Direct refresh loads latest availability from Tock's servers
+**Automatic Mode (Optimized for Speed & Flexibility):**
+1. **Initial Navigation**: Navigates to the search URL with your primary date when timer is scheduled
+   - Example: `https://www.exploretock.com/restaurant-name/search?date=2025-11-07&size=2&time=20%3A00`
+
+2. **At Drop Time**: Refreshes the page to fetch fresh availability data from the server
+
+3. **Calendar Parsing**: Parses the Tock calendar HTML to find available dates
+   - Looks for elements with `.ConsumerCalendar-day.is-available.is-in-month` classes
+   - Extracts date from `aria-label` attributes (YYYY-MM-DD format)
+   - Filters out disabled, sold out, or out-of-month dates
+
+4. **Smart Date Filtering**: Compares desired dates against available dates
+   - Desired dates determined by:
+     - If calendar dates selected: Uses only those specific dates
+     - If no calendar dates: Generates ±N days from primary date
+   - Only tries dates that are both desired AND available
+   - Skips dates that are sold out or disabled
+
+5. **Fast Date Iteration**: For each available date:
+   - Clicks the calendar date button directly in the DOM
+   - Waits 300ms for page to update
+   - Checks for "Book" button
+   - If found, clicks it and completes booking
+   - If not found, immediately moves to next date (no delays)
+
+**Why this approach is fast:**
+- Single page load instead of N page loads for N dates
+- Direct calendar interaction (just like a human clicking dates)
+- No delays between date attempts
+- Only tries dates that Tock's calendar shows as available
+- Fresh server data from initial page refresh
 
 **Why the refresh is necessary:** Tock uses client-side routing (SPA), so the search button doesn't make a fresh server request. Without a page refresh, the script would work with stale cached data loaded before the reservation drop.
 

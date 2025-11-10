@@ -3,9 +3,56 @@ import { Message, TockPreferences, ActiveTimer } from '../types';
 import { DEFAULT_PREFERENCES, saveActiveTimer, loadActiveTimer, clearActiveTimer, loadPreferences } from '../utils/storage';
 import { sendAutoFillFormMessage } from '../utils/messaging';
 import { detectPlatform } from '../utils/platform';
-import { buildTockSearchUrl } from '../utils/url-builder';
+import { buildTockSearchUrl, buildTockSearchUrlWithDate } from '../utils/url-builder';
 
 console.log('Tock Form Filler Background Script Loaded');
+
+/**
+ * Build the complete list of desired dates to try
+ * Returns array of date strings in YYYY-MM-DD format
+ */
+function buildDesiredDatesList(preferences: TockPreferences): string[] {
+  const desiredDates: string[] = [];
+
+  // Start with primary date
+  desiredDates.push(preferences.date);
+  console.log(`[Date List] Primary date: ${preferences.date}`);
+
+  // Check if specific dates are selected via calendar (this overrides auto-scan range)
+  const selectedDates = preferences.selectedDates || [];
+  if (selectedDates.length > 0) {
+    console.log(`[Date List] Using ${selectedDates.length} specific calendar-selected dates (overriding auto-scan range)`);
+    // Add selected dates (skip duplicates)
+    for (const date of selectedDates) {
+      if (!desiredDates.includes(date)) {
+        desiredDates.push(date);
+      }
+    }
+  }
+  // Otherwise, use auto-scan range if enabled
+  else if (preferences.useFirstAvailableAfter) {
+    const maxDaysToScan = preferences.maxDaysToScan ?? 7;
+    console.log(`[Date List] Auto-scan enabled, scanning ±${maxDaysToScan} days from primary`);
+
+    const primaryDate = new Date(preferences.date);
+
+    // Scan both before and after primary date
+    for (let dayOffset = -maxDaysToScan; dayOffset <= maxDaysToScan; dayOffset++) {
+      if (dayOffset === 0) continue; // Skip primary date (already added)
+
+      const scanDate = new Date(primaryDate);
+      scanDate.setDate(primaryDate.getDate() + dayOffset);
+      const scanDateString = scanDate.toISOString().split('T')[0];
+
+      if (!desiredDates.includes(scanDateString)) {
+        desiredDates.push(scanDateString);
+      }
+    }
+  }
+
+  console.log(`[Date List] Built list of ${desiredDates.length} desired dates: ${desiredDates.join(', ')}`);
+  return desiredDates;
+}
 
 const ALARM_NAME_PREFIX = 'tock-auto-search';
 
@@ -61,7 +108,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function handleAlarmTrigger(alarmName: string) {
   const alarmFireTime = Date.now();
   console.log(`⏰ [TIMING] Alarm fired at: ${new Date(alarmFireTime).toISOString()}`);
-  
+
   const activeTimer = await loadActiveTimer();
 
   if (!activeTimer || activeTimer.alarmName !== alarmName) {
@@ -76,25 +123,30 @@ async function handleAlarmTrigger(alarmName: string) {
   try {
     // Get preferences
     const preferences = await loadPreferences();
-    
+
     // Add alarm fire time to preferences for timing measurement
     preferences.alarmFireTime = alarmFireTime;
+
+    // Build list of desired dates to try
+    const desiredDates = buildDesiredDatesList(preferences);
 
     const backgroundProcessingTime = Date.now();
     console.log(`⏰ [TIMING] Background processing complete (delta: ${(backgroundProcessingTime - alarmFireTime).toFixed(2)}ms)`);
 
     // Attempt to fill the form on the target tab
     if (activeTimer.tabId) {
-      const result = await attemptFormFill(activeTimer.tabId, preferences);
+      const result = await attemptFormFill(activeTimer.tabId, preferences, desiredDates);
 
       if (result.success) {
         // Success! Mark as completed
         activeTimer.status = 'completed';
         await saveActiveTimer(activeTimer);
-        console.log('Form filled successfully');
+        console.log(`✅ Successfully booked!`);
       } else {
-        // Failed, try retry logic
-        await handleRetry(activeTimer, preferences);
+        // Failed
+        activeTimer.status = 'failed';
+        await saveActiveTimer(activeTimer);
+        console.log('❌ Failed to book any available dates');
       }
     } else {
       // No tab ID, mark as failed
@@ -104,7 +156,8 @@ async function handleAlarmTrigger(alarmName: string) {
     }
   } catch (error) {
     console.error('Error executing auto-fill:', error);
-    await handleRetry(activeTimer, await loadPreferences());
+    activeTimer.status = 'failed';
+    await saveActiveTimer(activeTimer);
   }
 }
 
@@ -122,8 +175,9 @@ async function waitForTabReload(tabId: number): Promise<void> {
   });
 }
 
-// Attempt to fill the form on a specific tab
-async function attemptFormFill(tabId: number, preferences: TockPreferences): Promise<{ success: boolean }> {
+// Attempt to fill the form manually (for user-initiated fills)
+// Similar to attemptFormFill but WITHOUT the refresh step
+async function attemptManualFormFill(tabId: number, preferences: TockPreferences, desiredDates: string[]): Promise<{ success: boolean }> {
   try {
     // Get the tab to check its URL
     const tab = await chrome.tabs.get(tabId);
@@ -137,61 +191,101 @@ async function attemptFormFill(tabId: number, preferences: TockPreferences): Pro
     const platform = detectPlatform(tab.url);
 
     if (platform === 'tock') {
-      console.log('🔄 Tock platform detected - refreshing page to fetch fresh availability data');
-      const refreshStartTime = Date.now();
+      console.log(`🔄 Manual fill - Tock platform detected, navigating to search page`);
+      const navigateStartTime = Date.now();
 
-      // Refresh the page to get fresh data from server
-      await chrome.tabs.reload(tabId);
+      // Build search URL with the PRIMARY date (first in list)
+      const primaryDate = desiredDates[0];
+      const searchUrl = buildTockSearchUrlWithDate(tab.url, preferences, primaryDate);
 
-      // Wait for the page to finish reloading
+      if (!searchUrl) {
+        console.error('Failed to build Tock search URL');
+        return { success: false };
+      }
+
+      console.log(`🔗 Navigating to: ${searchUrl}`);
+
+      // Navigate to the search URL
+      await chrome.tabs.update(tabId, { url: searchUrl });
+
+      // Wait for the page to finish loading
       await waitForTabReload(tabId);
 
-      const refreshEndTime = Date.now();
-      console.log(`⏰ [TIMING] Page refresh completed (delta: ${refreshEndTime - refreshStartTime}ms)`);
-    }
+      const navigateEndTime = Date.now();
+      console.log(`⏰ [TIMING] Navigation completed (delta: ${navigateEndTime - navigateStartTime}ms)`);
 
-    // Now send the auto-fill message
-    const result = await sendAutoFillFormMessage(preferences, tabId);
-    return result;
+      // Send message with desired dates list for content script to try
+      console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'AUTO_FILL_FORM',
+        payload: {
+          preferences,
+          datesToTry: desiredDates,
+        }
+      });
+
+      return { success: result.success };
+    } else {
+      // For non-Tock platforms, use original single-date behavior
+      const result = await sendAutoFillFormMessage(preferences, tabId);
+      return result;
+    }
   } catch (error) {
-    console.error('Error sending auto-fill message:', error);
+    console.error('Error sending manual fill message:', error);
     return { success: false };
   }
 }
 
-// Handle retry logic
-async function handleRetry(timer: ActiveTimer, preferences: TockPreferences) {
-  timer.currentAttempt++;
+// Attempt to fill the form on a specific tab with multiple dates (for scheduled automatic fills)
+// Includes a refresh to get fresh data from the server at drop time
+async function attemptFormFill(tabId: number, preferences: TockPreferences, desiredDates: string[]): Promise<{ success: boolean }> {
+  try {
+    // Get the tab to check its URL
+    const tab = await chrome.tabs.get(tabId);
 
-  if (timer.currentAttempt >= timer.maxRetries) {
-    // Max retries reached, mark as failed
-    timer.status = 'failed';
-    await saveActiveTimer(timer);
-    console.log('Max retries reached, marking as failed');
-    return;
-  }
-
-  // Schedule next retry
-  await saveActiveTimer(timer);
-  console.log(`Retry attempt ${timer.currentAttempt} of ${timer.maxRetries}`);
-
-  // Get retry interval from preferences
-  const retryIntervalSeconds = preferences.retryIntervalSeconds || 1;
-
-  // Wait and retry
-  setTimeout(async () => {
-    if (!timer.tabId) return;
-
-    const result = await attemptFormFill(timer.tabId, preferences);
-
-    if (result.success) {
-      timer.status = 'completed';
-      await saveActiveTimer(timer);
-      console.log('Form filled successfully on retry');
-    } else {
-      await handleRetry(timer, preferences);
+    if (!tab.url) {
+      console.error('Tab URL not available');
+      return { success: false };
     }
-  }, retryIntervalSeconds * 1000);
+
+    // Check if this is a Tock page
+    const platform = detectPlatform(tab.url);
+
+    if (platform === 'tock') {
+      console.log(`🔄 Tock platform detected - page already on search URL, refreshing for fresh data`);
+      const reloadStartTime = Date.now();
+
+      // Refresh the page to get fresh data from server
+      // (Page is already on search URL thanks to scheduleTimer navigation)
+      console.log('🔄 Refreshing page to fetch fresh availability data');
+      await chrome.tabs.reload(tabId);
+
+      // Wait for the refresh to complete
+      await waitForTabReload(tabId);
+
+      const reloadEndTime = Date.now();
+      console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
+
+      // Send message with desired dates list for content script to try
+      console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'AUTO_FILL_FORM',
+        payload: {
+          preferences,
+          datesToTry: desiredDates,
+        }
+      });
+
+      return { success: result.success };
+    } else {
+      // For non-Tock platforms, use original single-date behavior
+      const result = await sendAutoFillFormMessage(preferences, tabId);
+      return result;
+    }
+  } catch (error) {
+    console.error('Error sending auto-fill message:', error);
+    return { success: false };
+  }
 }
 
 // Schedule a new timer
@@ -227,7 +321,7 @@ async function scheduleTimer(preferences: TockPreferences, tabId: number): Promi
     dropTime: dropTime.toISOString(),
     scheduledTime: scheduledTime.toISOString(),
     currentAttempt: 0,
-    maxRetries: preferences.maxRetries || 10,
+    maxRetries: preferences.maxRetries ?? 0,
     status: 'scheduled',
     tabId,
   };
@@ -311,6 +405,19 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
     const { preferences, tabId } = message.payload;
     scheduleTimer(preferences, tabId)
       .then(timer => sendResponse({ success: true, timer }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    return true; // Keep channel open for async response
+  }
+
+  // Handle manual fill form request from popup
+  if (message.type === 'FILL_FORM') {
+    const { preferences, tabId } = message.payload;
+
+    // Build list of desired dates to try
+    const desiredDates = buildDesiredDatesList(preferences);
+
+    attemptManualFormFill(tabId, preferences, desiredDates)
+      .then(result => sendResponse(result))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // Keep channel open for async response
   }

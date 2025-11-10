@@ -7,41 +7,57 @@ import { detectPlatform, getPlatformDisplayName } from '../utils/platform';
 const currentPlatform = detectPlatform(window.location.href);
 console.log(`Form Filler Content Script Loaded - Platform: ${currentPlatform ? getPlatformDisplayName(currentPlatform) : 'Unknown'}`);
 
-// Listen for messages from the popup and background script
+// Listen for messages from the background script
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
   console.log('Message received in content script:', message);
 
-  if (message.type === 'FILL_FORM') {
-    const preferences = message.payload as TockPreferences;
-    handleFormFill(preferences)
-      .then((success) => {
-        sendResponse({ success });
-      })
-      .catch((error) => {
-        console.error('Error filling form:', error);
-        sendResponse({ success: false, error: error.message });
-      });
-
-    return true; // Indicates an async response
-  }
-
-  // Handle automatic form fill triggered by background script timer
+  // Handle form fill triggered by background script (both manual and automatic modes)
+  // The background script navigates to the search URL before sending this message
   if (message.type === 'AUTO_FILL_FORM') {
-    const preferences = message.payload as TockPreferences;
+    const payload = message.payload as any;
+    const preferences = payload.preferences || payload as TockPreferences;
+    const datesToTry = payload.datesToTry as string[] | undefined;
+
     const messageReceivedTime = Date.now();
-    
+
     if (preferences.alarmFireTime) {
       console.log(`⏰ [TIMING] Content script received message (delta from alarm: ${(messageReceivedTime - preferences.alarmFireTime).toFixed(2)}ms)`);
     }
-    
-    handleFormFill(preferences)
-      .then((success) => {
-        sendResponse({ success });
-      })
-      .catch((error) => {
-        console.error('Error auto-filling form:', error);
-        sendResponse({ success: false, error: error.message });
-      });
+
+    // If datesToTry is provided, use multi-date mode
+    if (datesToTry && datesToTry.length > 0) {
+      console.log(`📅 Multi-date mode: trying ${datesToTry.length} dates`);
+
+      if (currentPlatform === 'tock') {
+        const formFiller = new TockFormFiller({
+          preferences,
+          waitForForm: true,
+          autoSubmit: true,
+        });
+
+        formFiller.tryMultipleDates(datesToTry)
+          .then((success) => {
+            sendResponse({ success });
+          })
+          .catch((error) => {
+            console.error('Error trying multiple dates:', error);
+            sendResponse({ success: false, error: error.message });
+          });
+      } else {
+        console.error('Multi-date mode only supported for Tock');
+        sendResponse({ success: false, error: 'Multi-date mode only supported for Tock' });
+      }
+    } else {
+      // Single date mode (original behavior)
+      handleFormFill(preferences)
+        .then((success) => {
+          sendResponse({ success });
+        })
+        .catch((error) => {
+          console.error('Error auto-filling form:', error);
+          sendResponse({ success: false, error: error.message });
+        });
+    }
 
     return true; // Indicates an async response
   }

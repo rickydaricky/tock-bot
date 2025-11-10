@@ -1,31 +1,36 @@
 import { Message, TockPreferences, ActiveTimer } from '../types';
 
-// Send a message to the content script to fill the form
+// Send a message to the background script to fill the form
+// The background script will navigate to the search URL and then trigger the content script
 export const sendFillFormMessage = (preferences: TockPreferences, tabId?: number): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const message: Message = {
-      type: 'FILL_FORM',
-      payload: preferences,
-    };
+    // Get the tab ID if not provided
+    const sendMessage = (actualTabId: number) => {
+      const message: Message = {
+        type: 'FILL_FORM',
+        payload: {
+          preferences,
+          tabId: actualTabId,
+        },
+      };
 
-    if (tabId) {
-      chrome.tabs.sendMessage(tabId, message, (response) => {
+      chrome.runtime.sendMessage(message, (response) => {
         if (chrome.runtime.lastError) {
           reject(chrome.runtime.lastError);
+        } else if (response && !response.success) {
+          reject(new Error(response.error || 'Failed to fill form'));
         } else {
           resolve();
         }
       });
+    };
+
+    if (tabId) {
+      sendMessage(tabId);
     } else {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]?.id) {
-          chrome.tabs.sendMessage(tabs[0].id, message, (response) => {
-            if (chrome.runtime.lastError) {
-              reject(chrome.runtime.lastError);
-            } else {
-              resolve();
-            }
-          });
+          sendMessage(tabs[0].id);
         } else {
           reject(new Error('No active tab found'));
         }

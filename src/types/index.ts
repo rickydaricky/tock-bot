@@ -4,6 +4,12 @@ export interface TockPreferences {
   partySize: number;
   date: string; // Format: YYYY-MM-DD
   time: string; // Format: HH:MM
+  // Fallback date settings
+  fallbackDates?: string[]; // Array of dates in YYYY-MM-DD format
+  useFirstAvailableAfter?: boolean; // Auto-scan around primary date (±N days)
+  dateSelectionMode?: 'range' | 'specific'; // Toggle between range scanning or specific date selection
+  maxDaysToScan?: number; // Days to scan before/after primary (default: 7)
+  selectedDates?: string[]; // Specific dates selected via calendar (overrides auto-scan range)
   // Auto-search settings
   autoSearchEnabled?: boolean;
   dropTime?: string; // ISO datetime string

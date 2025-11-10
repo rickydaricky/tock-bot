@@ -16,6 +16,266 @@ export class TockFormFiller {
   }
 
   /**
+   * Get the modal container if present (Tock search modal)
+   * Returns null if no modal is found (e.g., on regular restaurant page)
+   */
+  private getModalContainer(): HTMLElement | null {
+    return document.querySelector('[data-testid="in-business-search-modal"]') as HTMLElement;
+  }
+
+  /**
+   * Ensure the Tock calendar dropdown is open
+   */
+  private async ensureCalendarIsOpen(): Promise<void> {
+    // Get the root container (modal if present, otherwise document)
+    const modal = this.getModalContainer();
+    const root = modal || document;
+
+    // Check if calendar is already visible
+    const calendar = root.querySelector('.ConsumerCalendar') as HTMLElement;
+
+    if (calendar) {
+      // Check if calendar is actually visible (not just exists in DOM)
+      const style = window.getComputedStyle(calendar);
+      const isVisible = style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       style.opacity !== '0';
+
+      const rect = calendar.getBoundingClientRect();
+      const hasSize = rect.width > 0 && rect.height > 0;
+      const isOpen = isVisible && hasSize;
+
+      if (isOpen) {
+        console.log('Calendar is already open');
+        return;
+      }
+    }
+
+    // Calendar not visible, need to click the date button to open it
+    console.log('Calendar not open, clicking date button to open it...');
+
+    const dateButton = root.querySelector('[data-testid="reservation-date-button"]') as HTMLElement;
+
+    if (!dateButton) {
+      console.error('Could not find date button to open calendar');
+      return;
+    }
+
+    // Click the date button
+    dateButton.click();
+
+    // Wait for calendar to appear
+    await this.waitForCalendarToAppear();
+  }
+
+  /**
+   * Wait for the calendar to appear in the DOM
+   */
+  private async waitForCalendarToAppear(): Promise<void> {
+    const maxAttempts = 10;
+    let attempts = 0;
+
+    // Get the root container (modal if present, otherwise document)
+    const modal = this.getModalContainer();
+    const root = modal || document;
+
+    while (attempts < maxAttempts) {
+      const calendar = root.querySelector('.ConsumerCalendar') as HTMLElement;
+
+      if (calendar) {
+        // Check if calendar is actually visible
+        const style = window.getComputedStyle(calendar);
+        const isVisible = style.display !== 'none' &&
+                         style.visibility !== 'hidden' &&
+                         style.opacity !== '0';
+
+        const rect = calendar.getBoundingClientRect();
+        const hasSize = rect.width > 0 && rect.height > 0;
+        const isOpen = isVisible && hasSize;
+
+        if (isOpen) {
+          console.log('Calendar appeared and is open');
+          await new Promise(r => setTimeout(r, 200)); // Small delay for rendering
+          return;
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 100));
+      attempts++;
+    }
+
+    console.warn('Calendar did not appear after waiting');
+  }
+
+  /**
+   * Get all available dates from the Tock calendar
+   * Returns array of date strings in YYYY-MM-DD format
+   */
+  private async getAvailableDatesFromCalendar(): Promise<string[]> {
+    const availableDates: string[] = [];
+
+    // First, ensure the calendar is visible
+    await this.ensureCalendarIsOpen();
+
+    // Get the root container (modal if present, otherwise document)
+    const modal = this.getModalContainer();
+    const root = modal || document;
+
+    // Try multiple selectors with decreasing strictness
+    const selectors = [
+      '.ConsumerCalendar-day.is-available.is-in-month:not(.is-disabled):not(.is-sold)',
+      '.ConsumerCalendar-day.is-available:not(.is-disabled):not(.is-sold)',
+      '.ConsumerCalendar-day.is-available',
+      'button[aria-label*="202"]' // Fallback: matches buttons with year in aria-label
+    ];
+
+    let availableButtons: NodeListOf<Element> | null = null;
+
+    // Try each selector until we find results
+    for (const selector of selectors) {
+      const buttons = root.querySelectorAll(selector);
+      if (buttons.length > 0) {
+        availableButtons = buttons;
+        break;
+      }
+    }
+
+    console.log(`Found ${availableButtons?.length || 0} available date buttons in calendar`);
+
+    if (availableButtons) {
+      availableButtons.forEach((button) => {
+        const ariaLabel = button.getAttribute('aria-label');
+        if (ariaLabel && /^\d{4}-\d{2}-\d{2}$/.test(ariaLabel)) {
+          availableDates.push(ariaLabel);
+        }
+      });
+    }
+
+    // Remove duplicates (both calendars visible) and sort
+    return [...new Set(availableDates)].sort();
+  }
+
+  /**
+   * Click a specific date in the Tock calendar
+   */
+  private async clickCalendarDate(dateString: string): Promise<boolean> {
+    try {
+      // Ensure calendar is open before clicking date
+      await this.ensureCalendarIsOpen();
+
+      // Get the root container (modal if present, otherwise document)
+      const modal = this.getModalContainer();
+      const root = modal || document;
+
+      // Find the button with this aria-label
+      const dateButton = root.querySelector(
+        `.ConsumerCalendar-day[aria-label="${dateString}"]`
+      ) as HTMLElement;
+
+      if (!dateButton) {
+        console.error(`Could not find calendar button for date: ${dateString}`);
+        return false;
+      }
+
+      // Verify it's available
+      if (!dateButton.classList.contains('is-available')) {
+        console.error(`Date ${dateString} is not available`);
+        return false;
+      }
+
+      console.log(`Clicking calendar date: ${dateString}`);
+
+      // Scroll the date button into view to ensure it's clickable
+      dateButton.scrollIntoView({ behavior: 'instant', block: 'center' });
+      await new Promise(r => setTimeout(r, 200)); // Wait for scroll
+
+      // Click the date button
+      dateButton.click();
+
+      // Wait for page to update
+      await new Promise(r => setTimeout(r, 300));
+
+      return true;
+    } catch (error) {
+      console.error(`Error clicking calendar date ${dateString}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Try multiple dates in sequence, filtering to only available dates
+   */
+  public async tryMultipleDates(desiredDates: string[]): Promise<boolean> {
+    console.log(`🎯 Starting multi-date search`);
+    console.log(`Desired dates: ${desiredDates.join(', ')}`);
+
+    // Get available dates from calendar
+    const availableDates = await this.getAvailableDatesFromCalendar();
+    console.log(`Available dates from calendar: ${availableDates.join(', ')}`);
+
+    // Filter desired dates to only include available ones
+    const datesToTry = desiredDates.filter(d => availableDates.includes(d));
+
+    // Find dates that are desired but not available
+    const unavailableDates = desiredDates.filter(d => !availableDates.includes(d));
+
+    if (unavailableDates.length > 0) {
+      console.log(`⚠️  Skipping unavailable dates: ${unavailableDates.join(', ')}`);
+    }
+
+    if (datesToTry.length === 0) {
+      console.log(`❌ No available dates to try from the desired list`);
+      return false;
+    }
+
+    console.log(`✅ Will try these available dates: ${datesToTry.join(', ')}`);
+
+    // Try each available date in sequence
+    for (let i = 0; i < datesToTry.length; i++) {
+      const date = datesToTry[i];
+      console.log(`\n🔍 Trying date ${i + 1}/${datesToTry.length}: ${date}`);
+
+      // Always click the calendar date to trigger time slot loading
+      const clicked = await this.clickCalendarDate(date);
+      if (!clicked) {
+        console.log(`Failed to click date ${date}, skipping`);
+        continue;
+      }
+
+      // Check for book button
+      const bookButton = await this.findBookButton();
+      if (bookButton) {
+        console.log(`✅ Book button found for date: ${date}!`);
+        console.log(`Button element:`, bookButton);
+        console.log(`Button tagName: ${bookButton.tagName}`);
+        console.log(`Button textContent: "${bookButton.textContent}"`);
+
+        // Check if button is actually clickable
+        const rect = bookButton.getBoundingClientRect();
+        console.log(`Button position - top: ${rect.top}, left: ${rect.left}, width: ${rect.width}, height: ${rect.height}`);
+
+        const computedStyle = window.getComputedStyle(bookButton);
+        console.log(`Button display: ${computedStyle.display}, visibility: ${computedStyle.visibility}, pointerEvents: ${computedStyle.pointerEvents}`);
+
+        try {
+          console.log(`Attempting to click book button with .click()...`);
+          bookButton.click();
+          console.log(`Book button clicked successfully`);
+        } catch (error) {
+          console.error(`Error during click:`, error);
+        }
+
+        return true;
+      } else {
+        console.log(`No book button found for date: ${date}`);
+      }
+    }
+
+    console.log(`❌ Exhausted all available dates without finding a book button`);
+    return false;
+  }
+
+  /**
    * Fill the Tock reservation form with the provided preferences
    */
   public async fill(): Promise<boolean> {
@@ -287,83 +547,173 @@ export class TockFormFiller {
   }
   
   /**
-   * Helper method to find a book button using various selectors
+   * Convert 24-hour time format to 12-hour format
+   * Example: "17:00" -> "5:00 PM"
+   */
+  private convertTo12HourFormat(time24: string): string {
+    const [hours24, minutes] = time24.split(':').map(Number);
+    const period = hours24 >= 12 ? 'PM' : 'AM';
+    const hours12 = hours24 % 12 || 12;
+    return `${hours12}:${minutes.toString().padStart(2, '0')} ${period}`;
+  }
+
+  /**
+   * Helper method to find a book button for the user's preferred time slot
    */
   private async findBookButton(): Promise<HTMLElement | null> {
-    // Try multiple selectors to find the book button
-    const bookButtonSelectors = [
-      '[data-testid="booking-card-button"]',
-      '[data-testid="offering-book-button"]',
-      '[data-testid*="book-button"]',
-      'button.css-dr2rn7',
-      'a.css-dr2rn7[aria-label*="Book now"]',
-      '.css-dr2rn7'
-    ];
-    
-    let bookButton: HTMLElement | null = null;
-    
-    // Try each selector
-    for (const selector of bookButtonSelectors) {
-      try {
-        const elements = document.querySelectorAll(selector);
-        if (elements.length > 0) {
-          console.log(`Found ${elements.length} potential book buttons with selector: ${selector}`);
-        
-          for (const el of Array.from(elements)) {
-            // Check if it contains "Book" text
-            if (el.textContent?.toLowerCase().includes('book')) {
-              bookButton = el as HTMLElement;
-              console.log(`Found book button with selector: ${selector}, text: "${el.textContent}"`);
-              
-              // Ensure element is visible and clickable
-              const style = window.getComputedStyle(bookButton);
-              if (style.display === 'none' || style.visibility === 'hidden') {
-                console.log('Button found but is not visible, continuing search...');
-                bookButton = null;
-                continue;
-              }
-              
-              // Check if element is in viewport
-              const rect = bookButton.getBoundingClientRect();
-              const isInViewport = rect.top >= 0 && 
-                                  rect.left >= 0 && 
-                                  rect.bottom <= window.innerHeight && 
-                                  rect.right <= window.innerWidth;
-              
-              if (!isInViewport) {
-                console.log('Button found but is outside viewport, scrolling into view...');
-                bookButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                // Wait a small amount of time for the scroll to complete
-                await new Promise(resolve => setTimeout(resolve, 300));
-              }
-              
-              return bookButton;
-            }
+    // Convert preference time to 12-hour format for matching
+    const preferredTime = this.convertTo12HourFormat(this.preferences.time);
+    console.log(`Looking for book button at preferred time: ${preferredTime}`);
+
+    // Get the root container (modal if present, otherwise document)
+    const modal = this.getModalContainer();
+    const root = modal || document;
+
+    // Find all time slot book buttons (not the generic "Book now" anchor)
+    const bookButtons = Array.from(root.querySelectorAll('[data-testid="booking-card-button"]'));
+    console.log(`Found ${bookButtons.length} time slot book buttons`);
+
+    if (bookButtons.length === 0) {
+      console.log('No time slot book buttons found');
+      return null;
+    }
+
+    // Parse time from text content and find matching button
+    const buttonWithTime: Array<{ button: HTMLElement, timeText: string, totalMinutes: number }> = [];
+
+    for (const button of bookButtons) {
+      // Walk up the DOM to find the container that has the time information
+      let container = button.parentElement;
+      let attempts = 0;
+      let timeText = '';
+
+      // Go up max 5 levels to find the time slot container
+      while (container && attempts < 5) {
+        const text = container.textContent || '';
+
+        // Look for time pattern like "5:00 PM" or "5:30 PM"
+        const timeMatch = text.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+        if (timeMatch) {
+          timeText = `${timeMatch[1]}:${timeMatch[2]} ${timeMatch[3].toUpperCase()}`;
+
+          // Convert to total minutes for comparison
+          let hours = parseInt(timeMatch[1], 10);
+          const minutes = parseInt(timeMatch[2], 10);
+          const period = timeMatch[3].toUpperCase();
+
+          if (period === 'PM' && hours < 12) {
+            hours += 12;
+          } else if (period === 'AM' && hours === 12) {
+            hours = 0;
           }
+
+          const totalMinutes = hours * 60 + minutes;
+
+          buttonWithTime.push({
+            button: button as HTMLElement,
+            timeText,
+            totalMinutes
+          });
+
+          console.log(`Found button at time: ${timeText}`);
+          break;
         }
-      } catch (e) {
-        // Some selectors might not be supported by the browser, continue to the next one
-        continue;
+
+        container = container.parentElement;
+        attempts++;
       }
     }
-    
-    // Fallback: look for any button or link that contains "Book" text
-    if (!bookButton) {
-      const allButtons = document.querySelectorAll('button, a[href]');
-      for (const btn of Array.from(allButtons)) {
-        if (btn.textContent?.toLowerCase().includes('book')) {
-          const style = window.getComputedStyle(btn);
-          // Make sure it's visible
-          if (style.display !== 'none' && style.visibility !== 'hidden') {
-            bookButton = btn as HTMLElement;
-            console.log('Found book button using text content search');
-            return bookButton;
-          }
-        }
+
+    if (buttonWithTime.length === 0) {
+      console.log('No buttons with time information found');
+      return null;
+    }
+
+    // Try to find exact match first
+    const exactMatch = buttonWithTime.find(item => item.timeText === preferredTime);
+    if (exactMatch) {
+      console.log(`Found exact time match: ${exactMatch.timeText}`);
+
+      // Ensure element is visible and clickable
+      const style = window.getComputedStyle(exactMatch.button);
+      if (style.display === 'none' || style.visibility === 'hidden') {
+        console.log('Button found but is not visible');
+        return null;
+      }
+
+      // Scroll into view if needed
+      const rect = exactMatch.button.getBoundingClientRect();
+      const isInViewport = rect.top >= 0 &&
+                          rect.left >= 0 &&
+                          rect.bottom <= window.innerHeight &&
+                          rect.right <= window.innerWidth;
+
+      if (!isInViewport) {
+        console.log('Button found but is outside viewport, scrolling into view...');
+        exactMatch.button.scrollIntoView({ behavior: 'instant', block: 'center' });
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
+      return exactMatch.button;
+    }
+
+    // No exact match, find closest time
+    console.log(`No exact match for ${preferredTime}, finding closest time...`);
+
+    // Convert preferred time to total minutes
+    const preferredTimeMatch = preferredTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    if (!preferredTimeMatch) {
+      console.log('Could not parse preferred time');
+      return null;
+    }
+
+    let preferredHours = parseInt(preferredTimeMatch[1], 10);
+    const preferredMinutes = parseInt(preferredTimeMatch[2], 10);
+    const preferredPeriod = preferredTimeMatch[3].toUpperCase();
+
+    if (preferredPeriod === 'PM' && preferredHours < 12) {
+      preferredHours += 12;
+    } else if (preferredPeriod === 'AM' && preferredHours === 12) {
+      preferredHours = 0;
+    }
+
+    const preferredTotalMinutes = preferredHours * 60 + preferredMinutes;
+
+    // Find closest time
+    let closestItem = buttonWithTime[0];
+    let closestDiff = Math.abs(preferredTotalMinutes - closestItem.totalMinutes);
+
+    for (const item of buttonWithTime) {
+      const diff = Math.abs(preferredTotalMinutes - item.totalMinutes);
+      if (diff < closestDiff) {
+        closestDiff = diff;
+        closestItem = item;
       }
     }
-    
-    return null;
+
+    console.log(`Found closest time match: ${closestItem.timeText} (preferred: ${preferredTime})`);
+
+    // Ensure element is visible and clickable
+    const style = window.getComputedStyle(closestItem.button);
+    if (style.display === 'none' || style.visibility === 'hidden') {
+      console.log('Closest button found but is not visible');
+      return null;
+    }
+
+    // Scroll into view if needed
+    const rect = closestItem.button.getBoundingClientRect();
+    const isInViewport = rect.top >= 0 &&
+                        rect.left >= 0 &&
+                        rect.bottom <= window.innerHeight &&
+                        rect.right <= window.innerWidth;
+
+    if (!isInViewport) {
+      console.log('Closest button found but is outside viewport, scrolling into view...');
+      closestItem.button.scrollIntoView({ behavior: 'instant', block: 'center' });
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+
+    return closestItem.button;
   }
 
   /**
