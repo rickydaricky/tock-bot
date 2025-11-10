@@ -331,103 +331,145 @@ async function attemptFormFill(tabId: number, preferences: TockPreferences, desi
 
     if (platform === 'tock') {
       console.log(`🔄 Tock platform detected - page already on search URL, refreshing for fresh data`);
-      const reloadStartTime = Date.now();
 
-      // Refresh the page to get fresh data from server
-      // (Page is already on search URL thanks to scheduleTimer navigation)
-      console.log('🔄 Refreshing page to fetch fresh availability data');
-      console.log(`🔄 [DEBUG] Starting page reload for tab ${tabId}`);
-      console.log(`   Current URL: ${tab.url}`);
-      try {
-        await chrome.tabs.reload(tabId);
-        console.log(`✅ [DEBUG] Reload command sent successfully`);
-      } catch (reloadError) {
-        console.error(`❌ [DEBUG] Reload command failed:`, reloadError);
-        throw reloadError;
-      }
+      // Determine retry settings
+      const maxAttempts = preferences.autoRefreshOnNoSlots ? (preferences.maxRefreshRetries ?? 3) : 1;
 
-      // Wait for the refresh to complete
-      console.log(`⏳ [DEBUG] Waiting for tab to finish reloading...`);
-      try {
-        await waitForTabReload(tabId);
-        console.log(`✅ [DEBUG] Tab reload completed`);
-      } catch (waitError) {
-        console.error(`❌ [DEBUG] Wait for reload failed:`, waitError);
-        throw waitError;
-      }
+      // Retry loop for auto-refresh feature (immediate retries, no delay)
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        console.log(`📍 Attempt ${attempt}/${maxAttempts}`);
+        const reloadStartTime = Date.now();
 
-      const reloadEndTime = Date.now();
-      console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
+        // Refresh the page to get fresh data from server
+        // (Page is already on search URL thanks to scheduleTimer navigation)
+        console.log('🔄 Refreshing page to fetch fresh availability data');
+        console.log(`🔄 [DEBUG] Starting page reload for tab ${tabId}`);
+        console.log(`   Current URL: ${tab.url}`);
+        try {
+          await chrome.tabs.reload(tabId);
+          console.log(`✅ [DEBUG] Reload command sent successfully`);
+        } catch (reloadError) {
+          console.error(`❌ [DEBUG] Reload command failed:`, reloadError);
+          throw reloadError;
+        }
 
-      // Send message with desired dates list for content script to try
-      console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
-      console.log(`📤 [DEBUG] Sending AUTO_FILL_FORM message to content script`);
-      console.log(`   Tab ID: ${tabId}`);
-      console.log(`   Dates to try: ${desiredDates.join(', ')}`);
+        // Wait for the refresh to complete
+        console.log(`⏳ [DEBUG] Waiting for tab to finish reloading...`);
+        try {
+          await waitForTabReload(tabId);
+          console.log(`✅ [DEBUG] Tab reload completed`);
+        } catch (waitError) {
+          console.error(`❌ [DEBUG] Wait for reload failed:`, waitError);
+          throw waitError;
+        }
 
-      try {
-        const result = await chrome.tabs.sendMessage(tabId, {
-          type: 'AUTO_FILL_FORM',
-          payload: {
-            preferences,
-            datesToTry: desiredDates,
+        const reloadEndTime = Date.now();
+        console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
+
+        // Send message with desired dates list for content script to try
+        console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
+        console.log(`📤 [DEBUG] Sending AUTO_FILL_FORM message to content script`);
+        console.log(`   Tab ID: ${tabId}`);
+        console.log(`   Dates to try: ${desiredDates.join(', ')}`);
+
+        try {
+          const result = await chrome.tabs.sendMessage(tabId, {
+            type: 'AUTO_FILL_FORM',
+            payload: {
+              preferences,
+              datesToTry: desiredDates,
+            }
+          });
+          console.log(`📥 [DEBUG] Received response from content script:`, result);
+
+          // If successful, return immediately
+          if (result.success) {
+            console.log(`✅ Success on attempt ${attempt}/${maxAttempts}`);
+            return { success: true };
           }
-        });
-        console.log(`📥 [DEBUG] Received response from content script:`, result);
-        return { success: result.success };
-      } catch (messageError) {
-        console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
-        throw messageError;
+
+          // If failed but we have more attempts, retry immediately
+          console.log(`❌ No slots found on attempt ${attempt}/${maxAttempts}${attempt < maxAttempts ? ', retrying immediately...' : ''}`);
+
+        } catch (messageError) {
+          console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
+          throw messageError;
+        }
       }
+
+      // All attempts failed
+      console.log(`❌ Failed after ${maxAttempts} attempts`);
+      return { success: false };
     } else if (platform === 'resy') {
       console.log(`🔄 Resy platform detected - page already on venue URL, refreshing for fresh data`);
-      const reloadStartTime = Date.now();
 
-      // Refresh the page to get fresh data from server
-      console.log('🔄 Refreshing page to fetch fresh availability data');
-      console.log(`🔄 [DEBUG] Starting page reload for tab ${tabId}`);
-      console.log(`   Current URL: ${tab.url}`);
-      try {
-        await chrome.tabs.reload(tabId);
-        console.log(`✅ [DEBUG] Reload command sent successfully`);
-      } catch (reloadError) {
-        console.error(`❌ [DEBUG] Reload command failed:`, reloadError);
-        throw reloadError;
-      }
+      // Determine retry settings
+      const maxAttempts = preferences.autoRefreshOnNoSlots ? (preferences.maxRefreshRetries ?? 3) : 1;
 
-      // Wait for the refresh to complete
-      console.log(`⏳ [DEBUG] Waiting for tab to finish reloading...`);
-      try {
-        await waitForTabReload(tabId);
-        console.log(`✅ [DEBUG] Tab reload completed`);
-      } catch (waitError) {
-        console.error(`❌ [DEBUG] Wait for reload failed:`, waitError);
-        throw waitError;
-      }
+      // Retry loop for auto-refresh feature (immediate retries, no delay)
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        console.log(`📍 Attempt ${attempt}/${maxAttempts}`);
+        const reloadStartTime = Date.now();
 
-      const reloadEndTime = Date.now();
-      console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
+        // Refresh the page to get fresh data from server
+        console.log('🔄 Refreshing page to fetch fresh availability data');
+        console.log(`🔄 [DEBUG] Starting page reload for tab ${tabId}`);
+        console.log(`   Current URL: ${tab.url}`);
+        try {
+          await chrome.tabs.reload(tabId);
+          console.log(`✅ [DEBUG] Reload command sent successfully`);
+        } catch (reloadError) {
+          console.error(`❌ [DEBUG] Reload command failed:`, reloadError);
+          throw reloadError;
+        }
 
-      // Send message with desired dates list for content script to try
-      console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
-      console.log(`📤 [DEBUG] Sending AUTO_FILL_FORM message to content script`);
-      console.log(`   Tab ID: ${tabId}`);
-      console.log(`   Dates to try: ${desiredDates.join(', ')}`);
+        // Wait for the refresh to complete
+        console.log(`⏳ [DEBUG] Waiting for tab to finish reloading...`);
+        try {
+          await waitForTabReload(tabId);
+          console.log(`✅ [DEBUG] Tab reload completed`);
+        } catch (waitError) {
+          console.error(`❌ [DEBUG] Wait for reload failed:`, waitError);
+          throw waitError;
+        }
 
-      try {
-        const result = await chrome.tabs.sendMessage(tabId, {
-          type: 'AUTO_FILL_FORM',
-          payload: {
-            preferences,
-            datesToTry: desiredDates,
+        const reloadEndTime = Date.now();
+        console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
+
+        // Send message with desired dates list for content script to try
+        console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
+        console.log(`📤 [DEBUG] Sending AUTO_FILL_FORM message to content script`);
+        console.log(`   Tab ID: ${tabId}`);
+        console.log(`   Dates to try: ${desiredDates.join(', ')}`);
+
+        try {
+          const result = await chrome.tabs.sendMessage(tabId, {
+            type: 'AUTO_FILL_FORM',
+            payload: {
+              preferences,
+              datesToTry: desiredDates,
+            }
+          });
+          console.log(`📥 [DEBUG] Received response from content script:`, result);
+
+          // If successful, return immediately
+          if (result.success) {
+            console.log(`✅ Success on attempt ${attempt}/${maxAttempts}`);
+            return { success: true };
           }
-        });
-        console.log(`📥 [DEBUG] Received response from content script:`, result);
-        return { success: result.success };
-      } catch (messageError) {
-        console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
-        throw messageError;
+
+          // If failed but we have more attempts, retry immediately
+          console.log(`❌ No slots found on attempt ${attempt}/${maxAttempts}${attempt < maxAttempts ? ', retrying immediately...' : ''}`);
+
+        } catch (messageError) {
+          console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
+          throw messageError;
+        }
       }
+
+      // All attempts failed
+      console.log(`❌ Failed after ${maxAttempts} attempts`);
+      return { success: false };
     } else {
       // For non-Tock/Resy platforms, use original single-date behavior
       const result = await sendAutoFillFormMessage(preferences, tabId);
@@ -475,8 +517,6 @@ async function scheduleTimer(preferences: TockPreferences, tabId: number): Promi
     alarmName,
     dropTime: dropTime.toISOString(),
     scheduledTime: scheduledTime.toISOString(),
-    currentAttempt: 0,
-    maxRetries: preferences.maxRetries ?? 0,
     status: 'scheduled',
     tabId,
   };

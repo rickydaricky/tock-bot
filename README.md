@@ -16,6 +16,10 @@ A Chrome extension that automatically fills in and submits reservation forms on 
 - **Intelligent Time Matching**: Selects the time slot that matches (or is closest to) your preferred time
 - **One-Click Submission**: Fills and submits the form with a single click
 - **Scheduled Automation**: Set a drop time to automatically search and book reservations at a specific time
+- **Advanced Timing Control**:
+  - **Flexible Search Offset**: Search before OR after drop time (e.g., -1500ms = 1.5 seconds AFTER 9pm)
+  - **Auto-Refresh on Empty Slots**: Automatically retry if no slots detected (immediate retries, no delay)
+  - **Aggressive Slot Detection**: Checks every 100ms for first 5 seconds to catch slots the instant they appear
 - **Optimized for Tock**: Direct calendar interaction for ultra-fast date switching
 - **Fresh Data Guarantee**: Page refresh ensures you're always working with the latest availability from the server
 - **Persistent Preferences**: Saves your settings for future use
@@ -73,9 +77,13 @@ A Chrome extension that automatically fills in and submits reservation forms on 
        - Drag from selected → deselects the range
        - **Calendar dates override auto-scan**: If you select specific dates, the scan range is ignored
    - **Reservation Drop Time**: The exact time when reservations open (in your local timezone)
-   - **Search Before Drop**: How many milliseconds before the drop time to start searching (default: 0ms - refreshes exactly at drop time)
-   - **Maximum Retry Attempts**: How many times to retry if the first attempt fails (default: 0 - optimized for single-shot speed)
-   - **Retry Interval**: How long to wait between retry attempts (in seconds)
+   - **Search Offset (ms)**: When to refresh relative to drop time
+     - **Positive values** (e.g., 200): Refresh BEFORE drop time (200ms early)
+     - **Negative values** (e.g., -1500): Refresh AFTER drop time (1.5 seconds late)
+     - **Recommended for Tock**: -1500 to -2000 (gives server time to process the 9pm update)
+   - **Auto-refresh if no slots found** (Optional): Automatically retry if no slots detected
+     - **Max Refresh Attempts**: How many times to refresh and check (1-10)
+     - Retries happen immediately with no delay for maximum speed
 5. Click "Schedule Timer"
 6. The extension will automatically prepare and execute the booking at the specified time
 7. You can monitor the countdown and cancel the timer if needed
@@ -147,21 +155,41 @@ The extension automatically detects whether you're on a Tock or OpenTable page b
 1. **Initial Navigation**: Navigates to the search URL with your primary date when timer is scheduled
    - Example: `https://www.exploretock.com/restaurant-name/search?date=2025-11-07&size=2&time=20%3A00`
 
-2. **At Drop Time**: Refreshes the page to fetch fresh availability data from the server
+2. **Intelligent Timing**: Supports both pre-drop and post-drop refresh strategies
+   - **Positive offset** (e.g., 200ms): Refreshes slightly before drop time (traditional approach)
+   - **Negative offset** (e.g., -1500ms): Refreshes 1.5 seconds AFTER drop time
+     - **Why this works**: Tock's backend needs time to process the reservation release
+     - **Problem solved**: Prevents fetching stale/empty API responses
+     - **Recommended**: -1500 to -2000ms for most restaurants
 
-3. **Calendar Parsing**: Parses the Tock calendar HTML to find available dates
+3. **Auto-Retry on Empty Slots**: If enabled, automatically retries if no slots found
+   - **Immediate retries**: No delay between attempts (maximum speed)
+   - **Example flow** (with 3 max attempts):
+     ```
+     9:00:01.5s → Refresh → No slots → Immediate retry
+     9:00:01.7s → Refresh → No slots → Immediate retry
+     9:00:01.9s → Refresh → Slots found! ✓
+     ```
+
+4. **Aggressive Slot Detection**: Optimized polling strategy
+   - **First 5 seconds**: Checks every 100ms (10x per second)
+   - **After 5 seconds**: Falls back to 500ms intervals
+   - **MutationObserver**: Detects DOM changes instantly in parallel
+   - **Total**: ~50 detection attempts in first 5 seconds
+
+5. **Calendar Parsing**: Parses the Tock calendar HTML to find available dates
    - Looks for elements with `.ConsumerCalendar-day.is-available.is-in-month` classes
    - Extracts date from `aria-label` attributes (YYYY-MM-DD format)
    - Filters out disabled, sold out, or out-of-month dates
 
-4. **Smart Date Filtering**: Compares desired dates against available dates
+6. **Smart Date Filtering**: Compares desired dates against available dates
    - Desired dates determined by:
      - If calendar dates selected: Uses only those specific dates
      - If no calendar dates: Generates ±N days from primary date
    - Only tries dates that are both desired AND available
    - Skips dates that are sold out or disabled
 
-5. **Fast Date Iteration**: For each available date:
+7. **Fast Date Iteration**: For each available date:
    - Clicks the calendar date button directly in the DOM
    - Waits 300ms for page to update
    - Checks for "Book" button
@@ -171,11 +199,13 @@ The extension automatically detects whether you're on a Tock or OpenTable page b
 **Why this approach is fast:**
 - Single page load instead of N page loads for N dates
 - Direct calendar interaction (just like a human clicking dates)
-- No delays between date attempts
+- No delays between date attempts or retries
+- Aggressive 100ms polling catches slots instantly
 - Only tries dates that Tock's calendar shows as available
-- Fresh server data from initial page refresh
+- Auto-refresh handles race conditions with server updates
+- Fresh server data from strategic timing
 
-**Why the refresh is necessary:** Tock uses client-side routing (SPA), so the search button doesn't make a fresh server request. Without a page refresh, the script would work with stale cached data loaded before the reservation drop.
+**Why negative offset works better:** Tock's servers need ~500ms-2s to process the reservation release at drop time. Refreshing immediately at 9:00:00 often returns empty data because the API call completes before slots are ready. Waiting 1.5-2 seconds lets the backend finish processing, ensuring your first refresh gets real availability data.
 
 ### OpenTable Implementation
 - Finds hidden `<select>` elements for party size, date, and time
@@ -186,8 +216,10 @@ The extension automatically detects whether you're on a Tock or OpenTable page b
 
 ### Scheduled Automation
 - Uses Chrome Alarms API for precise timing
-- Supports retry logic with configurable intervals
+- Supports flexible timing (before OR after drop time)
+- Auto-refresh on empty slots with immediate retries
 - Tracks timer status and displays countdown in real-time
+- Aggressive slot detection (100ms polling for first 5 seconds)
 
 ## Known Limitations
 

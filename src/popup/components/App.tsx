@@ -20,8 +20,6 @@ const App: React.FC = () => {
     autoSearchEnabled: false,
     dropTime: undefined,
     leadTimeMs: 200,
-    maxRetries: 0,
-    retryIntervalSeconds: 1,
   });
   const [status, setStatus] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -122,8 +120,7 @@ const App: React.FC = () => {
           const hasChanged =
             prevTimer!.alarmName !== timerStatus!.alarmName ||
             prevTimer!.status !== timerStatus!.status ||
-            prevTimer!.scheduledTime !== timerStatus!.scheduledTime ||
-            prevTimer!.currentAttempt !== timerStatus!.currentAttempt;
+            prevTimer!.scheduledTime !== timerStatus!.scheduledTime;
 
           return hasChanged ? timerStatus : prevTimer;
         });
@@ -183,13 +180,13 @@ const App: React.FC = () => {
     setPreferences(prev => ({ ...prev, leadTimeMs: isNaN(value) ? 200 : value }));
   };
 
-  const handleMaxRetriesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = parseInt(e.target.value);
-    setPreferences(prev => ({ ...prev, maxRetries: isNaN(value) ? 0 : value }));
+  const handleAutoRefreshOnNoSlotsChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setPreferences(prev => ({ ...prev, autoRefreshOnNoSlots: e.target.checked }));
   };
 
-  const handleRetryIntervalChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPreferences(prev => ({ ...prev, retryIntervalSeconds: parseInt(e.target.value) || 1 }));
+  const handleMaxRefreshRetriesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseInt(e.target.value);
+    setPreferences(prev => ({ ...prev, maxRefreshRetries: isNaN(value) ? 3 : value }));
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -447,47 +444,58 @@ const App: React.FC = () => {
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                Search Before Drop (ms)
+                Search Offset (ms)
               </label>
               <input
                 type="number"
                 value={preferences.leadTimeMs ?? 200}
                 onChange={handleLeadTimeMsChange}
-                min="0"
+                min="-5000"
                 max="5000"
                 step="100"
                 className="input text-sm"
               />
-              <p className="text-xs text-gray-500 mt-1">How many milliseconds before drop time to search (0-5000)</p>
+              <p className="text-xs text-gray-500 mt-1">
+                Positive = search BEFORE drop (e.g., 200 = 200ms early)<br />
+                Negative = search AFTER drop (e.g., -1500 = 1.5s late)<br />
+                Range: -5000 to 5000ms
+              </p>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Maximum Retry Attempts
+            <div className="border-t border-gray-200 pt-3">
+              <label className="flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={preferences.autoRefreshOnNoSlots || false}
+                  onChange={handleAutoRefreshOnNoSlotsChange}
+                  className="mr-2 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="text-sm font-medium text-gray-700">
+                  Auto-refresh if no slots found
+                </span>
               </label>
-              <input
-                type="number"
-                value={preferences.maxRetries ?? 0}
-                onChange={handleMaxRetriesChange}
-                min="0"
-                max="100"
-                className="input text-sm"
-              />
-            </div>
+              <p className="text-xs text-gray-500 mt-1 ml-6">
+                Automatically retry by refreshing the page if no available slots are detected
+              </p>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Retry Interval (seconds)
-              </label>
-              <input
-                type="number"
-                value={preferences.retryIntervalSeconds || 1}
-                onChange={handleRetryIntervalChange}
-                min="0.1"
-                max="60"
-                step="0.1"
-                className="input text-sm"
-              />
+              {preferences.autoRefreshOnNoSlots && (
+                <div className="ml-6 mt-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">
+                      Max Refresh Attempts
+                    </label>
+                    <input
+                      type="number"
+                      value={preferences.maxRefreshRetries ?? 3}
+                      onChange={handleMaxRefreshRetriesChange}
+                      min="1"
+                      max="10"
+                      className="input text-sm w-20"
+                    />
+                    <p className="text-xs text-gray-400 mt-1">How many times to refresh (1-10). Retries immediately with no delay.</p>
+                  </div>
+                </div>
+              )}
             </div>
 
             {activeTimer?.status === 'scheduled' ? (
@@ -495,7 +503,6 @@ const App: React.FC = () => {
                 <div className="p-3 bg-green-50 rounded-md">
                   <p className="text-sm font-medium text-green-800">Timer Active</p>
                   <p className="text-xs text-green-600 mt-1">Triggers in: {countdown}</p>
-                  <p className="text-xs text-green-600">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries + 1}</p>
                 </div>
                 <button
                   type="button"
@@ -508,7 +515,6 @@ const App: React.FC = () => {
             ) : activeTimer?.status === 'running' ? (
               <div className="p-3 bg-blue-50 rounded-md">
                 <p className="text-sm font-medium text-blue-800">Running...</p>
-                <p className="text-xs text-blue-600 mt-1">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries + 1}</p>
               </div>
             ) : activeTimer?.status === 'completed' ? (
               <div className="space-y-2">
@@ -526,7 +532,7 @@ const App: React.FC = () => {
             ) : activeTimer?.status === 'failed' ? (
               <div className="space-y-2">
                 <div className="p-3 bg-red-50 rounded-md">
-                  <p className="text-sm font-medium text-red-800">Failed After {activeTimer.maxRetries + 1} Attempts</p>
+                  <p className="text-sm font-medium text-red-800">Failed</p>
                 </div>
                 <button
                   type="button"

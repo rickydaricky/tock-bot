@@ -483,13 +483,16 @@ export class TockFormFiller {
 
   /**
    * Wait for and click the book button if available after search
+   * Uses aggressive polling (100ms) for first 5 seconds to catch slots as soon as they appear
    */
   private async waitForAndClickBookButton(): Promise<boolean> {
     console.log('Waiting for book button to appear...');
-    
+
     // Reset attempts counter for this operation
     this.attempts = 0;
-    
+    const startTime = Date.now();
+    const aggressivePhaseMs = 5000; // First 5 seconds use aggressive polling
+
     return new Promise((resolve) => {
       // Use MutationObserver to detect when new elements are added to the DOM
       const observer = new MutationObserver(async (mutations) => {
@@ -499,7 +502,8 @@ export class TockFormFiller {
             const bookButton = await this.findBookButton();
             if (bookButton) {
               observer.disconnect();
-              console.log('Book button found via MutationObserver, clicking...');
+              const elapsed = Date.now() - startTime;
+              console.log(`✅ Book button found via MutationObserver after ${elapsed}ms, clicking...`);
               bookButton.click();
               resolve(true);
               return;
@@ -507,39 +511,45 @@ export class TockFormFiller {
           }
         }
       });
-      
+
       // Start observing the document body for DOM changes
       observer.observe(document.body, { childList: true, subtree: true });
-      
-      // Also use polling as a fallback
+
+      // Also use polling as a fallback with aggressive timing in first 5 seconds
       const checkForBookButton = async () => {
         this.attempts++;
-        
+        const elapsed = Date.now() - startTime;
+
         const bookButton = await this.findBookButton();
-        
+
         if (bookButton) {
           observer.disconnect();
-          console.log('Book button found via polling, clicking...');
+          console.log(`✅ Book button found via polling after ${elapsed}ms (attempt ${this.attempts}), clicking...`);
           bookButton.click();
           resolve(true);
-        } else if (this.attempts >= this.maxAttempts) {
+        } else if (this.attempts >= this.maxAttempts && elapsed >= aggressivePhaseMs) {
+          // Only give up after aggressive phase is complete
           observer.disconnect();
-          console.log('Could not find book button after maximum attempts');
+          console.log(`❌ Could not find book button after ${this.attempts} attempts and ${elapsed}ms`);
           resolve(false);
         } else {
-          console.log(`Book button not found yet, attempt ${this.attempts}/${this.maxAttempts}`);
-          setTimeout(checkForBookButton, 500); // Check more frequently
+          // Use aggressive polling (100ms) for first 5 seconds, then fall back to 500ms
+          const pollInterval = elapsed < aggressivePhaseMs ? 100 : 500;
+          const phase = elapsed < aggressivePhaseMs ? 'aggressive' : 'standard';
+          console.log(`🔍 Book button not found yet, attempt ${this.attempts} (${phase} polling: ${pollInterval}ms, elapsed: ${elapsed}ms)`);
+          setTimeout(checkForBookButton, pollInterval);
         }
       };
-      
+
       // Start checking immediately, then at intervals
       checkForBookButton();
-      
+
       // Set a maximum timeout of 30 seconds to prevent hanging
       setTimeout(() => {
         observer.disconnect();
-        if (this.attempts < this.maxAttempts) {
-          console.log('Timeout reached waiting for book button');
+        const elapsed = Date.now() - startTime;
+        if (this.attempts < this.maxAttempts || elapsed < aggressivePhaseMs) {
+          console.log(`⏱️ Timeout reached waiting for book button after ${elapsed}ms`);
           resolve(false);
         }
       }, 30000);

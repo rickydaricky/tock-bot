@@ -13,9 +13,10 @@ export interface TockPreferences {
   // Auto-search settings
   autoSearchEnabled?: boolean;
   dropTime?: string; // ISO datetime string
-  leadTimeMs?: number; // Milliseconds before drop time to search
-  maxRetries?: number;
-  retryIntervalSeconds?: number;
+  leadTimeMs?: number; // Milliseconds before drop time to search (positive = before, negative = after)
+  // Auto-refresh settings
+  autoRefreshOnNoSlots?: boolean; // Auto-refresh if no slots found (default: false)
+  maxRefreshRetries?: number; // Number of refresh attempts (default: 3)
   // Timing measurement
   alarmFireTime?: number; // Timestamp when alarm fired (for performance measurement)
 }
@@ -29,8 +30,6 @@ export interface ActiveTimer {
   alarmName: string;
   dropTime: string;
   scheduledTime: string; // When the alarm will fire (dropTime - leadTime)
-  currentAttempt: number;
-  maxRetries: number;
   status: 'scheduled' | 'running' | 'completed' | 'failed' | 'cancelled';
   tabId?: number; // The tab where the reservation should happen
 }
