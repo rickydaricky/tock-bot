@@ -99,7 +99,34 @@ const App: React.FC = () => {
     const pollTimerStatus = async () => {
       try {
         const timerStatus = await sendGetTimerStatusMessage();
-        setActiveTimer(timerStatus);
+
+        // Only update state if timer actually changed (prevents race condition)
+        setActiveTimer(prevTimer => {
+          // If both are null, no change needed
+          if (!prevTimer && !timerStatus) return prevTimer;
+
+          // If we have a timer but polling returns null, check status
+          // Only keep timer if it's still being scheduled (prevents race condition)
+          // Allow null through for other statuses (running/completed/failed/cancelled)
+          if (prevTimer && !timerStatus) {
+            if (prevTimer.status === 'scheduled') {
+              return prevTimer;
+            }
+            return null;
+          }
+
+          // If we didn't have a timer and now we do, update
+          if (!prevTimer && timerStatus) return timerStatus;
+
+          // Compare timer states - only update if something changed
+          const hasChanged =
+            prevTimer!.alarmName !== timerStatus!.alarmName ||
+            prevTimer!.status !== timerStatus!.status ||
+            prevTimer!.scheduledTime !== timerStatus!.scheduledTime ||
+            prevTimer!.currentAttempt !== timerStatus!.currentAttempt;
+
+          return hasChanged ? timerStatus : prevTimer;
+        });
       } catch (error) {
         console.error('Error polling timer status:', error);
       }
@@ -468,7 +495,7 @@ const App: React.FC = () => {
                 <div className="p-3 bg-green-50 rounded-md">
                   <p className="text-sm font-medium text-green-800">Timer Active</p>
                   <p className="text-xs text-green-600 mt-1">Triggers in: {countdown}</p>
-                  <p className="text-xs text-green-600">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries}</p>
+                  <p className="text-xs text-green-600">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries + 1}</p>
                 </div>
                 <button
                   type="button"
@@ -481,7 +508,7 @@ const App: React.FC = () => {
             ) : activeTimer?.status === 'running' ? (
               <div className="p-3 bg-blue-50 rounded-md">
                 <p className="text-sm font-medium text-blue-800">Running...</p>
-                <p className="text-xs text-blue-600 mt-1">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries}</p>
+                <p className="text-xs text-blue-600 mt-1">Attempt: {activeTimer.currentAttempt + 1} / {activeTimer.maxRetries + 1}</p>
               </div>
             ) : activeTimer?.status === 'completed' ? (
               <div className="space-y-2">
@@ -499,7 +526,7 @@ const App: React.FC = () => {
             ) : activeTimer?.status === 'failed' ? (
               <div className="space-y-2">
                 <div className="p-3 bg-red-50 rounded-md">
-                  <p className="text-sm font-medium text-red-800">Failed After {activeTimer.maxRetries} Attempts</p>
+                  <p className="text-sm font-medium text-red-800">Failed After {activeTimer.maxRetries + 1} Attempts</p>
                 </div>
                 <button
                   type="button"

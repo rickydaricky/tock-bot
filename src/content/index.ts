@@ -9,7 +9,9 @@ console.log(`Form Filler Content Script Loaded - Platform: ${currentPlatform ? g
 
 // Listen for messages from the background script
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
-  console.log('Message received in content script:', message);
+  console.log(`📩 [DEBUG] Content script received message:`, message);
+  console.log(`   Message type: ${message.type}`);
+  console.log(`   Current URL: ${window.location.href}`);
 
   // Handle form fill triggered by background script (both manual and automatic modes)
   // The background script navigates to the search URL before sending this message
@@ -35,11 +37,14 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
           autoSubmit: true,
         });
 
+        console.log(`🎯 [DEBUG] Calling tryMultipleDates with ${datesToTry.length} dates`);
         formFiller.tryMultipleDates(datesToTry)
           .then((success) => {
+            console.log(`📊 [DEBUG] tryMultipleDates returned: ${success}`);
             sendResponse({ success });
           })
           .catch((error) => {
+            console.error(`💥 [DEBUG] tryMultipleDates threw exception:`, error);
             console.error('Error trying multiple dates:', error);
             sendResponse({ success: false, error: error.message });
           });

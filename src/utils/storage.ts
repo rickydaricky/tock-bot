@@ -11,7 +11,7 @@ export const DEFAULT_PREFERENCES: TockPreferences = {
   autoSearchEnabled: false,
   dropTime: undefined,
   leadTimeMs: 0, // Refresh exactly at drop time (not before, to ensure fresh data)
-  maxRetries: 0, // No retries by default (optimized for speed)
+  maxRetries: 0, // 0 retries by default (1 attempt total, optimized for speed)
   retryIntervalSeconds: 1,
 };
 

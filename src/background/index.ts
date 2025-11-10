@@ -98,9 +98,13 @@ chrome.runtime.onStartup.addListener(async () => {
 
 // Listen for alarms
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  console.log(`🔔 [DEBUG] Alarm listener triggered for: ${alarm.name}`);
   if (alarm.name.startsWith(ALARM_NAME_PREFIX)) {
-    console.log('Alarm triggered:', alarm.name);
+    console.log(`✅ [DEBUG] Alarm matches prefix, calling handleAlarmTrigger`);
     await handleAlarmTrigger(alarm.name);
+    console.log(`✅ [DEBUG] handleAlarmTrigger completed`);
+  } else {
+    console.log(`⚠️ [DEBUG] Alarm does not match prefix, ignoring`);
   }
 });
 
@@ -112,13 +116,18 @@ async function handleAlarmTrigger(alarmName: string) {
   const activeTimer = await loadActiveTimer();
 
   if (!activeTimer || activeTimer.alarmName !== alarmName) {
-    console.error('No active timer found for alarm:', alarmName);
+    console.error(`❌ [DEBUG] No active timer found for alarm: ${alarmName}`);
+    console.error(`   Active timer:`, activeTimer);
     return;
   }
+  console.log(`✅ [DEBUG] Active timer found:`, activeTimer);
 
   // Update status to running
+  console.log(`🔄 [DEBUG] Updating timer status from '${activeTimer.status}' to 'running'`);
   activeTimer.status = 'running';
   await saveActiveTimer(activeTimer);
+  console.log(`✅ [DEBUG] Timer status updated to 'running'`);
+
 
   try {
     // Get preferences
@@ -135,43 +144,75 @@ async function handleAlarmTrigger(alarmName: string) {
 
     // Attempt to fill the form on the target tab
     if (activeTimer.tabId) {
+      console.log(`🎯 [DEBUG] Calling attemptFormFill for tab ${activeTimer.tabId}`);
       const result = await attemptFormFill(activeTimer.tabId, preferences, desiredDates);
+      console.log(`📊 [DEBUG] attemptFormFill returned:`, result);
 
       if (result.success) {
         // Success! Mark as completed
+        console.log(`✅ [DEBUG] Form fill succeeded, updating status to 'completed'`);
         activeTimer.status = 'completed';
         await saveActiveTimer(activeTimer);
+        console.log(`✅ [DEBUG] Status saved as 'completed'`);
         console.log(`✅ Successfully booked!`);
       } else {
         // Failed
+        console.log(`❌ [DEBUG] Form fill failed, updating status to 'failed'`);
         activeTimer.status = 'failed';
         await saveActiveTimer(activeTimer);
+        console.log(`✅ [DEBUG] Status saved as 'failed'`);
         console.log('❌ Failed to book any available dates');
       }
     } else {
       // No tab ID, mark as failed
+      console.error(`❌ [DEBUG] No tab ID specified for timer`);
       activeTimer.status = 'failed';
       await saveActiveTimer(activeTimer);
       console.error('No tab ID specified for timer');
     }
   } catch (error) {
-    console.error('Error executing auto-fill:', error);
+    console.error(`💥 [DEBUG] Exception caught in handleAlarmTrigger:`, error);
+    console.error(`   Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
+    console.error(`   Error message: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`   Stack trace:`, error instanceof Error ? error.stack : 'N/A');
     activeTimer.status = 'failed';
     await saveActiveTimer(activeTimer);
+    console.log(`✅ [DEBUG] Status saved as 'failed' after exception`);
   }
 }
 
 // Wait for a tab to finish reloading
 async function waitForTabReload(tabId: number): Promise<void> {
-  return new Promise((resolve) => {
-    const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+  return new Promise((resolve, reject) => {
+    console.log(`⏳ [DEBUG] waitForTabReload: Setting up listener for tab ${tabId}`);
+
+    let completed = false;
+    const timeout = setTimeout(() => {
+      if (!completed) {
+        completed = true;
         chrome.tabs.onUpdated.removeListener(listener);
-        // Add a small buffer delay for stability
-        setTimeout(() => resolve(), 150);
+        console.error(`❌ [DEBUG] waitForTabReload: Timeout after 5s`);
+        reject(new Error('Tab reload timeout after 5 seconds'));
+      }
+    }, 5000); // 5 second timeout
+
+    const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+      console.log(`📡 [DEBUG] Tab update event: tab ${updatedTabId}, status: ${changeInfo.status}`);
+
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        if (!completed) {
+          completed = true;
+          clearTimeout(timeout);
+          chrome.tabs.onUpdated.removeListener(listener);
+          console.log(`✅ [DEBUG] waitForTabReload: Tab ${tabId} completed loading`);
+          // Add a small buffer delay for stability
+          setTimeout(() => resolve(), 150);
+        }
       }
     };
+
     chrome.tabs.onUpdated.addListener(listener);
+    console.log(`✅ [DEBUG] waitForTabReload: Listener attached`);
   });
 }
 
@@ -242,11 +283,13 @@ async function attemptFormFill(tabId: number, preferences: TockPreferences, desi
   try {
     // Get the tab to check its URL
     const tab = await chrome.tabs.get(tabId);
+    console.log(`📑 [DEBUG] Tab info:`, { id: tab.id, url: tab.url, status: tab.status });
 
     if (!tab.url) {
-      console.error('Tab URL not available');
+      console.error(`❌ [DEBUG] Tab URL not available, returning failure`);
       return { success: false };
     }
+    console.log(`✅ [DEBUG] Tab URL available: ${tab.url}`);
 
     // Check if this is a Tock page
     const platform = detectPlatform(tab.url);
@@ -258,31 +301,59 @@ async function attemptFormFill(tabId: number, preferences: TockPreferences, desi
       // Refresh the page to get fresh data from server
       // (Page is already on search URL thanks to scheduleTimer navigation)
       console.log('🔄 Refreshing page to fetch fresh availability data');
-      await chrome.tabs.reload(tabId);
+      console.log(`🔄 [DEBUG] Starting page reload for tab ${tabId}`);
+      console.log(`   Current URL: ${tab.url}`);
+      try {
+        await chrome.tabs.reload(tabId);
+        console.log(`✅ [DEBUG] Reload command sent successfully`);
+      } catch (reloadError) {
+        console.error(`❌ [DEBUG] Reload command failed:`, reloadError);
+        throw reloadError;
+      }
 
       // Wait for the refresh to complete
-      await waitForTabReload(tabId);
+      console.log(`⏳ [DEBUG] Waiting for tab to finish reloading...`);
+      try {
+        await waitForTabReload(tabId);
+        console.log(`✅ [DEBUG] Tab reload completed`);
+      } catch (waitError) {
+        console.error(`❌ [DEBUG] Wait for reload failed:`, waitError);
+        throw waitError;
+      }
 
       const reloadEndTime = Date.now();
       console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
 
       // Send message with desired dates list for content script to try
       console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
-      const result = await chrome.tabs.sendMessage(tabId, {
-        type: 'AUTO_FILL_FORM',
-        payload: {
-          preferences,
-          datesToTry: desiredDates,
-        }
-      });
+      console.log(`📤 [DEBUG] Sending AUTO_FILL_FORM message to content script`);
+      console.log(`   Tab ID: ${tabId}`);
+      console.log(`   Dates to try: ${desiredDates.join(', ')}`);
 
-      return { success: result.success };
+      try {
+        const result = await chrome.tabs.sendMessage(tabId, {
+          type: 'AUTO_FILL_FORM',
+          payload: {
+            preferences,
+            datesToTry: desiredDates,
+          }
+        });
+        console.log(`📥 [DEBUG] Received response from content script:`, result);
+        return { success: result.success };
+      } catch (messageError) {
+        console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
+        throw messageError;
+      }
     } else {
       // For non-Tock platforms, use original single-date behavior
       const result = await sendAutoFillFormMessage(preferences, tabId);
       return result;
     }
   } catch (error) {
+    console.error(`💥 [DEBUG] Exception in attemptFormFill:`, error);
+    console.error(`   Error type: ${error instanceof Error ? error.constructor.name : typeof error}`);
+    console.error(`   Error message: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`   Stack trace:`, error instanceof Error ? error.stack : 'N/A');
     console.error('Error sending auto-fill message:', error);
     return { success: false };
   }
@@ -368,7 +439,7 @@ async function cancelTimer(): Promise<void> {
     await saveActiveTimer(activeTimer);
 
     // Clear from storage
-    setTimeout(() => clearActiveTimer(), 1000);
+    await clearActiveTimer();
 
     console.log('Timer cancelled:', activeTimer.alarmName);
   }
