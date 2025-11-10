@@ -30,6 +30,10 @@ export function detectPlatform(url: string): Platform | null {
     return 'opentable';
   }
 
+  if (urlLower.includes('resy.com')) {
+    return 'resy';
+  }
+
   return null;
 }
 
@@ -42,6 +46,8 @@ export function getPlatformDisplayName(platform: Platform): string {
       return 'Tock';
     case 'opentable':
       return 'OpenTable';
+    case 'resy':
+      return 'Resy';
     default:
       return 'Unknown';
   }

@@ -1,14 +1,59 @@
 import { Message, TockPreferences, Platform } from '../types';
 import { TockFormFiller } from './form-filler';
 import { OpenTableFormFiller } from './opentable-form-filler';
+import { ResyFormFiller } from './resy-form-filler';
 import { detectPlatform, getPlatformDisplayName } from '../utils/platform';
 
-// Detect which platform we're on
-const currentPlatform = detectPlatform(window.location.href);
-console.log(`Form Filler Content Script Loaded - Platform: ${currentPlatform ? getPlatformDisplayName(currentPlatform) : 'Unknown'}`);
+// Special handling for Resy widget iframe
+if (window.location.hostname === 'widgets.resy.com') {
+  console.log('Content script loaded in Resy widget iframe');
 
-// Listen for messages from the background script
-chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
+  // Listen for messages from main page to click Reserve button
+  chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
+    console.log('📩 [IFRAME] Received message:', message);
+
+    if (message.type === 'CLICK_RESERVE_BUTTON') {
+      console.log('[IFRAME] Searching for Reserve Now button...');
+
+      // Look for the Reserve Now button
+      const button = document.querySelector('[data-test-id="order_summary_page-button-book"]') as HTMLElement;
+
+      if (button) {
+        console.log('[IFRAME] Found Reserve Now button, checking if clickable...');
+
+        const isVisible = button.offsetParent !== null;
+        const isEnabled = !button.hasAttribute('disabled');
+
+        console.log('[IFRAME] Button state:', { isVisible, isEnabled });
+
+        if (isVisible && isEnabled) {
+          console.log('[IFRAME] Clicking Reserve Now button!');
+          button.click();
+          sendResponse({ success: true });
+        } else {
+          console.log('[IFRAME] Button found but not clickable');
+          sendResponse({ success: false, error: 'Button not clickable' });
+        }
+      } else {
+        console.log('[IFRAME] Reserve Now button not found');
+        sendResponse({ success: false, error: 'Button not found' });
+      }
+
+      return true; // Keep message channel open for async response
+    }
+  });
+
+  // Don't run main page logic in iframe
+  console.log('[IFRAME] Skipping main page logic');
+} else {
+  // Main page logic - only run if NOT in iframe
+
+  // Detect which platform we're on
+  const currentPlatform = detectPlatform(window.location.href);
+  console.log(`Form Filler Content Script Loaded - Platform: ${currentPlatform ? getPlatformDisplayName(currentPlatform) : 'Unknown'}`);
+
+  // Listen for messages from the background script
+  chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
   console.log(`📩 [DEBUG] Content script received message:`, message);
   console.log(`   Message type: ${message.type}`);
   console.log(`   Current URL: ${window.location.href}`);
@@ -48,9 +93,27 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
             console.error('Error trying multiple dates:', error);
             sendResponse({ success: false, error: error.message });
           });
+      } else if (currentPlatform === 'resy') {
+        const formFiller = new ResyFormFiller({
+          preferences,
+          waitForForm: true,
+          autoSubmit: true,
+        });
+
+        console.log(`🎯 [DEBUG] Calling fillForm (Resy) with ${datesToTry.length} dates`);
+        formFiller.fillForm(datesToTry)
+          .then((success) => {
+            console.log(`📊 [DEBUG] fillForm (Resy) returned: ${success}`);
+            sendResponse({ success });
+          })
+          .catch((error) => {
+            console.error(`💥 [DEBUG] fillForm (Resy) threw exception:`, error);
+            console.error('Error filling Resy form:', error);
+            sendResponse({ success: false, error: error.message });
+          });
       } else {
-        console.error('Multi-date mode only supported for Tock');
-        sendResponse({ success: false, error: 'Multi-date mode only supported for Tock' });
+        console.error('Multi-date mode only supported for Tock and Resy');
+        sendResponse({ success: false, error: 'Multi-date mode only supported for Tock and Resy' });
       }
     } else {
       // Single date mode (original behavior)
@@ -76,7 +139,7 @@ const handleFormFill = async (preferences: TockPreferences): Promise<boolean> =>
       return false;
     }
 
-    let formFiller: TockFormFiller | OpenTableFormFiller;
+    let formFiller: TockFormFiller | OpenTableFormFiller | ResyFormFiller;
 
     switch (currentPlatform) {
       case 'tock':
@@ -86,7 +149,7 @@ const handleFormFill = async (preferences: TockPreferences): Promise<boolean> =>
           waitForForm: true,
           autoSubmit: true, // Auto-click search and book buttons
         });
-        break;
+        return await formFiller.fill();
 
       case 'opentable':
         console.log('Using OpenTable form filler');
@@ -95,16 +158,25 @@ const handleFormFill = async (preferences: TockPreferences): Promise<boolean> =>
           waitForForm: true,
           autoSubmit: true, // Auto-click first available time slot
         });
-        break;
+        return await formFiller.fill();
+
+      case 'resy':
+        console.log('Using Resy form filler');
+        formFiller = new ResyFormFiller({
+          preferences,
+          waitForForm: true,
+          autoSubmit: true, // Auto-click time slot and reserve button
+        });
+        return await formFiller.fillForm();
 
       default:
         console.error(`Unknown platform: ${currentPlatform}`);
         return false;
     }
-
-    return await formFiller.fill();
   } catch (error) {
     console.error('Error filling form:', error);
     return false;
   }
-}; 
+};
+
+} // End of main page logic (else block)

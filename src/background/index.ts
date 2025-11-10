@@ -3,7 +3,7 @@ import { Message, TockPreferences, ActiveTimer } from '../types';
 import { DEFAULT_PREFERENCES, saveActiveTimer, loadActiveTimer, clearActiveTimer, loadPreferences } from '../utils/storage';
 import { sendAutoFillFormMessage } from '../utils/messaging';
 import { detectPlatform } from '../utils/platform';
-import { buildTockSearchUrl, buildTockSearchUrlWithDate } from '../utils/url-builder';
+import { buildTockSearchUrl, buildTockSearchUrlWithDate, buildResySearchUrl, buildResySearchUrlWithDate } from '../utils/url-builder';
 
 console.log('Tock Form Filler Background Script Loaded');
 
@@ -266,8 +266,43 @@ async function attemptManualFormFill(tabId: number, preferences: TockPreferences
       });
 
       return { success: result.success };
+    } else if (platform === 'resy') {
+      console.log(`🔄 Manual fill - Resy platform detected, navigating to venue page with params`);
+      const navigateStartTime = Date.now();
+
+      // Build search URL with the PRIMARY date (first in list)
+      const primaryDate = desiredDates[0];
+      const searchUrl = buildResySearchUrlWithDate(tab.url, preferences, primaryDate);
+
+      if (!searchUrl) {
+        console.error('Failed to build Resy search URL');
+        return { success: false };
+      }
+
+      console.log(`🔗 Navigating to: ${searchUrl}`);
+
+      // Navigate to the search URL
+      await chrome.tabs.update(tabId, { url: searchUrl });
+
+      // Wait for the page to finish loading
+      await waitForTabReload(tabId);
+
+      const navigateEndTime = Date.now();
+      console.log(`⏰ [TIMING] Navigation completed (delta: ${navigateEndTime - navigateStartTime}ms)`);
+
+      // Send message with desired dates list for content script to try
+      console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'AUTO_FILL_FORM',
+        payload: {
+          preferences,
+          datesToTry: desiredDates,
+        }
+      });
+
+      return { success: result.success };
     } else {
-      // For non-Tock platforms, use original single-date behavior
+      // For non-Tock/Resy platforms, use original single-date behavior
       const result = await sendAutoFillFormMessage(preferences, tabId);
       return result;
     }
@@ -344,8 +379,57 @@ async function attemptFormFill(tabId: number, preferences: TockPreferences, desi
         console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
         throw messageError;
       }
+    } else if (platform === 'resy') {
+      console.log(`🔄 Resy platform detected - page already on venue URL, refreshing for fresh data`);
+      const reloadStartTime = Date.now();
+
+      // Refresh the page to get fresh data from server
+      console.log('🔄 Refreshing page to fetch fresh availability data');
+      console.log(`🔄 [DEBUG] Starting page reload for tab ${tabId}`);
+      console.log(`   Current URL: ${tab.url}`);
+      try {
+        await chrome.tabs.reload(tabId);
+        console.log(`✅ [DEBUG] Reload command sent successfully`);
+      } catch (reloadError) {
+        console.error(`❌ [DEBUG] Reload command failed:`, reloadError);
+        throw reloadError;
+      }
+
+      // Wait for the refresh to complete
+      console.log(`⏳ [DEBUG] Waiting for tab to finish reloading...`);
+      try {
+        await waitForTabReload(tabId);
+        console.log(`✅ [DEBUG] Tab reload completed`);
+      } catch (waitError) {
+        console.error(`❌ [DEBUG] Wait for reload failed:`, waitError);
+        throw waitError;
+      }
+
+      const reloadEndTime = Date.now();
+      console.log(`⏰ [TIMING] Page refresh completed (delta: ${reloadEndTime - reloadStartTime}ms)`);
+
+      // Send message with desired dates list for content script to try
+      console.log(`📅 Sending ${desiredDates.length} desired dates to content script`);
+      console.log(`📤 [DEBUG] Sending AUTO_FILL_FORM message to content script`);
+      console.log(`   Tab ID: ${tabId}`);
+      console.log(`   Dates to try: ${desiredDates.join(', ')}`);
+
+      try {
+        const result = await chrome.tabs.sendMessage(tabId, {
+          type: 'AUTO_FILL_FORM',
+          payload: {
+            preferences,
+            datesToTry: desiredDates,
+          }
+        });
+        console.log(`📥 [DEBUG] Received response from content script:`, result);
+        return { success: result.success };
+      } catch (messageError) {
+        console.error(`❌ [DEBUG] Failed to send message to content script:`, messageError);
+        throw messageError;
+      }
     } else {
-      // For non-Tock platforms, use original single-date behavior
+      // For non-Tock/Resy platforms, use original single-date behavior
       const result = await sendAutoFillFormMessage(preferences, tabId);
       return result;
     }
@@ -415,6 +499,15 @@ async function scheduleTimer(preferences: TockPreferences, tabId: number): Promi
         } else {
           console.warn('Failed to build Tock search URL, will use form filling approach');
         }
+      } else if (platform === 'resy') {
+        const searchUrl = buildResySearchUrl(tab.url, preferences);
+
+        if (searchUrl) {
+          console.log('🔗 Navigating to Resy venue URL:', searchUrl);
+          await chrome.tabs.update(tabId, { url: searchUrl });
+        } else {
+          console.warn('Failed to build Resy search URL, will use form filling approach');
+        }
       }
       // For OpenTable: Do nothing, keep current behavior
     }
@@ -453,6 +546,35 @@ async function getTimerStatus(): Promise<ActiveTimer | null> {
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
   console.log('Background received message:', message);
+
+  // Relay CLICK_RESERVE_BUTTON from main page to iframe
+  if (message.type === 'CLICK_RESERVE_BUTTON') {
+    console.log('[Background] Relaying CLICK_RESERVE_BUTTON to all frames');
+
+    // Get the tab that sent the message
+    if (!sender.tab?.id) {
+      console.error('[Background] No tab ID in sender');
+      sendResponse({ success: false, error: 'No tab ID' });
+      return false;
+    }
+
+    // Send message to all frames in the tab (including iframes)
+    chrome.tabs.sendMessage(
+      sender.tab.id,
+      { type: 'CLICK_RESERVE_BUTTON' },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.error('[Background] Error relaying message:', chrome.runtime.lastError.message);
+          sendResponse({ success: false, error: chrome.runtime.lastError.message });
+        } else {
+          console.log('[Background] Received response from iframe:', response);
+          sendResponse(response);
+        }
+      }
+    );
+
+    return true; // Keep channel open for async response
+  }
 
   if (message.type === 'CANCEL_TIMER') {
     cancelTimer()

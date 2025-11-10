@@ -1,4 +1,4 @@
-export type Platform = 'tock' | 'opentable';
+export type Platform = 'tock' | 'opentable' | 'resy';
 
 export interface TockPreferences {
   partySize: number;
@@ -21,7 +21,7 @@ export interface TockPreferences {
 }
 
 export interface Message {
-  type: 'FILL_FORM' | 'FORM_FILLED' | 'ERROR' | 'AUTO_FILL_FORM' | 'FILL_RESULT' | 'CANCEL_TIMER' | 'GET_TIMER_STATUS' | 'TIMER_STATUS' | 'SCHEDULE_TIMER';
+  type: 'FILL_FORM' | 'FORM_FILLED' | 'ERROR' | 'AUTO_FILL_FORM' | 'FILL_RESULT' | 'CANCEL_TIMER' | 'GET_TIMER_STATUS' | 'TIMER_STATUS' | 'SCHEDULE_TIMER' | 'CLICK_RESERVE_BUTTON';
   payload?: any;
 }
 

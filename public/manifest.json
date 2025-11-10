@@ -27,9 +27,12 @@
         "*://*.opentable.hk/*",
         "*://*.opentable.ae/*",
         "*://*.opentable.co.th/*",
-        "*://*.opentable.com.tw/*"
+        "*://*.opentable.com.tw/*",
+        "*://*.resy.com/*",
+        "*://*.widgets.resy.com/*"
       ],
-      "js": ["content.js"]
+      "js": ["content.js"],
+      "all_frames": true
     }
   ],
   "background": {
