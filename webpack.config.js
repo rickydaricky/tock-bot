@@ -9,6 +9,7 @@ module.exports = {
     popup: path.resolve(__dirname, 'src/popup/index.tsx'),
     content: path.resolve(__dirname, 'src/content/index.ts'),
     background: path.resolve(__dirname, 'src/background/index.ts'),
+    floatingTimer: path.resolve(__dirname, 'src/content/floating-timer.ts'),
   },
   output: {
     path: path.resolve(__dirname, 'dist'),

@@ -19,6 +19,9 @@ export interface TockPreferences {
   maxRefreshRetries?: number; // Number of refresh attempts (default: 3)
   // Timing measurement
   alarmFireTime?: number; // Timestamp when alarm fired (for performance measurement)
+  // Auto-purchase settings
+  autoPurchaseEnabled?: boolean; // Enable auto-purchase flow after booking
+  cvc?: string; // CVC code for auto-purchase (stored for AppleScript automation)
 }
 
 export interface Message {

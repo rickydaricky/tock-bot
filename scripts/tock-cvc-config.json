@@ -1,0 +1,6 @@
+{
+  "cvc": "8180",
+  "browser": "Comet",
+  "chromeOffset": 105,
+  "notes": "Set 'browser' to your browser app name. 'chromeOffset' is the height of tabs+address bar in pixels (default 85, may need adjustment for your browser)"
+}
