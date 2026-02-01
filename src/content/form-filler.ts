@@ -167,19 +167,14 @@ export class TockFormFiller {
       const modal = this.getModalContainer();
       const root = modal || document;
 
-      // Find the button with this aria-label
+      // Find the clickable button with this aria-label
+      // Must be in-month, available, and not disabled (there may be duplicate dates in adjacent month views)
       const dateButton = root.querySelector(
-        `.ConsumerCalendar-day[aria-label="${dateString}"]`
+        `.ConsumerCalendar-day.is-in-month.is-available[aria-label="${dateString}"]:not([disabled])`
       ) as HTMLElement;
 
       if (!dateButton) {
-        console.error(`Could not find calendar button for date: ${dateString}`);
-        return false;
-      }
-
-      // Verify it's available
-      if (!dateButton.classList.contains('is-available')) {
-        console.error(`Date ${dateString} is not available`);
+        console.error(`Could not find clickable calendar button for date: ${dateString}`);
         return false;
       }
 
@@ -261,6 +256,13 @@ export class TockFormFiller {
           console.log(`Attempting to click book button with .click()...`);
           bookButton.click();
           console.log(`Book button clicked successfully`);
+
+          // If auto-purchase is enabled, continue with purchase flow
+          if (this.preferences.autoPurchaseEnabled) {
+            console.log('🛒 Auto-purchase enabled, continuing to purchase flow...');
+            // Don't await here - let the function return and handle purchase flow async
+            setTimeout(() => this.handlePurchaseFlow(), 500);
+          }
         } catch (error) {
           console.error(`Error during click:`, error);
         }
@@ -505,6 +507,14 @@ export class TockFormFiller {
               const elapsed = Date.now() - startTime;
               console.log(`✅ Book button found via MutationObserver after ${elapsed}ms, clicking...`);
               bookButton.click();
+
+              // If auto-purchase is enabled, continue with purchase flow
+              if (this.preferences.autoPurchaseEnabled) {
+                console.log('🛒 Auto-purchase enabled, continuing to purchase flow...');
+                // Don't await here - let the promise resolve and handle purchase flow async
+                setTimeout(() => this.handlePurchaseFlow(), 500);
+              }
+
               resolve(true);
               return;
             }
@@ -526,6 +536,14 @@ export class TockFormFiller {
           observer.disconnect();
           console.log(`✅ Book button found via polling after ${elapsed}ms (attempt ${this.attempts}), clicking...`);
           bookButton.click();
+
+          // If auto-purchase is enabled, continue with purchase flow
+          if (this.preferences.autoPurchaseEnabled) {
+            console.log('🛒 Auto-purchase enabled, continuing to purchase flow...');
+            // Don't await here - let the promise resolve and handle purchase flow async
+            setTimeout(() => this.handlePurchaseFlow(), 500);
+          }
+
           resolve(true);
         } else if (this.attempts >= this.maxAttempts && elapsed >= aggressivePhaseMs) {
           // Only give up after aggressive phase is complete
@@ -1529,5 +1547,372 @@ export class TockFormFiller {
     // Set the closest match
     timeSelect.selectedIndex = closestIndex;
     timeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  /**
+   * Handle the purchase flow after clicking the book button
+   * Detects add-ons page or purchase confirmation and handles accordingly
+   */
+  public async handlePurchaseFlow(): Promise<boolean> {
+    console.log('🛒 Starting auto-purchase flow...');
+
+    // Wait for the page to update after clicking book button
+    await new Promise(r => setTimeout(r, 1000));
+
+    // Poll for either add-ons page or purchase confirmation page
+    const maxWaitTime = 30000; // 30 seconds max wait
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWaitTime) {
+      // Check for add-ons page (supplement group confirm button)
+      const addOnsButton = document.querySelector('[data-testid="supplement-group-confirm-button"]');
+      if (addOnsButton) {
+        console.log('📦 Add-ons page detected, skipping...');
+        const addOnsResult = await this.handleAddOnsPage();
+        if (!addOnsResult) {
+          console.log('❌ Failed to handle add-ons page');
+          return false;
+        }
+        // Continue to wait for purchase confirmation
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+
+      // Check for alternate add-ons page with "View Order" button
+      const viewOrderButton = document.querySelector('[data-testid="supplement-page-view-order"]');
+      if (viewOrderButton) {
+        console.log('📦 Alternate add-ons page detected (View Order)...');
+        const altAddOnsResult = await this.handleAlternateAddOnsPage();
+        if (!altAddOnsResult) {
+          console.log('❌ Failed to handle alternate add-ons page');
+          return false;
+        }
+        // Continue to wait for purchase confirmation
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+
+      // Check for purchase confirmation page (purchase button)
+      const purchaseButton = document.querySelector('[data-testid="purchase-button"]');
+      if (purchaseButton) {
+        console.log('💳 Purchase confirmation page detected');
+        return await this.handlePurchaseConfirmation();
+      }
+
+      // Wait before checking again
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    console.log('⏱️ Timeout waiting for purchase page');
+    return false;
+  }
+
+  /**
+   * Handle the add-ons page by clicking the skip/next button
+   */
+  private async handleAddOnsPage(): Promise<boolean> {
+    try {
+      const skipButton = document.querySelector('[data-testid="supplement-group-confirm-button"]') as HTMLElement;
+
+      if (!skipButton) {
+        console.log('Could not find add-ons skip button');
+        return false;
+      }
+
+      console.log('Clicking "Next: Review and Purchase" button...');
+      skipButton.click();
+
+      // Wait for navigation
+      await new Promise(r => setTimeout(r, 1500));
+
+      return true;
+    } catch (error) {
+      console.error('Error handling add-ons page:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Handle alternate add-ons page with "View Order" button that opens a modal
+   */
+  private async handleAlternateAddOnsPage(): Promise<boolean> {
+    try {
+      // Click "View Order" button
+      const viewOrderBtn = document.querySelector('[data-testid="supplement-page-view-order"]') as HTMLElement;
+      if (!viewOrderBtn) {
+        console.log('Could not find "View Order" button');
+        return false;
+      }
+
+      console.log('Clicking "View Order" button...');
+      viewOrderBtn.click();
+
+      // Wait for modal to appear
+      await new Promise(r => setTimeout(r, 500));
+
+      // Find and click "Continue to payment" in the modal
+      const modal = document.querySelector('.MuiDialog-root');
+      if (!modal) {
+        console.log('Modal did not appear');
+        return false;
+      }
+
+      const continueBtn = modal.querySelector('.MuiDialogActions-root button') as HTMLElement;
+      if (!continueBtn) {
+        console.log('Could not find "Continue to payment" button in modal');
+        return false;
+      }
+
+      console.log('Clicking "Continue to payment" button in modal...');
+      continueBtn.click();
+
+      // Wait for navigation
+      await new Promise(r => setTimeout(r, 1500));
+
+      return true;
+    } catch (error) {
+      console.error('Error handling alternate add-ons page:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Handle the purchase confirmation page
+   * - Check all required checkboxes
+   * - Focus the CVC iframe
+   * - Listen for Enter key to click purchase button
+   */
+  private async handlePurchaseConfirmation(): Promise<boolean> {
+    try {
+      console.log('🔧 Setting up purchase confirmation page...');
+
+      // Step 0: Handle gratuity if present (select "No gratuity")
+      await this.handleGratuitySelection();
+
+      // Step 1: Check all consent checkboxes
+      await this.checkPurchaseCheckboxes();
+
+      // Step 2: Focus the CVC iframe and show visual notification
+      const cvcIframe = document.querySelector('#braintree-hosted-field-cvv') as HTMLIFrameElement;
+
+      if (cvcIframe) {
+        console.log('🔐 Attempting to focus CVC iframe...');
+
+        // Try multiple focus techniques
+        cvcIframe.focus();
+        cvcIframe.click();
+
+        // Dispatch a synthetic mouse event at the iframe's center
+        const rect = cvcIframe.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+
+        const mouseEvent = new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: centerX,
+          clientY: centerY
+        });
+        cvcIframe.dispatchEvent(mouseEvent);
+
+        // Add visual highlight to draw attention
+        cvcIframe.style.outline = '3px solid #ff6b00';
+        cvcIframe.style.outlineOffset = '2px';
+        cvcIframe.style.boxShadow = '0 0 10px rgba(255, 107, 0, 0.5)';
+
+        // Show a floating notification near the CVC field
+        const notification = document.createElement('div');
+        notification.id = 'tock-bot-cvc-notification';
+        notification.innerHTML = '🤖 Auto-filling CVC...';
+        notification.style.cssText = `
+          position: fixed;
+          top: ${rect.top - 45}px;
+          left: ${rect.left}px;
+          background: #ff6b00;
+          color: white;
+          padding: 10px 16px;
+          border-radius: 6px;
+          font-size: 15px;
+          font-weight: bold;
+          z-index: 999999;
+          animation: pulse 1s infinite;
+          box-shadow: 0 4px 12px rgba(255, 107, 0, 0.4);
+        `;
+
+        // Add animation style
+        const style = document.createElement('style');
+        style.textContent = `
+          @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+          }
+        `;
+        document.head.appendChild(style);
+        document.body.appendChild(notification);
+
+        // Remove notification when user clicks on the iframe or presses Enter
+        const cleanup = () => {
+          notification.remove();
+          style.remove();
+          cvcIframe.style.outline = '';
+          cvcIframe.style.outlineOffset = '';
+          cvcIframe.style.boxShadow = '';
+        };
+
+        cvcIframe.addEventListener('focus', cleanup, { once: true });
+        // Also cleanup on Enter key
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') cleanup();
+        }, { once: true });
+
+      } else {
+        console.log('⚠️ CVC iframe not found');
+      }
+
+      // Step 3: Set up Enter key listener to click purchase button
+      console.log('⌨️ Listening for Enter key to complete purchase...');
+
+      const purchaseButton = document.querySelector('[data-testid="purchase-button"]') as HTMLElement;
+
+      if (!purchaseButton) {
+        console.log('❌ Purchase button not found');
+        return false;
+      }
+
+      // Create the keydown listener
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key === 'Enter') {
+          console.log('⏎ Enter key detected! Clicking purchase button...');
+          event.preventDefault();
+
+          // Remove the listener to prevent multiple clicks
+          document.removeEventListener('keydown', handleKeyDown);
+
+          // Click the purchase button
+          purchaseButton.click();
+          console.log('✅ Purchase button clicked!');
+        }
+      };
+
+      // Add the listener
+      document.addEventListener('keydown', handleKeyDown);
+
+      console.log('✅ Auto-purchase setup complete!');
+
+      // Step 4: Automatically trigger the CVC automation server
+      console.log('🤖 Triggering CVC automation server...');
+      try {
+        // Get the actual CVC iframe coordinates to pass to the server
+        const cvcIframeForCoords = document.querySelector('#braintree-hosted-field-cvv') as HTMLIFrameElement;
+        let body: { x?: number; y?: number } = {};
+
+        if (cvcIframeForCoords) {
+          // Scroll the CVC field into view first (centered vertically)
+          cvcIframeForCoords.scrollIntoView({ behavior: 'instant', block: 'center' });
+
+          // Small delay to let the scroll complete
+          await new Promise(resolve => setTimeout(resolve, 100));
+
+          // Now get the coordinates after scrolling
+          const rect = cvcIframeForCoords.getBoundingClientRect();
+          // Calculate screen coordinates (viewport coords + scroll + any window offset)
+          // Note: These are client coordinates relative to the viewport
+          const centerX = rect.left + rect.width / 2;
+          const centerY = rect.top + rect.height / 2;
+          body = { x: Math.round(centerX), y: Math.round(centerY) };
+          console.log(`📍 CVC iframe coordinates: (${body.x}, ${body.y}) [after scroll]`);
+        }
+
+        const response = await fetch('http://localhost:3847/trigger-cvc', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (result.success) {
+          console.log('✅ CVC automation triggered successfully!');
+
+          // Wait a moment for the CVC to be entered, then click purchase button
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          const purchaseBtn = document.querySelector('[data-testid="purchase-button"]') as HTMLElement;
+          if (purchaseBtn) {
+            console.log('🛒 Clicking purchase button...');
+            purchaseBtn.click();
+            console.log('✅ Purchase button clicked!');
+          }
+        } else {
+          console.log('⚠️ CVC automation failed:', result.error);
+          console.log('💡 Make sure the CVC server is running: node scripts/cvc-server.js');
+        }
+      } catch (error) {
+        console.log('⚠️ Could not reach CVC automation server');
+        console.log('💡 Start the server with: node scripts/cvc-server.js');
+        console.log('🔑 Or manually type CVC and press Enter');
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Error setting up purchase confirmation:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Handle gratuity selection on purchase confirmation page
+   * Defaults to "No gratuity" if the option is present
+   */
+  private async handleGratuitySelection(): Promise<void> {
+    const noGratuityBtn = document.querySelector('[data-testid="gratuity-button-zero"]') as HTMLElement;
+
+    if (!noGratuityBtn) {
+      console.log('💰 No gratuity option found (may not be present on this page)');
+      return;
+    }
+
+    // Check if already selected
+    if (noGratuityBtn.getAttribute('aria-pressed') === 'true') {
+      console.log('✅ "No gratuity" already selected');
+      return;
+    }
+
+    console.log('💰 Selecting "No gratuity" option...');
+    noGratuityBtn.click();
+    await new Promise(r => setTimeout(r, 100));
+    console.log('✅ "No gratuity" selected');
+  }
+
+  /**
+   * Check all consent checkboxes on the purchase confirmation page
+   */
+  private async checkPurchaseCheckboxes(): Promise<void> {
+    console.log('☑️ Checking consent checkboxes...');
+
+    // List of checkbox selectors to check
+    const checkboxSelectors = [
+      '[data-testid="confirm-cancellation-policy"]',
+      '[data-testid="checkout-opt-in-email"]',
+      '[data-testid="checkout-consents-to-text"]'
+    ];
+
+    for (const selector of checkboxSelectors) {
+      const checkbox = document.querySelector(selector) as HTMLInputElement;
+
+      if (checkbox) {
+        // Check if it's already checked
+        if (!checkbox.checked) {
+          console.log(`Checking: ${selector}`);
+          checkbox.click();
+          await new Promise(r => setTimeout(r, 100));
+        } else {
+          console.log(`Already checked: ${selector}`);
+        }
+      } else {
+        console.log(`Checkbox not found (may be optional): ${selector}`);
+      }
+    }
+
+    console.log('☑️ Checkboxes processed');
   }
 } 

@@ -20,6 +20,7 @@ const App: React.FC = () => {
     autoSearchEnabled: false,
     dropTime: undefined,
     leadTimeMs: 200,
+    autoPurchaseEnabled: false,
   });
   const [status, setStatus] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -189,6 +190,10 @@ const App: React.FC = () => {
     setPreferences(prev => ({ ...prev, maxRefreshRetries: isNaN(value) ? 3 : value }));
   };
 
+  const handleAutoPurchaseEnabledChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setPreferences(prev => ({ ...prev, autoPurchaseEnabled: e.target.checked }));
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setStatus('');
@@ -286,93 +291,133 @@ const App: React.FC = () => {
         <PartySize value={preferences.partySize} onChange={handlePartySizeChange} />
         <DatePicker value={preferences.date} onChange={handleDateChange} />
 
-        <div className="mb-4">
-          <label className="flex items-center cursor-pointer">
-            <input
-              type="checkbox"
-              checked={preferences.useFirstAvailableAfter || false}
-              onChange={handleUseFirstAvailableAfterChange}
-              className="mr-2 h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
-            />
-            <span className="text-sm font-medium text-gray-700">Use first available date</span>
-          </label>
+        {/* Hide "Use first available date" for OpenTable since there's no readable calendar */}
+        {platform !== 'opentable' && (
+          <div className="mb-4">
+            <label className="flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={preferences.useFirstAvailableAfter || false}
+                onChange={handleUseFirstAvailableAfterChange}
+                className="mr-2 h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+              />
+              <span className="text-sm font-medium text-gray-700">Use first available date</span>
+            </label>
 
-          {preferences.useFirstAvailableAfter && (
-            <p className="text-xs text-amber-600 mt-2 ml-6 p-2 bg-amber-50 border border-amber-200 rounded">
-              Note: Fallback dates only work for months at or after the primary date's month. Navigating to earlier months is not yet supported.
-            </p>
-          )}
+            {preferences.useFirstAvailableAfter && (
+              <p className="text-xs text-amber-600 mt-2 ml-6 p-2 bg-amber-50 border border-amber-200 rounded">
+                Note: Fallback dates only work for months at or after the primary date's month. Navigating to earlier months is not yet supported.
+              </p>
+            )}
 
-          {preferences.useFirstAvailableAfter && (
-            <div className="mt-2 ml-6 space-y-3">
-              {/* Mode toggle */}
-              <div className="flex gap-2 mb-3">
-                <button
-                  type="button"
-                  onClick={() => handleDateSelectionModeChange('range')}
-                  className={`flex-1 px-3 py-2 text-xs font-medium rounded border transition-colors ${
-                    preferences.dateSelectionMode === 'range'
-                      ? 'bg-blue-500 text-white border-blue-600'
-                      : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
-                  }`}
-                >
-                  Date Range
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleDateSelectionModeChange('specific')}
-                  className={`flex-1 px-3 py-2 text-xs font-medium rounded border transition-colors ${
-                    preferences.dateSelectionMode === 'specific'
-                      ? 'bg-blue-500 text-white border-blue-600'
-                      : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
-                  }`}
-                >
-                  Specific Dates
-                </button>
+            {preferences.useFirstAvailableAfter && (
+              <div className="mt-2 ml-6 space-y-3">
+                {/* Mode toggle */}
+                <div className="flex gap-2 mb-3">
+                  <button
+                    type="button"
+                    onClick={() => handleDateSelectionModeChange('range')}
+                    className={`flex-1 px-3 py-2 text-xs font-medium rounded border transition-colors ${
+                      preferences.dateSelectionMode === 'range'
+                        ? 'bg-blue-500 text-white border-blue-600'
+                        : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                    }`}
+                  >
+                    Date Range
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDateSelectionModeChange('specific')}
+                    className={`flex-1 px-3 py-2 text-xs font-medium rounded border transition-colors ${
+                      preferences.dateSelectionMode === 'specific'
+                        ? 'bg-blue-500 text-white border-blue-600'
+                        : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                    }`}
+                  >
+                    Specific Dates
+                  </button>
+                </div>
+
+                {/* Range mode */}
+                {preferences.dateSelectionMode === 'range' && (
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">
+                      Days to scan before/after primary
+                    </label>
+                    <input
+                      type="number"
+                      value={preferences.maxDaysToScan ?? 7}
+                      onChange={handleMaxDaysToScanChange}
+                      min="0"
+                      max="30"
+                      className="input text-sm w-20"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      {preferences.maxDaysToScan === 0
+                        ? 'Only checks primary date'
+                        : `Scans ±${preferences.maxDaysToScan ?? 7} days from primary date`}
+                    </p>
+                  </div>
+                )}
+
+                {/* Specific dates mode */}
+                {preferences.dateSelectionMode === 'specific' && (
+                  <div>
+                    <DateSelectionCalendar
+                      primaryDate={preferences.date}
+                      selectedDates={preferences.selectedDates || []}
+                      onSelectedDatesChange={handleSelectedDatesChange}
+                    />
+                    <p className="text-xs text-gray-500 mt-2">
+                      {(preferences.selectedDates && preferences.selectedDates.length > 0)
+                        ? `Will check ${preferences.selectedDates.length} selected ${preferences.selectedDates.length === 1 ? 'date' : 'dates'}`
+                        : 'Select dates to check for availability'}
+                    </p>
+                  </div>
+                )}
               </div>
-
-              {/* Range mode */}
-              {preferences.dateSelectionMode === 'range' && (
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">
-                    Days to scan before/after primary
-                  </label>
-                  <input
-                    type="number"
-                    value={preferences.maxDaysToScan ?? 7}
-                    onChange={handleMaxDaysToScanChange}
-                    min="0"
-                    max="30"
-                    className="input text-sm w-20"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    {preferences.maxDaysToScan === 0
-                      ? 'Only checks primary date'
-                      : `Scans ±${preferences.maxDaysToScan ?? 7} days from primary date`}
-                  </p>
-                </div>
-              )}
-
-              {/* Specific dates mode */}
-              {preferences.dateSelectionMode === 'specific' && (
-                <div>
-                  <DateSelectionCalendar
-                    primaryDate={preferences.date}
-                    selectedDates={preferences.selectedDates || []}
-                    onSelectedDatesChange={handleSelectedDatesChange}
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    {(preferences.selectedDates && preferences.selectedDates.length > 0)
-                      ? `Will check ${preferences.selectedDates.length} selected ${preferences.selectedDates.length === 1 ? 'date' : 'dates'}`
-                      : 'Select dates to check for availability'}
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         <TimePicker value={preferences.time} onChange={handleTimeChange} />
+
+        {/* Auto-purchase Section - Only show for Tock */}
+        {platform === 'tock' && (
+          <div className="mb-4 mt-4 p-3 bg-amber-50 border border-amber-200 rounded-md">
+            <label className="flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={preferences.autoPurchaseEnabled || false}
+                onChange={handleAutoPurchaseEnabledChange}
+                className="mr-2 h-4 w-4 text-amber-600 rounded border-gray-300 focus:ring-amber-500"
+              />
+              <span className="text-sm font-medium text-gray-700">Complete purchase for me</span>
+            </label>
+            <p className="text-xs text-amber-700 mt-2 ml-6">
+              After booking, will skip add-ons and complete purchase.
+            </p>
+
+            {preferences.autoPurchaseEnabled && (
+              <div className="mt-3 ml-6">
+                <label className="block text-xs font-medium text-gray-600 mb-1">
+                  CVC Code (for AppleScript automation)
+                </label>
+                <input
+                  type="password"
+                  value={preferences.cvc || ''}
+                  onChange={(e) => setPreferences(prev => ({ ...prev, cvc: e.target.value }))}
+                  placeholder="Enter CVC"
+                  maxLength={4}
+                  className="input text-sm w-20"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Stored locally. Used by AppleScript to auto-fill.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
         <button
           type="submit"

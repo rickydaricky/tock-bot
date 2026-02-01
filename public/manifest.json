@@ -33,6 +33,11 @@
       ],
       "js": ["content.js"],
       "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["floatingTimer.js"],
+      "all_frames": false
     }
   ],
   "background": {

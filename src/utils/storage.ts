@@ -11,6 +11,7 @@ export const DEFAULT_PREFERENCES: TockPreferences = {
   autoSearchEnabled: false,
   dropTime: undefined,
   leadTimeMs: 0, // Refresh exactly at drop time (not before, to ensure fresh data)
+  autoPurchaseEnabled: false, // Auto-purchase flow disabled by default
 };
 
 interface StorageResult {
