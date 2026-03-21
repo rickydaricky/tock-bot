@@ -399,20 +399,102 @@ const App: React.FC = () => {
             </p>
 
             {preferences.autoPurchaseEnabled && (
-              <div className="mt-3 ml-6">
-                <label className="block text-xs font-medium text-gray-600 mb-1">
-                  CVC Code (for AppleScript automation)
-                </label>
-                <input
-                  type="password"
-                  value={preferences.cvc || ''}
-                  onChange={(e) => setPreferences(prev => ({ ...prev, cvc: e.target.value }))}
-                  placeholder="Enter CVC"
-                  maxLength={4}
-                  className="input text-sm w-20"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Stored locally. Used by AppleScript to auto-fill.
+              <div className="mt-3 ml-6 space-y-2">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Card Number</label>
+                  <input
+                    type="password"
+                    value={preferences.cardNumber || ''}
+                    onChange={(e) => setPreferences(prev => ({ ...prev, cardNumber: e.target.value.replace(/\D/g, '').slice(0, 16) }))}
+                    placeholder="•••• •••• •••• ••••"
+                    maxLength={16}
+                    className="input text-sm w-44"
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Expiry</label>
+                    <input
+                      type="text"
+                      value={preferences.cardExpiry || ''}
+                      onChange={(e) => {
+                        let val = e.target.value.replace(/\D/g, '').slice(0, 4);
+                        if (val.length >= 3) val = val.slice(0, 2) + '/' + val.slice(2);
+                        setPreferences(prev => ({ ...prev, cardExpiry: val }));
+                      }}
+                      placeholder="MM/YY"
+                      maxLength={5}
+                      className="input text-sm w-16"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">CVC</label>
+                    <input
+                      type="password"
+                      value={preferences.cvc || ''}
+                      onChange={(e) => setPreferences(prev => ({ ...prev, cvc: e.target.value.replace(/\D/g, '').slice(0, 4) }))}
+                      placeholder="•••"
+                      maxLength={4}
+                      className="input text-sm w-14"
+                    />
+                  </div>
+                </div>
+                <hr className="border-amber-200 my-2" />
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Full Name</label>
+                  <input
+                    type="text"
+                    value={preferences.billingName || ''}
+                    onChange={(e) => setPreferences(prev => ({ ...prev, billingName: e.target.value }))}
+                    placeholder="John Doe"
+                    className="input text-sm w-full"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Address</label>
+                  <input
+                    type="text"
+                    value={preferences.billingAddress || ''}
+                    onChange={(e) => setPreferences(prev => ({ ...prev, billingAddress: e.target.value }))}
+                    placeholder="123 Main St"
+                    className="input text-sm w-full"
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <div className="flex-1">
+                    <label className="block text-xs font-medium text-gray-600 mb-1">City</label>
+                    <input
+                      type="text"
+                      value={preferences.billingCity || ''}
+                      onChange={(e) => setPreferences(prev => ({ ...prev, billingCity: e.target.value }))}
+                      placeholder="City"
+                      className="input text-sm w-full"
+                    />
+                  </div>
+                  <div className="w-14">
+                    <label className="block text-xs font-medium text-gray-600 mb-1">State</label>
+                    <input
+                      type="text"
+                      value={preferences.billingState || ''}
+                      onChange={(e) => setPreferences(prev => ({ ...prev, billingState: e.target.value.toUpperCase().slice(0, 2) }))}
+                      placeholder="CA"
+                      maxLength={2}
+                      className="input text-sm w-full"
+                    />
+                  </div>
+                  <div className="w-20">
+                    <label className="block text-xs font-medium text-gray-600 mb-1">ZIP</label>
+                    <input
+                      type="text"
+                      value={preferences.billingZip || ''}
+                      onChange={(e) => setPreferences(prev => ({ ...prev, billingZip: e.target.value.slice(0, 10) }))}
+                      placeholder="94110"
+                      className="input text-sm w-full"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500">
+                  Stored locally only. Auto-typed via AppleScript into Stripe fields.
                 </p>
               </div>
             )}

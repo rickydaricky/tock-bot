@@ -1678,178 +1678,132 @@ export class TockFormFiller {
 
   /**
    * Handle the purchase confirmation page
-   * - Check all required checkboxes
-   * - Focus the CVC iframe
-   * - Listen for Enter key to click purchase button
+   * Detects Stripe Payment Element (new) or Braintree (legacy)
+   * Sends card details to the local automation server for typing
    */
   private async handlePurchaseConfirmation(): Promise<boolean> {
     try {
       console.log('🔧 Setting up purchase confirmation page...');
 
-      // Step 0: Handle gratuity if present (select "No gratuity")
+      // Step 0: Handle gratuity if present
       await this.handleGratuitySelection();
 
       // Step 1: Check all consent checkboxes
       await this.checkPurchaseCheckboxes();
 
-      // Step 2: Focus the CVC iframe and show visual notification
-      const cvcIframe = document.querySelector('#braintree-hosted-field-cvv') as HTMLIFrameElement;
+      // Step 2: Detect payment provider and find the payment iframe
+      const stripePaymentIframe = document.querySelector('[data-testid="payment"] iframe, .StripeElement iframe') as HTMLIFrameElement;
+      const braintreeCvcIframe = document.querySelector('#braintree-hosted-field-cvv') as HTMLIFrameElement;
 
-      if (cvcIframe) {
-        console.log('🔐 Attempting to focus CVC iframe...');
+      const paymentIframe = stripePaymentIframe || braintreeCvcIframe;
+      const isStripe = !!stripePaymentIframe;
 
-        // Try multiple focus techniques
-        cvcIframe.focus();
-        cvcIframe.click();
+      if (paymentIframe) {
+        console.log(`💳 ${isStripe ? 'Stripe Payment Element' : 'Braintree CVC field'} detected`);
 
-        // Dispatch a synthetic mouse event at the iframe's center
-        const rect = cvcIframe.getBoundingClientRect();
-        const centerX = rect.left + rect.width / 2;
-        const centerY = rect.top + rect.height / 2;
+        // Scroll into view
+        paymentIframe.scrollIntoView({ behavior: 'instant', block: 'center' });
+        await new Promise(r => setTimeout(r, 200));
 
-        const mouseEvent = new MouseEvent('click', {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          clientX: centerX,
-          clientY: centerY
-        });
-        cvcIframe.dispatchEvent(mouseEvent);
-
-        // Add visual highlight to draw attention
-        cvcIframe.style.outline = '3px solid #ff6b00';
-        cvcIframe.style.outlineOffset = '2px';
-        cvcIframe.style.boxShadow = '0 0 10px rgba(255, 107, 0, 0.5)';
-
-        // Show a floating notification near the CVC field
-        const notification = document.createElement('div');
-        notification.id = 'tock-bot-cvc-notification';
-        notification.innerHTML = '🤖 Auto-filling CVC...';
-        notification.style.cssText = `
-          position: fixed;
-          top: ${rect.top - 45}px;
-          left: ${rect.left}px;
-          background: #ff6b00;
-          color: white;
-          padding: 10px 16px;
-          border-radius: 6px;
-          font-size: 15px;
-          font-weight: bold;
-          z-index: 999999;
-          animation: pulse 1s infinite;
-          box-shadow: 0 4px 12px rgba(255, 107, 0, 0.4);
-        `;
-
-        // Add animation style
-        const style = document.createElement('style');
-        style.textContent = `
-          @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-          }
-        `;
-        document.head.appendChild(style);
-        document.body.appendChild(notification);
-
-        // Remove notification when user clicks on the iframe or presses Enter
-        const cleanup = () => {
-          notification.remove();
-          style.remove();
-          cvcIframe.style.outline = '';
-          cvcIframe.style.outlineOffset = '';
-          cvcIframe.style.boxShadow = '';
-        };
-
-        cvcIframe.addEventListener('focus', cleanup, { once: true });
-        // Also cleanup on Enter key
-        document.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') cleanup();
-        }, { once: true });
-
+        // Visual highlight
+        const container = isStripe
+          ? (paymentIframe.closest('.StripeElement') || paymentIframe.parentElement) as HTMLElement
+          : paymentIframe;
+        if (container) {
+          container.style.outline = '3px solid #ff6b00';
+          container.style.outlineOffset = '2px';
+          container.style.boxShadow = '0 0 10px rgba(255, 107, 0, 0.5)';
+        }
       } else {
-        console.log('⚠️ CVC iframe not found');
+        console.log('⚠️ No payment iframe found (Stripe or Braintree)');
       }
 
-      // Step 3: Set up Enter key listener to click purchase button
-      console.log('⌨️ Listening for Enter key to complete purchase...');
-
+      // Step 3: Set up Enter key fallback to click purchase button
       const purchaseButton = document.querySelector('[data-testid="purchase-button"]') as HTMLElement;
-
       if (!purchaseButton) {
         console.log('❌ Purchase button not found');
         return false;
       }
 
-      // Create the keydown listener
       const handleKeyDown = (event: KeyboardEvent) => {
         if (event.key === 'Enter') {
           console.log('⏎ Enter key detected! Clicking purchase button...');
           event.preventDefault();
-
-          // Remove the listener to prevent multiple clicks
           document.removeEventListener('keydown', handleKeyDown);
-
-          // Click the purchase button
           purchaseButton.click();
-          console.log('✅ Purchase button clicked!');
         }
       };
-
-      // Add the listener
       document.addEventListener('keydown', handleKeyDown);
 
-      console.log('✅ Auto-purchase setup complete!');
-
-      // Step 4: Automatically trigger the CVC automation server
-      console.log('🤖 Triggering CVC automation server...');
+      // Step 4: Trigger the card automation server
+      console.log('🤖 Triggering card automation server...');
       try {
-        // Get the actual CVC iframe coordinates to pass to the server
-        const cvcIframeForCoords = document.querySelector('#braintree-hosted-field-cvv') as HTMLIFrameElement;
-        let body: { x?: number; y?: number } = {};
+        // Get coordinates of the payment iframe (card number field area)
+        const targetIframe = paymentIframe;
+        let requestBody: Record<string, any> = { isStripe };
 
-        if (cvcIframeForCoords) {
-          // Scroll the CVC field into view first (centered vertically)
-          cvcIframeForCoords.scrollIntoView({ behavior: 'instant', block: 'center' });
+        // Send card details from extension preferences so server doesn't need config file
+        if (this.preferences.cardNumber) requestBody.cardNumber = this.preferences.cardNumber;
+        if (this.preferences.cardExpiry) requestBody.cardExpiry = this.preferences.cardExpiry;
+        if (this.preferences.cvc) requestBody.cvc = this.preferences.cvc;
 
-          // Small delay to let the scroll complete
-          await new Promise(resolve => setTimeout(resolve, 100));
+        // Send billing details
+        if (this.preferences.billingName) requestBody.billingName = this.preferences.billingName;
+        if (this.preferences.billingAddress) requestBody.billingAddress = this.preferences.billingAddress;
+        if (this.preferences.billingCity) requestBody.billingCity = this.preferences.billingCity;
+        if (this.preferences.billingState) requestBody.billingState = this.preferences.billingState;
+        if (this.preferences.billingZip) requestBody.billingZip = this.preferences.billingZip;
 
-          // Now get the coordinates after scrolling
-          const rect = cvcIframeForCoords.getBoundingClientRect();
-          // Calculate screen coordinates (viewport coords + scroll + any window offset)
-          // Note: These are client coordinates relative to the viewport
-          const centerX = rect.left + rect.width / 2;
-          const centerY = rect.top + rect.height / 2;
-          body = { x: Math.round(centerX), y: Math.round(centerY) };
-          console.log(`📍 CVC iframe coordinates: (${body.x}, ${body.y}) [after scroll]`);
+        if (targetIframe) {
+          const rect = targetIframe.getBoundingClientRect();
+          // For Stripe: click near the top of the iframe where card number field is
+          requestBody.x = Math.round(rect.left + rect.width / 2);
+          requestBody.y = Math.round(rect.top + (isStripe ? 30 : rect.height / 2));
+          requestBody.iframeWidth = Math.round(rect.width);
+          requestBody.iframeHeight = Math.round(rect.height);
+          console.log(`📍 Payment iframe at: (${requestBody.x}, ${requestBody.y}), size: ${requestBody.iframeWidth}x${requestBody.iframeHeight}`);
+        }
+
+        // Get billing address iframe coordinates (separate Stripe iframe)
+        if (isStripe) {
+          const billingIframe = document.querySelector('[data-testid="billing"] iframe') as HTMLIFrameElement;
+          if (billingIframe) {
+            const bRect = billingIframe.getBoundingClientRect();
+            requestBody.billingIframeX = Math.round(bRect.left);
+            requestBody.billingIframeY = Math.round(bRect.top);
+            requestBody.billingIframeWidth = Math.round(bRect.width);
+            requestBody.billingIframeHeight = Math.round(bRect.height);
+            console.log(`📍 Billing iframe at: (${requestBody.billingIframeX}, ${requestBody.billingIframeY}), size: ${requestBody.billingIframeWidth}x${requestBody.billingIframeHeight}`);
+          }
         }
 
         const response = await fetch('http://localhost:3847/trigger-cvc', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
+          body: JSON.stringify(requestBody)
         });
         const result = await response.json();
         if (result.success) {
-          console.log('✅ CVC automation triggered successfully!');
+          console.log('✅ Card automation triggered successfully!');
 
-          // Wait a moment for the CVC to be entered, then click purchase button
-          await new Promise(resolve => setTimeout(resolve, 500));
+          // Wait for card + billing details to be typed, then click purchase
+          await new Promise(resolve => setTimeout(resolve, 8000));
 
           const purchaseBtn = document.querySelector('[data-testid="purchase-button"]') as HTMLElement;
           if (purchaseBtn) {
             console.log('🛒 Clicking purchase button...');
+            document.removeEventListener('keydown', handleKeyDown);
             purchaseBtn.click();
             console.log('✅ Purchase button clicked!');
           }
         } else {
-          console.log('⚠️ CVC automation failed:', result.error);
-          console.log('💡 Make sure the CVC server is running: node scripts/cvc-server.js');
+          console.log('⚠️ Card automation failed:', result.error);
+          console.log('💡 Make sure the server is running: node scripts/cvc-server.js');
         }
       } catch (error) {
-        console.log('⚠️ Could not reach CVC automation server');
+        console.log('⚠️ Could not reach card automation server');
         console.log('💡 Start the server with: node scripts/cvc-server.js');
-        console.log('🔑 Or manually type CVC and press Enter');
+        console.log('🔑 Or manually fill card details and press Enter');
       }
 
       return true;
@@ -1889,18 +1843,16 @@ export class TockFormFiller {
   private async checkPurchaseCheckboxes(): Promise<void> {
     console.log('☑️ Checking consent checkboxes...');
 
-    // List of checkbox selectors to check
+    // Only target actual checkbox inputs, not headings
     const checkboxSelectors = [
-      '[data-testid="confirm-cancellation-policy"]',
-      '[data-testid="checkout-opt-in-email"]',
-      '[data-testid="checkout-consents-to-text"]'
+      '[data-testid="checkout-consents-to-text"]',
+      '[data-testid="checkout-opt-in-email"]'
     ];
 
     for (const selector of checkboxSelectors) {
       const checkbox = document.querySelector(selector) as HTMLInputElement;
 
-      if (checkbox) {
-        // Check if it's already checked
+      if (checkbox && checkbox.type === 'checkbox') {
         if (!checkbox.checked) {
           console.log(`Checking: ${selector}`);
           checkbox.click();
