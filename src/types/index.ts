@@ -21,7 +21,14 @@ export interface TockPreferences {
   alarmFireTime?: number; // Timestamp when alarm fired (for performance measurement)
   // Auto-purchase settings
   autoPurchaseEnabled?: boolean; // Enable auto-purchase flow after booking
-  cvc?: string; // CVC code for auto-purchase (stored for AppleScript automation)
+  cardNumber?: string; // Credit card number for auto-purchase
+  cardExpiry?: string; // Card expiry MM/YY for auto-purchase
+  cvc?: string; // CVC code for auto-purchase
+  billingName?: string; // Full name on card
+  billingAddress?: string; // Address line 1
+  billingCity?: string; // City
+  billingState?: string; // State (2-letter code e.g. CA)
+  billingZip?: string; // ZIP code
 }
 
 export interface Message {

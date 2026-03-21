@@ -1,6 +1,8 @@
 {
-  "cvc": "8180",
+  "cardNumber": "",
+  "cardExpiry": "",
+  "cvc": "",
   "browser": "Comet",
   "chromeOffset": 105,
-  "notes": "Set 'browser' to your browser app name. 'chromeOffset' is the height of tabs+address bar in pixels (default 85, may need adjustment for your browser)"
+  "notes": "Fallback config — the extension popup UI is the primary way to set card details. 'browser': app name for AppleScript. 'chromeOffset': height in px of browser tabs+address bar (default 85, Comet ~105)."
 }
