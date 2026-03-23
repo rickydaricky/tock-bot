@@ -163,6 +163,35 @@ app.post('/api/cookies', requireAuth, (req, res) => {
   res.json({ success: true, count: cookies.length });
 });
 
+// Bookmarklet endpoint — accepts cookies from exploretock.com via CORS
+// Auth via API_KEY in query string (since bookmarklet can't set cookies/headers easily)
+app.options('/api/cookies/push', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
+app.post('/api/cookies/push', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const key = req.query.key as string;
+  if (API_KEY && key !== API_KEY) {
+    res.status(401).json({ error: 'Invalid key' });
+    return;
+  }
+
+  const { cookies } = req.body;
+  if (!Array.isArray(cookies)) {
+    res.status(400).json({ error: 'Body must contain a "cookies" array' });
+    return;
+  }
+
+  updateCookies(cookies);
+  console.log(`🍪 Bookmarklet pushed ${cookies.length} cookies`);
+  res.json({ success: true, count: cookies.length });
+});
+
 // Keep old /cookies endpoint
 app.post('/cookies', requireAuth, (req, res) => {
   const { cookies } = req.body;
