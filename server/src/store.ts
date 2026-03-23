@@ -2,18 +2,20 @@ import fs from 'fs';
 import path from 'path';
 
 const STORE_DIR = process.env.STORE_DIR || '/data';
+
+// Ensure directory exists on startup
+try {
+  fs.mkdirSync(STORE_DIR, { recursive: true });
+} catch (err) {
+  console.error(`❌ Cannot create store directory ${STORE_DIR}:`, err);
+  console.error('   Mount a Railway volume at /data or set STORE_DIR env var');
+}
 const STORE_FILE = path.join(STORE_DIR, 'state.json');
 
 interface StoreData {
   cookies?: any[];
   payment?: any;
   tockCredentials?: { email: string; password: string };
-}
-
-function ensureDir(): void {
-  if (!fs.existsSync(STORE_DIR)) {
-    fs.mkdirSync(STORE_DIR, { recursive: true });
-  }
 }
 
 function readStore(): StoreData {
@@ -26,8 +28,11 @@ function readStore(): StoreData {
 }
 
 function writeStore(data: StoreData): void {
-  ensureDir();
-  fs.writeFileSync(STORE_FILE, JSON.stringify(data));
+  try {
+    fs.writeFileSync(STORE_FILE, JSON.stringify(data));
+  } catch (err) {
+    console.error('Failed to write store:', err);
+  }
 }
 
 export function saveToDisk(key: keyof StoreData, value: any): void {
