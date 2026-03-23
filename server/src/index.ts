@@ -6,6 +6,7 @@ import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, ScheduledBooking } from './scheduler';
 import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
 import { notifyResult } from './notify';
+import { loginToTock } from './login';
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -190,6 +191,18 @@ app.post('/api/cookies/push', (req, res) => {
   updateCookies(cookies);
   console.log(`🍪 Bookmarklet pushed ${cookies.length} cookies`);
   res.json({ success: true, count: cookies.length });
+});
+
+// Auto-login: use Playwright to log into Tock and extract cookies
+app.post('/api/tock-login', requireAuth, async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    res.status(400).json({ error: 'email and password required' });
+    return;
+  }
+  console.log(`\n🔐 Tock login request for ${email}`);
+  const result = await loginToTock(email, password);
+  res.json(result);
 });
 
 // Keep old /cookies endpoint
