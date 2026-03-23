@@ -763,9 +763,10 @@ html, body {
     <div id="cookies-status"></div>
 
     <div class="card" style="margin-top:12px">
-      <div class="card-title" style="margin-bottom:8px">Auto Login</div>
+      <div class="card-title" style="margin-bottom:8px">Tock Account</div>
+      <div id="tock-creds-status"></div>
       <div class="card-meta" style="margin-bottom:12px">
-        Log into Tock automatically and refresh session cookies.
+        Credentials are saved for automatic session refresh every 12 hours.
       </div>
       <div class="field">
         <label>Tock Email</label>
@@ -775,7 +776,7 @@ html, body {
         <label>Tock Password</label>
         <input type="password" id="tock-password" placeholder="password">
       </div>
-      <button class="btn btn-primary" id="tock-login-btn" onclick="doTockLogin()">Log In & Sync Cookies</button>
+      <button class="btn btn-primary" id="tock-login-btn" onclick="doTockLogin()">Log In & Save Credentials</button>
       <div id="tock-login-result"></div>
     </div>
 
@@ -1120,6 +1121,18 @@ async function loadSettings() {
     document.getElementById('cookies-status').innerHTML = `
       <div class="masked">${cookies.loaded ? cookies.count + ' cookies loaded' : 'no cookies set'}</div>
     `;
+  } catch {}
+
+  // Tock credentials
+  try {
+    const creds = await api('/api/tock-credentials');
+    const statusEl = document.getElementById('tock-creds-status');
+    if (creds.saved) {
+      statusEl.innerHTML = `<div class="masked" style="margin-bottom:8px"><span style="color:var(--success)">&#10003;</span> Saved as ${creds.email} &mdash; auto-refresh active</div>`;
+      document.getElementById('tock-email').value = creds.email;
+    } else {
+      statusEl.innerHTML = `<div class="masked" style="margin-bottom:8px;color:var(--text-muted)">No credentials saved</div>`;
+    }
   } catch {}
 
   // Generate bookmarklet code with current server URL and auth key

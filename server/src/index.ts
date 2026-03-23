@@ -7,6 +7,7 @@ import { startScheduler, addScheduledBooking, removeScheduledBooking, getSchedul
 import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
 import { notifyResult } from './notify';
 import { loginToTock } from './login';
+import { saveTockCredentials, getTockCredentials, startSessionRefresh } from './session';
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -202,7 +203,16 @@ app.post('/api/tock-login', requireAuth, async (req, res) => {
   }
   console.log(`\n🔐 Tock login request for ${email}`);
   const result = await loginToTock(email, password);
+  if (result.success) {
+    saveTockCredentials(email, password);
+    console.log('💾 Tock credentials saved for auto-refresh');
+  }
   res.json(result);
+});
+
+app.get('/api/tock-credentials', requireAuth, (_req, res) => {
+  const creds = getTockCredentials();
+  res.json({ saved: !!creds, email: creds?.email || null });
 });
 
 // Keep old /cookies endpoint
@@ -251,6 +261,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 loadCookiesFromEnv();
 startScheduler();
+startSessionRefresh();
 
 app.listen(PORT, () => {
   const cookies = getCookies();
