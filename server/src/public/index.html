@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>tock-bot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-root: #0a0a0b;
+  --bg-surface: #111113;
+  --bg-raised: #19191d;
+  --bg-input: #0e0e10;
+  --border: #2a2a30;
+  --border-focus: #4a9eff;
+  --text-primary: #e8e8ed;
+  --text-secondary: #8a8a95;
+  --text-muted: #55555f;
+  --accent: #4a9eff;
+  --accent-dim: #2a5a9a;
+  --success: #34d399;
+  --success-bg: #0a2a1a;
+  --error: #f87171;
+  --error-bg: #2a0a0a;
+  --warning: #fbbf24;
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-sans: 'DM Sans', sans-serif;
+  --radius: 8px;
+  --radius-sm: 4px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  font-family: var(--font-sans);
+  background: var(--bg-root);
+  color: var(--text-primary);
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Login ── */
+#login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100dvh;
+  padding: 24px;
+}
+
+.login-box {
+  width: 100%;
+  max-width: 340px;
+  text-align: center;
+}
+
+.login-box h1 {
+  font-family: var(--font-mono);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  margin-bottom: 4px;
+}
+
+.login-box .subtitle {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  margin-bottom: 32px;
+}
+
+.login-box input {
+  width: 100%;
+  padding: 14px 16px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  text-align: center;
+  letter-spacing: 4px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.login-box input:focus { border-color: var(--border-focus); }
+
+.login-box button {
+  width: 100%;
+  margin-top: 12px;
+  padding: 14px;
+  background: var(--accent);
+  color: #000;
+  border: none;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.login-box button:active { opacity: 0.8; }
+
+.login-error {
+  color: var(--error);
+  font-size: 13px;
+  margin-top: 12px;
+  font-family: var(--font-mono);
+}
+
+/* ── App Shell ── */
+#app { display: none; }
+
+.header {
+  padding: 16px 20px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.header h1 {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+.header .status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  display: inline-block;
+  margin-right: 6px;
+  animation: pulse-dot 2s infinite;
+}
+
+.header .status-dot.offline { background: var(--error); animation: none; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Tabs ── */
+.tabs {
+  display: flex;
+  padding: 16px 20px 0;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.tabs button {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.tab-content {
+  display: none;
+  padding: 20px;
+  padding-bottom: 40px;
+  max-width: 600px;
+}
+
+.tab-content.active { display: block; }
+
+/* ── Form Elements ── */
+.field {
+  margin-bottom: 16px;
+}
+
+.field label {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.field input, .field textarea, .field select {
+  width: 100%;
+  padding: 12px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.field input:focus, .field textarea:focus { border-color: var(--border-focus); }
+
+.field textarea {
+  min-height: 100px;
+  resize: vertical;
+  font-size: 12px;
+}
+
+.field .hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: var(--font-mono);
+}
+
+.field-row {
+  display: flex;
+  gap: 12px;
+}
+
+.field-row .field { flex: 1; }
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.toggle-row input[type="checkbox"] {
+  appearance: none;
+  width: 36px;
+  height: 20px;
+  background: var(--border);
+  border-radius: 10px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.toggle-row input[type="checkbox"]::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: var(--text-secondary);
+  border-radius: 50%;
+  transition: all 0.2s;
+}
+
+.toggle-row input[type="checkbox"]:checked {
+  background: var(--accent-dim);
+}
+
+.toggle-row input[type="checkbox"]:checked::after {
+  left: 18px;
+  background: var(--accent);
+}
+
+.toggle-row span {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* ── Buttons ── */
+.btn {
+  padding: 12px 20px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #000;
+  width: 100%;
+}
+
+.btn-primary:active { opacity: 0.8; }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-danger {
+  background: none;
+  color: var(--error);
+  border: 1px solid var(--error);
+  padding: 6px 12px;
+  font-size: 11px;
+}
+
+.btn-danger:active { background: var(--error-bg); }
+
+.btn-secondary {
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  width: 100%;
+}
+
+/* ── Cards ── */
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 10px;
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.card-title {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.card-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.card-meta span {
+  color: var(--text-secondary);
+}
+
+/* ── Status badges ── */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.badge-success { background: var(--success-bg); color: var(--success); border: 1px solid #1a4a2a; }
+.badge-error { background: var(--error-bg); color: var(--error); border: 1px solid #4a1a1a; }
+.badge-info { background: #0a1a2a; color: var(--accent); border: 1px solid #1a3a5a; }
+
+/* ── Result display ── */
+.result {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  animation: slide-in 0.3s ease;
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.result.success {
+  background: var(--success-bg);
+  border: 1px solid #1a4a2a;
+  color: var(--success);
+}
+
+.result.error {
+  background: var(--error-bg);
+  border: 1px solid #4a1a1a;
+  color: var(--error);
+}
+
+.result .detail {
+  color: var(--text-secondary);
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.screenshots {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.screenshots img {
+  height: 180px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.screenshots img:active { transform: scale(0.97); }
+
+/* ── Lightbox ── */
+.lightbox {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.9);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.lightbox.active { display: flex; }
+
+.lightbox img {
+  max-width: 100%;
+  max-height: 90dvh;
+  border-radius: var(--radius);
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 28px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+
+/* ── Section headers ── */
+.section-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+  margin-top: 24px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-title:first-child { margin-top: 0; }
+
+/* ── Settings status ── */
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.status-row:last-child { border-bottom: none; }
+
+.status-row .label { color: var(--text-secondary); }
+
+/* ── Loading spinner ── */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Empty state ── */
+.empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+/* ── History expand ── */
+.history-screenshots {
+  margin-top: 10px;
+  display: none;
+}
+
+.history-screenshots.active { display: block; }
+
+/* ── Masked value ── */
+.masked {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 8px 0;
+}
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="login-screen">
+  <div class="login-box">
+    <h1>tock-bot</h1>
+    <div class="subtitle">reservation autopilot</div>
+    <input type="password" id="login-pw" placeholder="password" autocomplete="current-password">
+    <button onclick="doLogin()">enter</button>
+    <div id="login-error" class="login-error"></div>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <div class="header">
+    <h1>tock-bot</h1>
+    <div><span id="status-dot" class="status-dot"></span><span id="status-text" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">checking...</span></div>
+  </div>
+
+  <div class="tabs">
+    <button class="active" onclick="switchTab('book')">Book</button>
+    <button onclick="switchTab('scheduled')">Scheduled</button>
+    <button onclick="switchTab('history')">History</button>
+    <button onclick="switchTab('settings')">Settings</button>
+  </div>
+
+  <!-- Book Now -->
+  <div id="tab-book" class="tab-content active">
+    <div class="field">
+      <label>Restaurant</label>
+      <input type="text" id="book-restaurant" placeholder="lazybearsf">
+    </div>
+    <div class="field">
+      <label>Dates</label>
+      <input type="text" id="book-dates" placeholder="2026-04-29, 2026-04-28">
+      <div class="hint">comma-separated, priority order</div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Party Size</label>
+        <input type="number" id="book-party" value="2" min="1" max="20">
+      </div>
+      <div class="field">
+        <label>Time</label>
+        <input type="text" id="book-time" value="17:00" placeholder="17:00">
+      </div>
+    </div>
+    <div class="toggle-row">
+      <input type="checkbox" id="book-autopurchase" checked>
+      <span>Auto-purchase</span>
+    </div>
+    <div class="toggle-row">
+      <input type="checkbox" id="book-dryrun">
+      <span>Dry run (screenshots only)</span>
+    </div>
+    <button class="btn btn-primary" id="book-btn" onclick="doBook()">Book Now</button>
+    <div id="book-result"></div>
+  </div>
+
+  <!-- Scheduled -->
+  <div id="tab-scheduled" class="tab-content">
+    <div class="section-title">Active Schedules</div>
+    <div id="scheduled-list"></div>
+
+    <div class="section-title">New Schedule</div>
+    <div class="field">
+      <label>Label</label>
+      <input type="text" id="sched-label" placeholder="Lazy Bear April drop">
+    </div>
+    <div class="field">
+      <label>Restaurant</label>
+      <input type="text" id="sched-restaurant" placeholder="lazybearsf">
+    </div>
+    <div class="field">
+      <label>Dates</label>
+      <input type="text" id="sched-dates" placeholder="2026-04-29, 2026-04-28">
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Party Size</label>
+        <input type="number" id="sched-party" value="2" min="1" max="20">
+      </div>
+      <div class="field">
+        <label>Time</label>
+        <input type="text" id="sched-time" value="17:00">
+      </div>
+    </div>
+    <div class="field">
+      <label>Cron Expression</label>
+      <input type="text" id="sched-cron" placeholder="0 10 1 4 *">
+      <div class="hint">min hour day month weekday &mdash; e.g. "0 10 1 4 *" = Apr 1 at 10:00 AM</div>
+    </div>
+    <button class="btn btn-primary" onclick="addSchedule()">Add Schedule</button>
+  </div>
+
+  <!-- History -->
+  <div id="tab-history" class="tab-content">
+    <div id="history-list"></div>
+  </div>
+
+  <!-- Settings -->
+  <div id="tab-settings" class="tab-content">
+    <div class="section-title">Status</div>
+    <div id="settings-status"></div>
+
+    <div class="section-title">Payment</div>
+    <div id="payment-current"></div>
+    <div class="field">
+      <label>Card Number</label>
+      <input type="password" id="pay-card" placeholder="4242424242424242">
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Expiry</label>
+        <input type="text" id="pay-expiry" placeholder="MM/YY">
+      </div>
+      <div class="field">
+        <label>CVC</label>
+        <input type="password" id="pay-cvc" placeholder="123">
+      </div>
+    </div>
+    <div class="field">
+      <label>Billing Name</label>
+      <input type="text" id="pay-name" placeholder="Ricky Zhong">
+    </div>
+    <div class="field">
+      <label>Address</label>
+      <input type="text" id="pay-address" placeholder="123 Main St">
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>City</label>
+        <input type="text" id="pay-city" placeholder="San Francisco">
+      </div>
+      <div class="field">
+        <label>State</label>
+        <input type="text" id="pay-state" placeholder="CA" maxlength="2">
+      </div>
+      <div class="field">
+        <label>ZIP</label>
+        <input type="text" id="pay-zip" placeholder="94110">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="savePayment()">Save Payment</button>
+
+    <div class="section-title">Session Cookies</div>
+    <div id="cookies-status"></div>
+    <div class="field">
+      <label>Paste Cookies JSON</label>
+      <textarea id="cookies-json" placeholder='[{"name":"...","value":"...","domain":".exploretock.com"}]'></textarea>
+      <div class="hint">Export from browser DevTools or EditThisCookie extension</div>
+    </div>
+    <button class="btn btn-secondary" onclick="updateCookies()">Update Cookies</button>
+  </div>
+</div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <button class="lightbox-close">&times;</button>
+  <img id="lightbox-img" src="">
+</div>
+
+<script>
+// ── Auth ──
+function getAuthCookie() {
+  const c = document.cookie.split(';').find(c => c.trim().startsWith('tock_auth='));
+  return c ? c.trim().split('=')[1] : null;
+}
+
+function checkAuth() {
+  if (getAuthCookie()) {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    loadAll();
+  }
+}
+
+async function doLogin() {
+  const pw = document.getElementById('login-pw').value;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw })
+    });
+    if (res.ok) {
+      document.cookie = `tock_auth=${pw};path=/;max-age=${60*60*24*30};SameSite=Strict`;
+      checkAuth();
+    } else {
+      document.getElementById('login-error').textContent = 'wrong password';
+    }
+  } catch {
+    document.getElementById('login-error').textContent = 'connection failed';
+  }
+}
+
+document.getElementById('login-pw').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+// ── Tabs ──
+function switchTab(name) {
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  const btns = document.querySelectorAll('.tabs button');
+  const tabs = ['book', 'scheduled', 'history', 'settings'];
+  btns[tabs.indexOf(name)].classList.add('active');
+
+  if (name === 'scheduled') loadScheduled();
+  if (name === 'history') loadHistory();
+  if (name === 'settings') loadSettings();
+}
+
+// ── API helper ──
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
+    ...opts
+  });
+  return res.json();
+}
+
+// ── Load all data ──
+function loadAll() {
+  loadStatus();
+}
+
+async function loadStatus() {
+  try {
+    const data = await api('/health');
+    const dot = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    if (data.cookiesLoaded) {
+      dot.classList.remove('offline');
+      text.textContent = 'ready';
+    } else {
+      dot.classList.add('offline');
+      text.textContent = 'no cookies';
+    }
+  } catch {
+    document.getElementById('status-dot').classList.add('offline');
+    document.getElementById('status-text').textContent = 'offline';
+  }
+}
+
+// ── Book Now ──
+async function doBook() {
+  const btn = document.getElementById('book-btn');
+  const resultDiv = document.getElementById('book-result');
+
+  const restaurant = document.getElementById('book-restaurant').value.trim();
+  const datesRaw = document.getElementById('book-dates').value.trim();
+  const partySize = parseInt(document.getElementById('book-party').value);
+  const time = document.getElementById('book-time').value.trim();
+  const autoPurchase = document.getElementById('book-autopurchase').checked;
+  const dryRun = document.getElementById('book-dryrun').checked;
+
+  if (!restaurant || !datesRaw) {
+    resultDiv.innerHTML = '<div class="result error">fill in restaurant and dates</div>';
+    return;
+  }
+
+  const dates = datesRaw.split(',').map(d => d.trim()).filter(Boolean);
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>booking...';
+  resultDiv.innerHTML = '';
+
+  try {
+    const data = await api('/api/book', {
+      method: 'POST',
+      body: JSON.stringify({ restaurant, dates, partySize, time, autoPurchase, dryRun })
+    });
+
+    if (data.success) {
+      let html = `<div class="result success">
+        <div>booked ${restaurant}</div>
+        <div class="detail">${data.bookedDate || ''} at ${data.bookedTime || ''}</div>`;
+      if (data.screenshots?.length) {
+        html += '<div class="screenshots">';
+        data.screenshots.forEach(s => {
+          html += `<img src="data:image/png;base64,${s}" onclick="openLightbox(this.src)">`;
+        });
+        html += '</div>';
+      }
+      html += '</div>';
+      resultDiv.innerHTML = html;
+    } else {
+      resultDiv.innerHTML = `<div class="result error">
+        <div>booking failed</div>
+        <div class="detail">${data.error || 'unknown error'}</div>
+      </div>`;
+    }
+  } catch (err) {
+    resultDiv.innerHTML = `<div class="result error">request failed: ${err.message}</div>`;
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Book Now';
+}
+
+// ── Scheduled ──
+async function loadScheduled() {
+  const list = document.getElementById('scheduled-list');
+  try {
+    const data = await api('/api/scheduled');
+    if (!data.length) {
+      list.innerHTML = '<div class="empty">no scheduled bookings</div>';
+      return;
+    }
+    list.innerHTML = data.map(s => `
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">${s.label || s.restaurant}</div>
+          <button class="btn btn-danger" onclick="deleteSchedule('${s.id}')">delete</button>
+        </div>
+        <div class="card-meta">
+          <span>restaurant:</span> ${s.restaurant}<br>
+          <span>dates:</span> ${s.dates.join(', ')}<br>
+          <span>time:</span> ${s.time} &middot; <span>party:</span> ${s.partySize}<br>
+          <span>cron:</span> ${s.cron}
+        </div>
+      </div>
+    `).join('');
+  } catch {
+    list.innerHTML = '<div class="empty">failed to load</div>';
+  }
+}
+
+async function addSchedule() {
+  const restaurant = document.getElementById('sched-restaurant').value.trim();
+  const datesRaw = document.getElementById('sched-dates').value.trim();
+  const partySize = parseInt(document.getElementById('sched-party').value);
+  const time = document.getElementById('sched-time').value.trim();
+  const cronExpr = document.getElementById('sched-cron').value.trim();
+  const label = document.getElementById('sched-label').value.trim();
+
+  if (!restaurant || !datesRaw || !cronExpr) return;
+
+  const dates = datesRaw.split(',').map(d => d.trim()).filter(Boolean);
+
+  await api('/api/scheduled', {
+    method: 'POST',
+    body: JSON.stringify({ restaurant, dates, partySize, time, cron: cronExpr, label, autoPurchase: true })
+  });
+
+  // Clear form
+  ['sched-label', 'sched-restaurant', 'sched-dates', 'sched-cron'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+
+  loadScheduled();
+}
+
+async function deleteSchedule(id) {
+  await api('/api/scheduled/' + id, { method: 'DELETE' });
+  loadScheduled();
+}
+
+// ── History ──
+async function loadHistory() {
+  const list = document.getElementById('history-list');
+  try {
+    const data = await api('/api/history');
+    if (!data.length) {
+      list.innerHTML = '<div class="empty">no booking history yet</div>';
+      return;
+    }
+    list.innerHTML = data.map(h => {
+      const time = new Date(h.ranAt).toLocaleString();
+      const badge = h.success
+        ? '<span class="badge badge-success">success</span>'
+        : '<span class="badge badge-error">failed</span>';
+      const source = `<span class="badge badge-info">${h.source}</span>`;
+      const screenshotHtml = h.hasScreenshots
+        ? `<div class="history-screenshots" id="ss-${h.id}"></div>
+           <button class="btn btn-secondary" style="margin-top:8px;width:auto;padding:6px 12px;font-size:11px" onclick="loadScreenshots('${h.id}')">view screenshots</button>`
+        : '';
+      return `<div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">${h.restaurant}</div>
+            <div class="card-meta" style="margin-top:2px">${time}</div>
+          </div>
+          <div style="display:flex;gap:4px">${source}${badge}</div>
+        </div>
+        <div class="card-meta">
+          ${h.date ? `<span>date:</span> ${h.date} &middot; ` : ''}<span>time:</span> ${h.time || 'n/a'}
+          ${h.error ? `<br><span style="color:var(--error)">${h.error}</span>` : ''}
+        </div>
+        ${screenshotHtml}
+      </div>`;
+    }).join('');
+  } catch {
+    list.innerHTML = '<div class="empty">failed to load</div>';
+  }
+}
+
+async function loadScreenshots(id) {
+  const container = document.getElementById('ss-' + id);
+  if (container.classList.contains('active')) {
+    container.classList.remove('active');
+    return;
+  }
+
+  // Try loading screenshots 0-4
+  let html = '<div class="screenshots">';
+  for (let i = 0; i < 5; i++) {
+    const url = `/api/history/${id}/screenshot/${i}`;
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        html += `<img src="${url}" onclick="openLightbox('${url}')">`;
+      } else break;
+    } catch { break; }
+  }
+  html += '</div>';
+  container.innerHTML = html;
+  container.classList.add('active');
+}
+
+// ── Settings ──
+async function loadSettings() {
+  // Status
+  try {
+    const health = await api('/health');
+    document.getElementById('settings-status').innerHTML = `
+      <div class="status-row"><span class="label">cookies</span> ${health.cookiesLoaded ? `<span style="color:var(--success)">${health.cookieCount} loaded</span>` : '<span style="color:var(--error)">not set</span>'}</div>
+      <div class="status-row"><span class="label">payment</span> ${health.paymentConfigured ? '<span style="color:var(--success)">configured</span>' : '<span style="color:var(--error)">not set</span>'}</div>
+    `;
+  } catch {
+    document.getElementById('settings-status').innerHTML = '<div class="status-row"><span style="color:var(--error)">offline</span></div>';
+  }
+
+  // Payment
+  try {
+    const pay = await api('/api/payment');
+    if (pay.configured) {
+      document.getElementById('payment-current').innerHTML = `
+        <div class="masked">card ending in ${pay.cardLast4} &middot; ${pay.cardExpiry} &middot; ${pay.billingName}</div>
+      `;
+    } else {
+      document.getElementById('payment-current').innerHTML = '<div class="masked">no payment configured</div>';
+    }
+  } catch {}
+
+  // Cookies
+  try {
+    const cookies = await api('/api/cookies/status');
+    document.getElementById('cookies-status').innerHTML = `
+      <div class="masked">${cookies.loaded ? cookies.count + ' cookies loaded' : 'no cookies set'}</div>
+    `;
+  } catch {}
+}
+
+async function savePayment() {
+  const body = {
+    cardNumber: document.getElementById('pay-card').value,
+    cardExpiry: document.getElementById('pay-expiry').value,
+    cvc: document.getElementById('pay-cvc').value,
+    billingName: document.getElementById('pay-name').value,
+    billingAddress: document.getElementById('pay-address').value,
+    billingCity: document.getElementById('pay-city').value,
+    billingState: document.getElementById('pay-state').value,
+    billingZip: document.getElementById('pay-zip').value,
+  };
+  await api('/api/payment', { method: 'POST', body: JSON.stringify(body) });
+  loadSettings();
+}
+
+async function updateCookies() {
+  const raw = document.getElementById('cookies-json').value.trim();
+  try {
+    const cookies = JSON.parse(raw);
+    await api('/api/cookies', { method: 'POST', body: JSON.stringify({ cookies }) });
+    document.getElementById('cookies-json').value = '';
+    loadSettings();
+    loadStatus();
+  } catch {
+    alert('Invalid JSON');
+  }
+}
+
+// ── Lightbox ──
+function openLightbox(src) {
+  document.getElementById('lightbox-img').src = src;
+  document.getElementById('lightbox').classList.add('active');
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('active');
+}
+
+// ── Init ──
+checkAuth();
+</script>
+</body>
+</html>
