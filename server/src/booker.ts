@@ -1,6 +1,6 @@
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
 import { injectCookies } from './cookies';
-import { fillStripePayment, fillStripeBilling, PaymentDetails, getPaymentFromEnv } from './stripe';
+import { fillStripePayment, fillStripeBilling, PaymentDetails, getPayment } from './stripe';
 
 export interface BookingRequest {
   restaurant: string;
@@ -259,9 +259,9 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
   }
 
   // Fill payment details
-  const payment = getPaymentFromEnv();
+  const payment = getPayment();
   if (!payment) {
-    console.log('⚠️ No payment details configured (CARD_NUMBER env var missing)');
+    console.log('⚠️ No payment details configured (set via UI or CARD_NUMBER env var)');
     if (dryRun) screenshots.push(await takeScreenshot(page));
     return dryRun; // dryRun succeeds without payment
   }

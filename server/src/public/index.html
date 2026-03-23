@@ -676,10 +676,24 @@ html, body {
 
     <div class="section-title">Session Cookies</div>
     <div id="cookies-status"></div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="card-title" style="margin-bottom:8px">One-Click Sync</div>
+      <div class="card-meta" style="margin-bottom:12px">
+        1. Go to <span>exploretock.com</span> and log in<br>
+        2. Open DevTools console (F12)<br>
+        3. Paste this and press Enter:
+      </div>
+      <div style="position:relative">
+        <pre id="bookmarklet-code" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;font-family:var(--font-mono);font-size:11px;color:var(--accent);overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5"></pre>
+        <button onclick="copyBookmarklet()" style="position:absolute;top:8px;right:8px;background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-secondary);padding:4px 10px;font-family:var(--font-mono);font-size:11px;cursor:pointer" id="copy-btn">copy</button>
+      </div>
+    </div>
+
+    <div class="section-title" style="margin-top:20px">Manual Upload</div>
     <div class="field">
       <label>Paste Cookies JSON</label>
       <textarea id="cookies-json" placeholder='[{"name":"...","value":"...","domain":".exploretock.com"}]'></textarea>
-      <div class="hint">Export from browser DevTools or EditThisCookie extension</div>
     </div>
     <button class="btn btn-secondary" onclick="updateCookies()">Update Cookies</button>
   </div>
@@ -982,9 +996,13 @@ async function loadSettings() {
       <div class="masked">${cookies.loaded ? cookies.count + ' cookies loaded' : 'no cookies set'}</div>
     `;
   } catch {}
+
+  // Generate bookmarklet code with current server URL and auth key
+  generateBookmarkletCode();
 }
 
 async function savePayment() {
+  const btn = event.target;
   const body = {
     cardNumber: document.getElementById('pay-card').value,
     cardExpiry: document.getElementById('pay-expiry').value,
@@ -995,8 +1013,22 @@ async function savePayment() {
     billingState: document.getElementById('pay-state').value,
     billingZip: document.getElementById('pay-zip').value,
   };
-  await api('/api/payment', { method: 'POST', body: JSON.stringify(body) });
-  loadSettings();
+
+  if (!body.cardNumber) { alert('Enter a card number'); return; }
+
+  btn.disabled = true;
+  btn.textContent = 'saving...';
+  try {
+    await api('/api/payment', { method: 'POST', body: JSON.stringify(body) });
+    btn.textContent = 'saved!';
+    btn.style.background = 'var(--success)';
+    setTimeout(() => { btn.textContent = 'Save Payment'; btn.style.background = ''; btn.disabled = false; }, 1500);
+    loadSettings();
+  } catch {
+    btn.textContent = 'failed';
+    btn.style.background = 'var(--error)';
+    setTimeout(() => { btn.textContent = 'Save Payment'; btn.style.background = ''; btn.disabled = false; }, 1500);
+  }
 }
 
 async function updateCookies() {
@@ -1010,6 +1042,24 @@ async function updateCookies() {
   } catch {
     alert('Invalid JSON');
   }
+}
+
+// ── Bookmarklet ──
+function generateBookmarkletCode() {
+  const serverUrl = window.location.origin;
+  const key = getAuthCookie() || '';
+  const code = `fetch("${serverUrl}/api/cookies/push?key=${key}",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cookies:document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".exploretock.com",path:"/"}})})}).then(r=>r.json()).then(d=>alert("Synced "+d.count+" cookies!")).catch(e=>alert("Failed: "+e.message))`;
+  const el = document.getElementById('bookmarklet-code');
+  if (el) el.textContent = code;
+}
+
+function copyBookmarklet() {
+  const code = document.getElementById('bookmarklet-code').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = 'copied!';
+    setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+  });
 }
 
 // ── Lightbox ──

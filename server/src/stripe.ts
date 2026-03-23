@@ -11,6 +11,19 @@ export interface PaymentDetails {
   billingZip: string;
 }
 
+// In-memory payment override (set from UI via /api/payment)
+let paymentOverride: PaymentDetails | null = null;
+
+export function setPaymentOverride(payment: PaymentDetails): void {
+  paymentOverride = payment;
+}
+
+/** Get payment details — UI override takes priority over env vars */
+export function getPayment(): PaymentDetails | null {
+  if (paymentOverride?.cardNumber) return paymentOverride;
+  return getPaymentFromEnv();
+}
+
 /** Load payment details from environment variables */
 export function getPaymentFromEnv(): PaymentDetails | null {
   const cardNumber = process.env.CARD_NUMBER;
