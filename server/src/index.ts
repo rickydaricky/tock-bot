@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { runBooking, BookingRequest } from './booker';
 import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, ScheduledBooking } from './scheduler';
-import { getPaymentFromEnv, PaymentDetails } from './stripe';
+import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
 import { notifyResult } from './notify';
 
 const app = express();
@@ -12,8 +12,7 @@ app.use(express.json({ limit: '5mb' }));
 
 const API_KEY = process.env.API_KEY;
 
-// In-memory payment override (from UI). Falls back to env vars.
-let paymentOverride: PaymentDetails | null = null;
+// Payment override is now managed in stripe.ts via setPaymentOverride/getPayment
 
 // --- Auth middleware ---
 
@@ -49,7 +48,7 @@ app.post('/api/login', (req, res) => {
 
 app.get('/health', (_req, res) => {
   const cookies = getCookies();
-  const payment = paymentOverride || getPaymentFromEnv();
+  const payment = getPayment();
   res.json({
     status: 'ok',
     cookiesLoaded: cookies.length > 0,
@@ -175,7 +174,7 @@ app.post('/cookies', requireAuth, (req, res) => {
 // --- Payment config ---
 
 app.get('/api/payment', requireAuth, (_req, res) => {
-  const payment = paymentOverride || getPaymentFromEnv();
+  const payment = getPayment();
   if (!payment) {
     res.json({ configured: false });
     return;
@@ -194,7 +193,7 @@ app.get('/api/payment', requireAuth, (_req, res) => {
 });
 
 app.post('/api/payment', requireAuth, (req, res) => {
-  paymentOverride = req.body as PaymentDetails;
+  setPaymentOverride(req.body as PaymentDetails);
   res.json({ success: true });
 });
 
