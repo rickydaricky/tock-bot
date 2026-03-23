@@ -7,6 +7,7 @@ RUN npm ci
 
 COPY . ./
 RUN npx tsc
+RUN cp -r src/public dist/public
 RUN npm prune --omit=dev
 
 EXPOSE 3000
