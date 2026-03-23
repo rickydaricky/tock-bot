@@ -48,9 +48,10 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
     console.log(`   Party: ${req.partySize}, Time: ${req.time}`);
     console.log(`   Auto-purchase: ${req.autoPurchase ?? false}, Dry run: ${req.dryRun ?? false}`);
 
-    // Launch browser
+    // Launch browser — use new headless mode which is less detectable
     browser = await chromium.launch({
       headless: true,
+      channel: 'chromium',
       args: STEALTH_ARGS,
     });
 
@@ -67,6 +68,11 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
     }
 
     const page = await context.newPage();
+
+    // Remove webdriver flag to avoid bot detection
+    await page.addInitScript(() => {
+      Object.defineProperty((globalThis as any).navigator, 'webdriver', { get: () => false });
+    });
 
     // Navigate to search page with primary date
     const searchUrl = `https://www.exploretock.com/${req.restaurant}/search?date=${req.dates[0]}&size=${req.partySize}&time=${encodeURIComponent(req.time)}`;
