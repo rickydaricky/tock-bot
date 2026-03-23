@@ -69,7 +69,18 @@ export async function loginToTock(email: string, password: string): Promise<{ su
 
     // Step 4: Wait for navigation (successful login redirects away from /login)
     console.log('   Waiting for login to complete...');
-    await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 15000 });
+    try {
+      await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 15000 });
+    } catch {
+      // Check if there's an error message on the page
+      const errorText = await page.evaluate(() => {
+        const err = (globalThis as any).document.querySelector('[class*="error"], [class*="Error"], [role="alert"]');
+        return err ? err.textContent?.trim() : null;
+      });
+      const msg = errorText || 'Login failed — wrong email/password or Turnstile blocked';
+      console.error(`   ${msg}`);
+      return { success: false, error: msg };
+    }
     await page.waitForTimeout(2000);
 
     const finalUrl = page.url();
