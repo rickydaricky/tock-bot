@@ -1,4 +1,5 @@
 import { BrowserContext } from 'playwright';
+import { saveToDisk, loadFromDisk } from './store';
 
 export interface TockCookie {
   name: string;
@@ -13,14 +14,24 @@ export interface TockCookie {
 
 let storedCookies: TockCookie[] = [];
 
-/** Load cookies from TOCK_COOKIES env var (base64-encoded JSON) */
+/** Load cookies — tries disk first, then TOCK_COOKIES env var */
 export function loadCookiesFromEnv(): TockCookie[] {
+  // Try disk first (persists across requests within a deploy)
+  const fromDisk = loadFromDisk('cookies');
+  if (Array.isArray(fromDisk) && fromDisk.length > 0) {
+    storedCookies = fromDisk;
+    console.log(`🍪 Loaded ${storedCookies.length} cookies from disk`);
+    return storedCookies;
+  }
+
+  // Fall back to env var
   const raw = process.env.TOCK_COOKIES;
   if (!raw) return [];
 
   try {
     const json = Buffer.from(raw, 'base64').toString('utf-8');
     storedCookies = JSON.parse(json);
+    saveToDisk('cookies', storedCookies);
     return storedCookies;
   } catch (err) {
     console.error('Failed to parse TOCK_COOKIES:', err);
@@ -28,9 +39,10 @@ export function loadCookiesFromEnv(): TockCookie[] {
   }
 }
 
-/** Update stored cookies (from POST /cookies endpoint) */
+/** Update stored cookies (from UI) and persist to disk */
 export function updateCookies(cookies: TockCookie[]): void {
   storedCookies = cookies;
+  saveToDisk('cookies', cookies);
 }
 
 /** Get current stored cookies */
