@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-const STORE_DIR = process.env.STORE_DIR || '/tmp/tock-bot-data';
+const STORE_DIR = process.env.STORE_DIR || '/data';
 const STORE_FILE = path.join(STORE_DIR, 'state.json');
 
 interface StoreData {
