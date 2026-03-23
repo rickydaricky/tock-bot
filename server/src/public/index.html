@@ -625,7 +625,10 @@ html, body {
 <div id="app">
   <div class="header">
     <h1>tock-bot</h1>
-    <div><span id="status-dot" class="status-dot"></span><span id="status-text" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">checking...</span></div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <div><span id="status-dot" class="status-dot"></span><span id="status-text" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">checking...</span></div>
+      <button onclick="doLogout()" style="background:none;border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-muted);padding:4px 10px;font-family:var(--font-mono);font-size:10px;cursor:pointer">logout</button>
+    </div>
   </div>
 
   <div class="tabs">
@@ -838,6 +841,11 @@ async function doLogin() {
 document.getElementById('login-pw').addEventListener('keydown', e => {
   if (e.key === 'Enter') doLogin();
 });
+
+function doLogout() {
+  document.cookie = 'tock_auth=;path=/;max-age=0';
+  window.location.reload();
+}
 
 // ── Tabs ──
 function switchTab(name) {
