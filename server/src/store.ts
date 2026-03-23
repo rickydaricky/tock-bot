@@ -1,22 +1,15 @@
 import fs from 'fs';
 import path from 'path';
 
-// Try /data (Railway volume), fall back to /tmp if not writable
-function resolveStoreDir(): string {
-  const preferred = process.env.STORE_DIR || '/data';
-  try {
-    fs.mkdirSync(preferred, { recursive: true });
-    fs.accessSync(preferred, fs.constants.W_OK);
-    return preferred;
-  } catch {
-    const fallback = '/tmp/tock-bot-data';
-    fs.mkdirSync(fallback, { recursive: true });
-    console.log(`⚠️ Cannot write to ${preferred}, using ${fallback} (data won't persist across deploys)`);
-    return fallback;
-  }
-}
+const STORE_DIR = process.env.STORE_DIR || '/data';
 
-const STORE_DIR = resolveStoreDir();
+// Ensure directory exists on startup
+try {
+  fs.mkdirSync(STORE_DIR, { recursive: true });
+} catch (err) {
+  console.error(`❌ Cannot create store directory ${STORE_DIR}:`, err);
+  console.error('   Mount a Railway volume at /data or set STORE_DIR env var');
+}
 const STORE_FILE = path.join(STORE_DIR, 'state.json');
 
 interface StoreData {
