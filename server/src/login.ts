@@ -22,7 +22,7 @@ export async function loginToTock(email: string, password: string): Promise<{ su
     console.log(`🔐 Logging into Tock as ${email}...`);
 
     browser = await chromium.launch({
-      headless: false, // Headed mode needed to pass Turnstile
+      headless: true,
       args: STEALTH_ARGS,
     });
 
