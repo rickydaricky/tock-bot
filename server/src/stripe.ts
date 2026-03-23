@@ -1,4 +1,5 @@
 import { Page } from 'playwright';
+import { saveToDisk, loadFromDisk } from './store';
 
 export interface PaymentDetails {
   cardNumber: string;
@@ -11,16 +12,14 @@ export interface PaymentDetails {
   billingZip: string;
 }
 
-// In-memory payment override (set from UI via /api/payment)
-let paymentOverride: PaymentDetails | null = null;
-
 export function setPaymentOverride(payment: PaymentDetails): void {
-  paymentOverride = payment;
+  saveToDisk('payment', payment);
 }
 
-/** Get payment details — UI override takes priority over env vars */
+/** Get payment details — disk (from UI) → env vars */
 export function getPayment(): PaymentDetails | null {
-  if (paymentOverride?.cardNumber) return paymentOverride;
+  const fromDisk = loadFromDisk('payment') as PaymentDetails | null;
+  if (fromDisk?.cardNumber) return fromDisk;
   return getPaymentFromEnv();
 }
 
