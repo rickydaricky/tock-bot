@@ -50,7 +50,7 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
 
     // Launch browser
     browser = await chromium.launch({
-      headless: true,
+      headless: false, // Headed mode needed for Cloudflare Turnstile (Xvfb on Railway)
       args: STEALTH_ARGS,
     });
 
