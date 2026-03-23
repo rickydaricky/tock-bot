@@ -114,10 +114,15 @@ html, body {
 }
 
 /* ── App Shell ── */
-#app { display: none; }
+#app {
+  display: none;
+  max-width: 540px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
 
 .header {
-  padding: 16px 20px 0;
+  padding: 16px 0 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -150,7 +155,7 @@ html, body {
 /* ── Tabs ── */
 .tabs {
   display: flex;
-  padding: 16px 20px 0;
+  padding: 16px 0 0;
   gap: 2px;
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
@@ -180,12 +185,77 @@ html, body {
 
 .tab-content {
   display: none;
-  padding: 20px;
+  padding: 20px 0;
   padding-bottom: 40px;
-  max-width: 600px;
 }
 
 .tab-content.active { display: block; }
+
+/* ── Date chips ── */
+.date-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 38px;
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  align-items: center;
+  cursor: text;
+  transition: border-color 0.2s;
+}
+
+.date-chips:focus-within { border-color: var(--border-focus); }
+
+.date-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  animation: slide-in 0.15s ease;
+}
+
+.date-chip button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0;
+  line-height: 1;
+}
+
+.date-chip button:hover { color: var(--error); }
+
+.date-add-btn {
+  background: none;
+  border: 1px dashed var(--border);
+  color: var(--text-muted);
+  border-radius: 3px;
+  padding: 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.date-add-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Hidden native date input used as picker */
+.date-picker-hidden {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
 
 /* ── Form Elements ── */
 .field {
@@ -217,6 +287,16 @@ html, body {
 }
 
 .field input:focus, .field textarea:focus { border-color: var(--border-focus); }
+
+.field input[type="date"], .field input[type="time"] {
+  color-scheme: dark;
+}
+
+.field input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+.field input[type="number"]::-webkit-inner-spin-button { opacity: 1; }
 
 .field textarea {
   min-height: 100px;
@@ -562,9 +642,11 @@ html, body {
       <input type="text" id="book-restaurant" placeholder="lazybearsf">
     </div>
     <div class="field">
-      <label>Dates</label>
-      <input type="text" id="book-dates" placeholder="2026-04-29, 2026-04-28">
-      <div class="hint">comma-separated, priority order</div>
+      <label>Dates (priority order)</label>
+      <div class="date-chips" id="book-dates-chips">
+        <input type="date" class="date-picker-hidden" id="book-date-picker">
+        <button type="button" class="date-add-btn" onclick="document.getElementById('book-date-picker').showPicker()">+ add date</button>
+      </div>
     </div>
     <div class="field-row">
       <div class="field">
@@ -573,7 +655,7 @@ html, body {
       </div>
       <div class="field">
         <label>Time</label>
-        <input type="text" id="book-time" value="17:00" placeholder="17:00">
+        <input type="time" id="book-time" value="17:00">
       </div>
     </div>
     <div class="toggle-row">
@@ -603,8 +685,11 @@ html, body {
       <input type="text" id="sched-restaurant" placeholder="lazybearsf">
     </div>
     <div class="field">
-      <label>Dates</label>
-      <input type="text" id="sched-dates" placeholder="2026-04-29, 2026-04-28">
+      <label>Dates (priority order)</label>
+      <div class="date-chips" id="sched-dates-chips">
+        <input type="date" class="date-picker-hidden" id="sched-date-picker">
+        <button type="button" class="date-add-btn" onclick="document.getElementById('sched-date-picker').showPicker()">+ add date</button>
+      </div>
     </div>
     <div class="field-row">
       <div class="field">
@@ -613,7 +698,7 @@ html, body {
       </div>
       <div class="field">
         <label>Time</label>
-        <input type="text" id="sched-time" value="17:00">
+        <input type="time" id="sched-time" value="17:00">
       </div>
     </div>
     <div class="field">
@@ -766,9 +851,41 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+// ── Date chip management ──
+function setupDatePicker(pickerId, chipsId) {
+  const picker = document.getElementById(pickerId);
+  picker.addEventListener('change', () => {
+    if (picker.value) {
+      addDateChip(chipsId, picker.value);
+      picker.value = '';
+    }
+  });
+}
+
+function addDateChip(chipsId, date) {
+  const container = document.getElementById(chipsId);
+  // Don't add duplicates
+  if (container.querySelector(`[data-date="${date}"]`)) return;
+
+  const chip = document.createElement('span');
+  chip.className = 'date-chip';
+  chip.dataset.date = date;
+  chip.innerHTML = `${date}<button onclick="this.parentElement.remove()">&times;</button>`;
+  // Insert before the add button
+  const addBtn = container.querySelector('.date-add-btn');
+  container.insertBefore(chip, addBtn);
+}
+
+function getDatesFromChips(chipsId) {
+  const container = document.getElementById(chipsId);
+  return Array.from(container.querySelectorAll('.date-chip')).map(c => c.dataset.date);
+}
+
 // ── Load all data ──
 function loadAll() {
   loadStatus();
+  setupDatePicker('book-date-picker', 'book-dates-chips');
+  setupDatePicker('sched-date-picker', 'sched-dates-chips');
 }
 
 async function loadStatus() {
@@ -795,18 +912,16 @@ async function doBook() {
   const resultDiv = document.getElementById('book-result');
 
   const restaurant = document.getElementById('book-restaurant').value.trim();
-  const datesRaw = document.getElementById('book-dates').value.trim();
+  const dates = getDatesFromChips('book-dates-chips');
   const partySize = parseInt(document.getElementById('book-party').value);
   const time = document.getElementById('book-time').value.trim();
   const autoPurchase = document.getElementById('book-autopurchase').checked;
   const dryRun = document.getElementById('book-dryrun').checked;
 
-  if (!restaurant || !datesRaw) {
-    resultDiv.innerHTML = '<div class="result error">fill in restaurant and dates</div>';
+  if (!restaurant || !dates.length) {
+    resultDiv.innerHTML = '<div class="result error">fill in restaurant and add at least one date</div>';
     return;
   }
-
-  const dates = datesRaw.split(',').map(d => d.trim()).filter(Boolean);
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>booking...';
   resultDiv.innerHTML = '';
@@ -874,15 +989,13 @@ async function loadScheduled() {
 
 async function addSchedule() {
   const restaurant = document.getElementById('sched-restaurant').value.trim();
-  const datesRaw = document.getElementById('sched-dates').value.trim();
+  const dates = getDatesFromChips('sched-dates-chips');
   const partySize = parseInt(document.getElementById('sched-party').value);
   const time = document.getElementById('sched-time').value.trim();
   const cronExpr = document.getElementById('sched-cron').value.trim();
   const label = document.getElementById('sched-label').value.trim();
 
-  if (!restaurant || !datesRaw || !cronExpr) return;
-
-  const dates = datesRaw.split(',').map(d => d.trim()).filter(Boolean);
+  if (!restaurant || !dates.length || !cronExpr) return;
 
   await api('/api/scheduled', {
     method: 'POST',
@@ -890,9 +1003,11 @@ async function addSchedule() {
   });
 
   // Clear form
-  ['sched-label', 'sched-restaurant', 'sched-dates', 'sched-cron'].forEach(id => {
+  ['sched-label', 'sched-restaurant', 'sched-cron'].forEach(id => {
     document.getElementById(id).value = '';
   });
+  // Clear date chips
+  document.querySelectorAll('#sched-dates-chips .date-chip').forEach(c => c.remove());
 
   loadScheduled();
 }
