@@ -258,12 +258,24 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
     }
   }
 
+  // Wait for Stripe iframes to load
+  console.log('⏳ Waiting for Stripe iframes to load...');
+  await page.waitForTimeout(5000);
+
+  // Debug: log all frames
+  const frameUrls = page.frames().map(f => f.url()).filter(u => u && u !== 'about:blank');
+  console.log(`   ${frameUrls.length} frames loaded`);
+  const stripeFrames = frameUrls.filter(u => u.includes('stripe'));
+  console.log(`   ${stripeFrames.length} Stripe frames: ${stripeFrames.map(u => u.slice(0, 80)).join(', ')}`);
+
+  // Take a screenshot of the purchase page for debugging
+  screenshots.push(await takeScreenshot(page));
+
   // Fill payment details
   const payment = getPayment();
   if (!payment) {
     console.log('⚠️ No payment details configured (set via UI or CARD_NUMBER env var)');
-    if (dryRun) screenshots.push(await takeScreenshot(page));
-    return dryRun; // dryRun succeeds without payment
+    return dryRun;
   }
 
   try {
@@ -273,7 +285,7 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
     await page.waitForTimeout(500);
   } catch (err) {
     console.error('❌ Stripe fill error:', err);
-    if (dryRun) screenshots.push(await takeScreenshot(page));
+    screenshots.push(await takeScreenshot(page));
     return false;
   }
 
