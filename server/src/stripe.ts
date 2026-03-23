@@ -1,4 +1,4 @@
-import { Page } from 'playwright';
+import { Page, Frame } from 'playwright';
 import { saveToDisk, loadFromDisk } from './store';
 
 export interface PaymentDetails {
@@ -42,31 +42,43 @@ export function getPaymentFromEnv(): PaymentDetails | null {
 }
 
 /**
+ * Find the Stripe payment frame by searching all frames for the card number input.
+ * More reliable than CSS selectors since Stripe nests iframes unpredictably.
+ */
+async function findStripeFrame(page: Page, fieldName: string): Promise<Frame | null> {
+  for (const frame of page.frames()) {
+    try {
+      const found = await frame.locator(`input[name="${fieldName}"]`).count();
+      if (found > 0) return frame;
+    } catch { /* skip inaccessible frames */ }
+  }
+  return null;
+}
+
+/**
  * Fill the Stripe Payment Element (card number, expiry, CVC).
- *
- * Playwright can access cross-origin iframe internals via frameLocator,
- * unlike Chrome extension content scripts.
  */
 export async function fillStripePayment(page: Page, payment: PaymentDetails): Promise<void> {
   console.log('💳 Filling Stripe Payment Element...');
 
-  // The payment iframe is inside [data-testid="payment"] or a .StripeElement
-  const paymentFrame = page.frameLocator('[data-testid="payment"] iframe').first();
+  // Find the frame containing the card number input
+  const frame = await findStripeFrame(page, 'number');
+  if (!frame) {
+    throw new Error('Could not find Stripe payment frame (no input[name="number"] in any frame)');
+  }
+  console.log('   Found payment frame');
 
-  // Stripe Payment Element field selectors — try multiple patterns
-  // Stripe uses different name/placeholder attributes across versions
-  const cardField = paymentFrame.locator('input[name="number"], input[name="cardNumber"], input[placeholder*="Card number"], input[autocomplete="cc-number"]').first();
-  const expiryField = paymentFrame.locator('input[name="expiry"], input[name="cardExpiry"], input[placeholder*="MM"], input[autocomplete="cc-exp"]').first();
-  const cvcField = paymentFrame.locator('input[name="cvc"], input[name="cardCvc"], input[placeholder*="CVC"], input[autocomplete="cc-csc"]').first();
+  const cardField = frame.locator('input[name="number"]');
+  const expiryField = frame.locator('input[name="expiry"]');
+  const cvcField = frame.locator('input[name="cvc"]');
 
   await cardField.click();
   await page.waitForTimeout(300);
   await cardField.fill(payment.cardNumber);
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(500);
 
   await expiryField.click();
   await page.waitForTimeout(200);
-  // Stripe expects MMYY without slash
   const expiryDigits = payment.cardExpiry.replace(/\D/g, '');
   await expiryField.fill(expiryDigits);
   await page.waitForTimeout(200);
@@ -85,17 +97,22 @@ export async function fillStripePayment(page: Page, payment: PaymentDetails): Pr
 export async function fillStripeBilling(page: Page, payment: PaymentDetails): Promise<void> {
   console.log('📍 Filling Stripe Billing Address...');
 
-  const billingFrame = page.frameLocator('[data-testid="billing"] iframe').first();
+  // Find the frame containing the billing name input
+  const frame = await findStripeFrame(page, 'name');
+  if (!frame) {
+    throw new Error('Could not find Stripe billing frame (no input[name="name"] in any frame)');
+  }
+  console.log('   Found billing frame');
 
-  // Name field
-  const nameField = billingFrame.locator('input[name="name"], input[autocomplete="name"]').first();
+  // Name
+  const nameField = frame.locator('input[name="name"]');
   await nameField.click();
   await page.waitForTimeout(200);
   await nameField.fill(payment.billingName);
   await page.waitForTimeout(300);
 
   // Address line 1
-  const addressField = billingFrame.locator('input[name="addressLine1"], input[autocomplete="address-line1"]').first();
+  const addressField = frame.locator('input[name="addressLine1"]');
   await addressField.click();
   await page.waitForTimeout(200);
   await addressField.fill(payment.billingAddress);
@@ -106,21 +123,20 @@ export async function fillStripeBilling(page: Page, payment: PaymentDetails): Pr
   await page.waitForTimeout(300);
 
   // City
-  const cityField = billingFrame.locator('input[name="locality"], input[autocomplete="address-level2"]').first();
+  const cityField = frame.locator('input[name="locality"]');
   await cityField.click();
   await page.waitForTimeout(200);
   await cityField.fill(payment.billingCity);
   await page.waitForTimeout(200);
 
-  // State dropdown — try by value, then by label (Stripe may use full state names or abbreviations)
-  const stateField = billingFrame.locator('select[name="administrativeArea"], select[autocomplete="address-level1"]').first();
+  // State dropdown
+  const stateField = frame.locator('select[name="administrativeArea"]');
   try {
     await stateField.selectOption({ value: payment.billingState }, { timeout: 3000 });
   } catch {
     try {
       await stateField.selectOption({ label: payment.billingState }, { timeout: 3000 });
     } catch {
-      // Last resort: click and type to filter
       await stateField.click();
       await page.keyboard.type(payment.billingState);
       await page.keyboard.press('Enter');
@@ -129,7 +145,7 @@ export async function fillStripeBilling(page: Page, payment: PaymentDetails): Pr
   await page.waitForTimeout(200);
 
   // ZIP code
-  const zipField = billingFrame.locator('input[name="postalCode"], input[autocomplete="postal-code"]').first();
+  const zipField = frame.locator('input[name="postalCode"]');
   await zipField.click();
   await page.waitForTimeout(200);
   await zipField.fill(payment.billingZip);
