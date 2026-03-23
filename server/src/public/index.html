@@ -1166,8 +1166,8 @@ async function updateCookies() {
 
 // ── Cookie sync ──
 function generateBookmarkletCode() {
-  // This snippet copies cookies to clipboard (no fetch — CSP blocks external requests on Tock)
-  const code = `navigator.clipboard.writeText(JSON.stringify(document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".exploretock.com",path:"/"}}))).then(()=>alert("Copied "+document.cookie.split("; ").length+" cookies to clipboard!"))`;
+  // copy() is a DevTools-only function that works without page focus (unlike navigator.clipboard)
+  const code = `copy(JSON.stringify(document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".exploretock.com",path:"/"}})));alert("Copied "+document.cookie.split("; ").length+" cookies to clipboard!")`;
   const el = document.getElementById('bookmarklet-code');
   if (el) el.textContent = code;
 }
