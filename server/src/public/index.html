@@ -985,6 +985,7 @@ async function loadSettings() {
 }
 
 async function savePayment() {
+  const btn = event.target;
   const body = {
     cardNumber: document.getElementById('pay-card').value,
     cardExpiry: document.getElementById('pay-expiry').value,
@@ -995,8 +996,22 @@ async function savePayment() {
     billingState: document.getElementById('pay-state').value,
     billingZip: document.getElementById('pay-zip').value,
   };
-  await api('/api/payment', { method: 'POST', body: JSON.stringify(body) });
-  loadSettings();
+
+  if (!body.cardNumber) { alert('Enter a card number'); return; }
+
+  btn.disabled = true;
+  btn.textContent = 'saving...';
+  try {
+    await api('/api/payment', { method: 'POST', body: JSON.stringify(body) });
+    btn.textContent = 'saved!';
+    btn.style.background = 'var(--success)';
+    setTimeout(() => { btn.textContent = 'Save Payment'; btn.style.background = ''; btn.disabled = false; }, 1500);
+    loadSettings();
+  } catch {
+    btn.textContent = 'failed';
+    btn.style.background = 'var(--error)';
+    setTimeout(() => { btn.textContent = 'Save Payment'; btn.style.background = ''; btn.disabled = false; }, 1500);
+  }
 }
 
 async function updateCookies() {
