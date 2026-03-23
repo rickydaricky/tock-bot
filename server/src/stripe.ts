@@ -45,12 +45,16 @@ export function getPaymentFromEnv(): PaymentDetails | null {
  * Find the Stripe payment frame by searching all frames for the card number input.
  * More reliable than CSS selectors since Stripe nests iframes unpredictably.
  */
-async function findStripeFrame(page: Page, fieldName: string): Promise<Frame | null> {
-  for (const frame of page.frames()) {
-    try {
-      const found = await frame.locator(`input[name="${fieldName}"]`).count();
-      if (found > 0) return frame;
-    } catch { /* skip inaccessible frames */ }
+async function findStripeFrame(page: Page, fieldName: string, timeoutMs = 15000): Promise<Frame | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const frame of page.frames()) {
+      try {
+        const found = await frame.locator(`input[name="${fieldName}"]`).count();
+        if (found > 0) return frame;
+      } catch { /* skip inaccessible frames */ }
+    }
+    await page.waitForTimeout(500);
   }
   return null;
 }
