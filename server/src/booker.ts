@@ -1,6 +1,17 @@
-import { chromium, Browser, Page, BrowserContext } from 'playwright';
+import { chromium, Browser, Page, BrowserContext, Frame } from 'playwright';
 import { injectCookies } from './cookies';
 import { fillStripePayment, fillStripeBilling, PaymentDetails, getPayment } from './stripe';
+
+/** Find a frame containing a CVC/CVV input field */
+async function findCvcFrame(page: Page): Promise<Frame | null> {
+  for (const frame of page.frames()) {
+    try {
+      const count = await frame.locator('input[name="cvv"], input[name="cvc"], input[placeholder="CVC"], input[autocomplete="cc-csc"]').count();
+      if (count > 0) return frame;
+    } catch { /* skip */ }
+  }
+  return null;
+}
 
 export interface BookingRequest {
   restaurant: string;
@@ -264,35 +275,72 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
     }
   }
 
-  // Wait for Stripe iframes to load
-  console.log('⏳ Waiting for Stripe iframes to load...');
-  await page.waitForTimeout(5000);
+  // Wait for payment section to load
+  await page.waitForTimeout(3000);
 
-  // Debug: log all frames
-  const frameUrls = page.frames().map(f => f.url()).filter(u => u && u !== 'about:blank');
-  console.log(`   ${frameUrls.length} frames loaded`);
-  const stripeFrames = frameUrls.filter(u => u.includes('stripe'));
-  console.log(`   ${stripeFrames.length} Stripe frames: ${stripeFrames.map(u => u.slice(0, 80)).join(', ')}`);
+  // Detect payment mode: saved card (CVC-only) vs new card (full Stripe form)
+  const savedCardDropdown = await page.$('select, [data-testid="saved-card-select"]');
+  const cvcOnlyField = await page.$('[data-testid="cvc-input-field"], #braintree-hosted-field-cvv');
+  const hasSavedCard = !!(savedCardDropdown || cvcOnlyField);
 
-  // Take a screenshot of the purchase page for debugging
-  screenshots.push(await takeScreenshot(page));
+  // Also check for "Select credit card" text which indicates saved card mode
+  const pageText = await page.evaluate(() => (globalThis as any).document.body?.innerText?.slice(0, 3000) || '');
+  const hasSavedCardText = pageText.includes('Select credit card') || pageText.includes('confirm your credit card security code');
 
-  // Fill payment details
   const payment = getPayment();
-  if (!payment) {
-    console.log('⚠️ No payment details configured (set via UI or CARD_NUMBER env var)');
-    return dryRun;
-  }
 
-  try {
-    await fillStripePayment(page, payment);
-    await page.waitForTimeout(500);
-    await fillStripeBilling(page, payment);
-    await page.waitForTimeout(500);
-  } catch (err) {
-    console.error('❌ Stripe fill error:', err);
-    screenshots.push(await takeScreenshot(page));
-    return false;
+  if (hasSavedCard || hasSavedCardText) {
+    // Saved card mode — just need to fill CVC
+    console.log('💳 Saved card detected — filling CVC only');
+
+    if (!payment?.cvc) {
+      console.log('⚠️ No CVC configured');
+      screenshots.push(await takeScreenshot(page));
+      return dryRun;
+    }
+
+    try {
+      // Try to find CVC field — could be a Braintree iframe or a regular Stripe iframe
+      const cvcFrame = await findCvcFrame(page);
+      if (cvcFrame) {
+        const cvcInput = cvcFrame.locator('input[name="cvv"], input[name="cvc"], input[placeholder="CVC"], input[autocomplete="cc-csc"]').first();
+        await cvcInput.click();
+        await page.waitForTimeout(200);
+        await cvcInput.fill(payment.cvc);
+        console.log('✅ CVC filled');
+      } else {
+        // CVC might be a regular input on the page (not in an iframe)
+        const cvcInput = page.locator('[data-testid="cvc-input-field"] input, input[placeholder="CVC"]').first();
+        await cvcInput.click();
+        await page.waitForTimeout(200);
+        await cvcInput.fill(payment.cvc);
+        console.log('✅ CVC filled (page input)');
+      }
+    } catch (err) {
+      console.error('❌ CVC fill error:', err);
+      screenshots.push(await takeScreenshot(page));
+      return false;
+    }
+  } else {
+    // New card mode — fill all Stripe fields
+    console.log('💳 New card form detected — filling all fields');
+
+    if (!payment) {
+      console.log('⚠️ No payment details configured (set via UI or CARD_NUMBER env var)');
+      screenshots.push(await takeScreenshot(page));
+      return dryRun;
+    }
+
+    try {
+      await fillStripePayment(page, payment);
+      await page.waitForTimeout(500);
+      await fillStripeBilling(page, payment);
+      await page.waitForTimeout(500);
+    } catch (err) {
+      console.error('❌ Stripe fill error:', err);
+      screenshots.push(await takeScreenshot(page));
+      return false;
+    }
   }
 
   if (dryRun) {
