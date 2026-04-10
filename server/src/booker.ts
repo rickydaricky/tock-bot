@@ -30,54 +30,37 @@ export interface BookingResult {
   screenshots?: string[]; // base64 screenshots if dryRun
 }
 
-const STEALTH_ARGS = [
+export const STEALTH_ARGS = [
   '--disable-blink-features=AutomationControlled',
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
 ];
 
-function randomDelay(min = 200, max = 500): number {
+export function randomDelay(min = 200, max = 500): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 /** Convert 24-hour time to 12-hour display (e.g., "17:00" → "5:00 PM") */
-function to12Hour(time24: string): string {
+export function to12Hour(time24: string): string {
   const [h, m] = time24.split(':').map(Number);
   const period = h >= 12 ? 'PM' : 'AM';
   const hour12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
   return `${hour12}:${m.toString().padStart(2, '0')} ${period}`;
 }
 
-export async function runBooking(req: BookingRequest): Promise<BookingResult> {
+/**
+ * Run a booking using an already-created browser context.
+ * Accepts an optional AbortSignal for cancellation (used by blitz mode).
+ */
+export async function runBookingWithContext(
+  context: BrowserContext,
+  req: BookingRequest,
+  signal?: AbortSignal
+): Promise<BookingResult> {
   const screenshots: string[] = [];
-  let browser: Browser | null = null;
 
   try {
-    console.log(`\n🚀 Starting booking: ${req.restaurant}`);
-    console.log(`   Dates: ${req.dates.join(', ')}`);
-    console.log(`   Party: ${req.partySize}, Time: ${req.time}`);
-    console.log(`   Auto-purchase: ${req.autoPurchase ?? false}, Dry run: ${req.dryRun ?? false}`);
-
-    // Launch browser — use new headless mode which is less detectable
-    browser = await chromium.launch({
-      headless: true,
-      channel: 'chromium',
-      args: STEALTH_ARGS,
-    });
-
-    const context = await browser.newContext({
-      viewport: { width: 1440, height: 900 },
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    });
-
-    // Inject authenticated cookies
-    const cookieCount = await injectCookies(context);
-    console.log(`🍪 Injected ${cookieCount} cookies`);
-    if (cookieCount === 0) {
-      return { success: false, error: 'No Tock cookies configured. Set TOCK_COOKIES env var.' };
-    }
-
     const page = await context.newPage();
 
     // Remove webdriver flag to avoid bot detection
@@ -91,6 +74,8 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(randomDelay(500, 1000));
 
+    if (signal?.aborted) return { success: false, error: 'Aborted', screenshots };
+
     if (req.dryRun) screenshots.push(await takeScreenshot(page));
 
     // Wait for calendar to load
@@ -100,6 +85,8 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
     } catch {
       return { success: false, error: 'Calendar did not load. Check cookies / restaurant slug.', screenshots };
     }
+
+    if (signal?.aborted) return { success: false, error: 'Aborted', screenshots };
 
     // Read available dates from calendar
     const availableDates = await page.$$eval(
@@ -120,6 +107,8 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
     let bookedTime: string | undefined;
 
     for (const date of datesToTry) {
+      if (signal?.aborted) return { success: false, error: 'Aborted', screenshots };
+
       console.log(`\n🔍 Trying date: ${date}`);
 
       // Click the date in the calendar
@@ -185,6 +174,8 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
       return { success: false, error: 'No available time slots found on any date', screenshots };
     }
 
+    if (signal?.aborted) return { success: false, error: 'Aborted', screenshots };
+
     if (req.dryRun) screenshots.push(await takeScreenshot(page));
 
     // Handle post-booking flow (add-ons → purchase)
@@ -202,12 +193,42 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
     const error = err instanceof Error ? err.message : String(err);
     console.error('❌ Booking error:', error);
     return { success: false, error, screenshots };
+  }
+}
+
+/** Convenience wrapper: launches a browser, runs the booking, and closes the browser. */
+export async function runBooking(req: BookingRequest): Promise<BookingResult> {
+  let browser: Browser | null = null;
+
+  try {
+    console.log(`\n🚀 Starting booking: ${req.restaurant}`);
+    console.log(`   Dates: ${req.dates.join(', ')}`);
+    console.log(`   Party: ${req.partySize}, Time: ${req.time}`);
+    console.log(`   Auto-purchase: ${req.autoPurchase ?? false}, Dry run: ${req.dryRun ?? false}`);
+
+    browser = await chromium.launch({ headless: true, channel: 'chromium', args: STEALTH_ARGS });
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 900 },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    });
+
+    const cookieCount = await injectCookies(context);
+    console.log(`🍪 Injected ${cookieCount} cookies`);
+    if (cookieCount === 0) {
+      return { success: false, error: 'No Tock cookies configured. Set TOCK_COOKIES env var.' };
+    }
+
+    return await runBookingWithContext(context, req);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    console.error('❌ Booking error:', error);
+    return { success: false, error };
   } finally {
     if (browser) await browser.close();
   }
 }
 
-async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshots: string[]): Promise<boolean> {
+export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshots: string[]): Promise<boolean> {
   console.log('🛒 Starting purchase flow...');
   await page.waitForTimeout(1000);
 
@@ -279,7 +300,7 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
   await page.waitForTimeout(3000);
 
   // Detect payment mode: saved card (CVC-only) vs new card (full Stripe form)
-  const savedCardDropdown = await page.$('select, [data-testid="saved-card-select"]');
+  const savedCardDropdown = await page.$('[data-testid="saved-card-select"]');
   const cvcOnlyField = await page.$('[data-testid="cvc-input-field"], #braintree-hosted-field-cvv');
   const hasSavedCard = !!(savedCardDropdown || cvcOnlyField);
 

@@ -2,8 +2,9 @@ import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
 import { runBooking, BookingRequest } from './booker';
+import { runBlitz, BlitzConfig } from './blitz';
 import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
-import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, ScheduledBooking } from './scheduler';
+import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, deleteHistoryEntry, clearHistory, ScheduledBooking, schedulerEvents, BookingHistoryEntry } from './scheduler';
 import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
 import { notifyResult } from './notify';
 import { loginToTock } from './login';
@@ -107,10 +108,26 @@ app.get('/api/scheduled', requireAuth, (_req, res) => {
 });
 
 app.post('/api/scheduled', requireAuth, (req, res) => {
+  const { runAt, blitz, ...rest } = req.body;
+
+  if (runAt && isNaN(new Date(runAt).getTime())) {
+    return res.status(400).json({ success: false, error: 'Invalid runAt datetime' });
+  }
+
+  // cron is only needed for recurring schedules (no runAt).
+  // When runAt is set, the scheduler uses setTimeout for precise timing.
+  let cronExpr = rest.cron;
+  if (!runAt && !cronExpr) {
+    return res.status(400).json({ success: false, error: 'Either runAt or cron is required' });
+  }
+
   const booking: ScheduledBooking = {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
-    ...req.body,
+    ...rest,
+    cron: cronExpr || '',
+    runAt,
+    blitz: blitz && blitz.attempts > 1 ? blitz : undefined,
   };
   const result = addScheduledBooking(booking);
   if (result.success) {
@@ -125,6 +142,70 @@ app.delete('/api/scheduled/:id', requireAuth, (req, res) => {
   res.json({ success: removed });
 });
 
+// --- Manual blitz endpoint ---
+
+app.post('/api/blitz', requireAuth, async (req, res) => {
+  const { blitz, ...bookingReq } = req.body;
+  if (!bookingReq.restaurant || !bookingReq.dates?.length || !bookingReq.time || !bookingReq.partySize) {
+    return res.status(400).json({ success: false, error: 'Missing required fields: restaurant, dates, time, partySize' });
+  }
+  if (!blitz || !blitz.attempts || blitz.attempts < 2) {
+    return res.status(400).json({ success: false, error: 'blitz.attempts must be >= 2' });
+  }
+  const config: BlitzConfig = {
+    attempts: Math.min(blitz.attempts, 5),
+    staggerMs: blitz.staggerMs || 1000,
+  };
+  try {
+    const result = await runBlitz(bookingReq, config);
+    const entry = {
+      id: crypto.randomUUID(),
+      restaurant: bookingReq.restaurant,
+      date: result.result.bookedDate,
+      time: result.result.bookedTime,
+      success: result.success,
+      error: result.result.error,
+      screenshots: result.result.screenshots,
+      ranAt: new Date().toISOString(),
+      source: 'manual' as const,
+      blitzMeta: { winningAttempt: result.winningAttempt, totalAttempted: result.totalAttempted },
+    };
+    addToHistory(entry);
+    schedulerEvents.emit('booking-result', entry);
+    await notifyResult(bookingReq.restaurant, result.result,
+      { winningAttempt: result.winningAttempt, totalAttempted: result.totalAttempted });
+    res.json(result);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    console.error('❌ Blitz endpoint error:', error);
+    res.status(500).json({ success: false, error: `Blitz failed: ${error}` });
+  }
+});
+
+// --- SSE for live notifications ---
+
+app.get('/api/events', requireAuth, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const onResult = (entry: BookingHistoryEntry) => {
+    const data = JSON.stringify({
+      success: entry.success,
+      restaurant: entry.restaurant,
+      date: entry.date,
+      time: entry.time,
+      error: entry.error,
+      blitzMeta: entry.blitzMeta,
+    });
+    res.write(`data: ${data}\n\n`);
+  };
+
+  schedulerEvents.on('booking-result', onResult);
+  req.on('close', () => schedulerEvents.off('booking-result', onResult));
+});
+
 // --- Booking history ---
 
 app.get('/api/history', requireAuth, (_req, res) => {
@@ -134,6 +215,16 @@ app.get('/api/history', requireAuth, (_req, res) => {
     hasScreenshots: !!screenshots?.length,
   }));
   res.json(history);
+});
+
+app.delete('/api/history/:id', requireAuth, (req, res) => {
+  const removed = deleteHistoryEntry(req.params.id);
+  res.json({ success: removed });
+});
+
+app.delete('/api/history', requireAuth, (_req, res) => {
+  clearHistory();
+  res.json({ success: true });
 });
 
 app.get('/api/history/:id/screenshot/:index', requireAuth, (req, res) => {
