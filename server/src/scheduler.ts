@@ -1,10 +1,16 @@
 import cron from 'node-cron';
+import { EventEmitter } from 'events';
 import { runBooking, BookingRequest } from './booker';
+import { BlitzConfig, runBlitz } from './blitz';
 import { notifyResult } from './notify';
+
+export const schedulerEvents = new EventEmitter();
 
 export interface ScheduledBooking extends BookingRequest {
   id: string;
   cron: string;          // cron expression e.g. "0 10 1 4 *"
+  runAt?: string;        // ISO datetime — converted to cron on save
+  blitz?: BlitzConfig;   // optional blitz mode config
   label?: string;        // human-friendly label
   createdAt: string;     // ISO timestamp
 }
@@ -19,9 +25,11 @@ export interface BookingHistoryEntry {
   screenshots?: string[];
   ranAt: string;         // ISO timestamp
   source: 'manual' | 'scheduled';
+  blitzMeta?: { winningAttempt?: number; totalAttempted?: number };
 }
 
-const scheduledBookings: Map<string, { booking: ScheduledBooking; task: cron.ScheduledTask }> = new Map();
+interface Stoppable { stop(): void; }
+const scheduledBookings: Map<string, { booking: ScheduledBooking; task: Stoppable }> = new Map();
 const bookingHistory: BookingHistoryEntry[] = [];
 
 /** Load scheduled bookings from SCHEDULED_BOOKINGS env var on startup */
@@ -46,26 +54,26 @@ export function startScheduler(): void {
   }
 }
 
-/** Add a scheduled booking and start its cron job */
-export function addScheduledBooking(booking: ScheduledBooking): { success: boolean; error?: string } {
-  if (!booking.id) booking.id = crypto.randomUUID();
-  if (!booking.createdAt) booking.createdAt = new Date().toISOString();
+/** The callback that runs when a booking fires (cron or setTimeout) */
+async function executeBooking(booking: ScheduledBooking): Promise<void> {
+  try {
+    console.log(`\n⏰ Triggered: ${booking.label || booking.restaurant}`);
 
-  if (!cron.validate(booking.cron)) {
-    return { success: false, error: `Invalid cron expression: ${booking.cron}` };
-  }
+    let result: import('./booker').BookingResult;
+    let blitzMeta: { winningAttempt?: number; totalAttempted?: number } | undefined;
 
-  // Stop existing task if updating
-  if (scheduledBookings.has(booking.id)) {
-    scheduledBookings.get(booking.id)!.task.stop();
-  }
+    if (booking.blitz && booking.blitz.attempts > 1) {
+      const blitzResult = await runBlitz(booking, booking.blitz, booking.runAt);
+      result = blitzResult.result;
+      blitzMeta = {
+        winningAttempt: blitzResult.winningAttempt,
+        totalAttempted: blitzResult.totalAttempted,
+      };
+    } else {
+      result = await runBooking(booking);
+    }
 
-  const task = cron.schedule(booking.cron, async () => {
-    console.log(`\n⏰ Cron triggered: ${booking.label || booking.restaurant}`);
-    const result = await runBooking(booking);
-    await notifyResult(booking.restaurant, result);
-
-    bookingHistory.unshift({
+    const entry: BookingHistoryEntry = {
       id: crypto.randomUUID(),
       restaurant: booking.restaurant,
       date: result.bookedDate,
@@ -75,11 +83,74 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
       screenshots: result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'scheduled',
-    });
-  });
+      blitzMeta,
+    };
+    bookingHistory.unshift(entry);
+    schedulerEvents.emit('booking-result', entry);
+    await notifyResult(booking.restaurant, result, blitzMeta);
+  } catch (err) {
+    console.error(`❌ Scheduled booking crashed: ${booking.label || booking.restaurant}`, err);
+    const entry: BookingHistoryEntry = {
+      id: crypto.randomUUID(),
+      restaurant: booking.restaurant,
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      ranAt: new Date().toISOString(),
+      source: 'scheduled',
+    };
+    bookingHistory.unshift(entry);
+    schedulerEvents.emit('booking-result', entry);
+  }
+}
+
+/** Add a scheduled booking. Uses setTimeout for runAt-based schedules, cron for recurring. */
+export function addScheduledBooking(booking: ScheduledBooking): { success: boolean; error?: string } {
+  if (!booking.id) booking.id = crypto.randomUUID();
+  if (!booking.createdAt) booking.createdAt = new Date().toISOString();
+
+  // Stop existing task if updating
+  if (scheduledBookings.has(booking.id)) {
+    scheduledBookings.get(booking.id)!.task.stop();
+  }
+
+  let task: Stoppable;
+
+  if (booking.runAt) {
+    // Use setTimeout for exact datetime scheduling.
+    // For blitz, fire early to allow browser pre-launch (~15s).
+    // The blitz engine uses runAt for precise stagger timing internally.
+    const targetTime = new Date(booking.runAt).getTime();
+    if (targetTime - Date.now() < -5000) {
+      return { success: false, error: `Run time is in the past (${Math.round((Date.now() - targetTime) / 1000)}s ago)` };
+    }
+    const earlyMs = booking.blitz && booking.blitz.attempts > 1 ? 15_000 : 0;
+    const delayMs = Math.max(0, targetTime - earlyMs - Date.now());
+
+    const timer = setTimeout(() => {
+      executeBooking(booking);
+      // Auto-remove after execution
+      scheduledBookings.delete(booking.id);
+    }, delayMs);
+
+    task = { stop: () => clearTimeout(timer) };
+
+    const blitzLabel = booking.blitz && booking.blitz.attempts > 1
+      ? ` [blitz: ${booking.blitz.attempts}x @ ${booking.blitz.staggerMs}ms]`
+      : '';
+    console.log(`   📅 ${booking.label || booking.restaurant}: fires in ${Math.round(delayMs / 1000)}s → ${booking.dates.join(', ')} at ${booking.time}${blitzLabel}`);
+  } else {
+    // Fall back to cron for recurring schedules
+    if (!cron.validate(booking.cron)) {
+      return { success: false, error: `Invalid cron expression: ${booking.cron}` };
+    }
+
+    const cronTask = cron.schedule(booking.cron, () => executeBooking(booking));
+    task = { stop: () => cronTask.stop() };
+
+    console.log(`   📅 ${booking.label || booking.restaurant}: "${booking.cron}" → ${booking.dates.join(', ')} at ${booking.time}`);
+  }
 
   scheduledBookings.set(booking.id, { booking, task });
-  console.log(`   📅 ${booking.label || booking.restaurant}: "${booking.cron}" → ${booking.dates.join(', ')} at ${booking.time}`);
   return { success: true };
 }
 
@@ -107,4 +178,17 @@ export function addToHistory(entry: BookingHistoryEntry): void {
 /** Get booking history */
 export function getHistory(): BookingHistoryEntry[] {
   return bookingHistory;
+}
+
+/** Delete a single history entry */
+export function deleteHistoryEntry(id: string): boolean {
+  const idx = bookingHistory.findIndex(e => e.id === id);
+  if (idx < 0) return false;
+  bookingHistory.splice(idx, 1);
+  return true;
+}
+
+/** Clear all history */
+export function clearHistory(): void {
+  bookingHistory.length = 0;
 }

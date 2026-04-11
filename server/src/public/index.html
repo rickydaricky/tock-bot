@@ -257,6 +257,115 @@ html, body {
   pointer-events: none;
 }
 
+/* ── Calendar Widget ── */
+.calendar-widget {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.calendar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.cal-month {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.cal-nav {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.15s;
+}
+
+.cal-nav:hover { border-color: var(--accent); color: var(--accent); }
+
+.cal-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  margin-bottom: 4px;
+}
+
+.cal-weekdays span {
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+
+.cal-day {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.1s;
+  color: var(--text-primary);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.cal-day:hover { background: var(--bg-raised); border-color: var(--border); }
+.cal-day.other-month { color: var(--text-muted); opacity: 0.4; }
+.cal-day.selected { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.cal-day.drag-select { background: rgba(74, 158, 255, 0.25); border-color: var(--accent); }
+.cal-day.drag-deselect { background: rgba(248, 113, 113, 0.2); border-color: var(--error); }
+
+.cal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.cal-count {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.cal-clear {
+  background: none;
+  border: 1px solid var(--error);
+  color: var(--error);
+  border-radius: var(--radius-sm);
+  padding: 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: none;
+}
+
+.cal-clear:hover { background: var(--error-bg); }
+
 /* ── Form Elements ── */
 .field {
   margin-bottom: 16px;
@@ -689,9 +798,21 @@ html, body {
     </div>
     <div class="field">
       <label>Dates (priority order)</label>
-      <div class="date-chips" id="sched-dates-chips">
-        <input type="date" class="date-picker-hidden" id="sched-date-picker">
-        <button type="button" class="date-add-btn" onclick="document.getElementById('sched-date-picker').showPicker()">+ add date</button>
+      <div class="calendar-widget" id="sched-calendar">
+        <div class="calendar-header">
+          <button type="button" class="cal-nav" onclick="calNav(-1)">&larr;</button>
+          <span class="cal-month" id="cal-month-label"></span>
+          <button type="button" class="cal-nav" onclick="calNav(1)">&rarr;</button>
+        </div>
+        <div class="cal-weekdays">
+          <span>Su</span><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span>
+        </div>
+        <div class="cal-grid" id="cal-grid"></div>
+        <div class="cal-footer">
+          <span class="cal-count" id="cal-count">0 dates selected</span>
+          <button type="button" class="cal-clear" id="cal-clear" onclick="calClearAll()">Clear All</button>
+        </div>
+        <div class="hint">click or drag to select dates</div>
       </div>
     </div>
     <div class="field-row">
@@ -705,15 +826,34 @@ html, body {
       </div>
     </div>
     <div class="field">
-      <label>Cron Expression</label>
-      <input type="text" id="sched-cron" placeholder="0 10 1 4 *">
-      <div class="hint">min hour day month weekday &mdash; e.g. "0 10 1 4 *" = Apr 1 at 10:00 AM</div>
+      <label>Run At</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="datetime-local" id="sched-run-at" style="flex:1" step="1">
+        <button type="button" class="btn" onclick="setRunAtNow()" style="white-space:nowrap;padding:10px 14px;font-size:12px;background:transparent;border:1px solid var(--accent);color:var(--accent)">Right Now</button>
+      </div>
+      <div class="hint">when the bot should attempt the booking</div>
+    </div>
+    <div class="section-title" style="margin-top:16px;font-size:11px;color:var(--text-muted)">Blitz Mode <span style="font-weight:400">(optional)</span></div>
+    <div class="field-row">
+      <div class="field">
+        <label>Parallel Attempts</label>
+        <input type="number" id="sched-blitz-attempts" value="1" min="1" max="5">
+        <div class="hint">1 = normal, 2-5 = blitz</div>
+      </div>
+      <div class="field">
+        <label>Stagger (ms)</label>
+        <input type="number" id="sched-blitz-stagger" value="1000" min="200" max="5000" step="100">
+        <div class="hint">delay between each attempt</div>
+      </div>
     </div>
     <button class="btn btn-primary" onclick="addSchedule()">Add Schedule</button>
   </div>
 
   <!-- History -->
   <div id="tab-history" class="tab-content">
+    <div id="history-actions" style="display:none;margin-bottom:12px;text-align:right">
+      <button class="btn btn-danger" style="width:auto;padding:8px 14px;font-size:12px" onclick="clearAllHistory()">Clear All History</button>
+    </div>
     <div id="history-list"></div>
   </div>
 
@@ -816,6 +956,8 @@ function checkAuth() {
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
     loadAll();
+    const savedTab = localStorage.getItem('tock-tab');
+    if (savedTab) switchTab(savedTab);
   }
 }
 
@@ -855,6 +997,8 @@ function switchTab(name) {
   const btns = document.querySelectorAll('.tabs button');
   const tabs = ['book', 'scheduled', 'history', 'settings'];
   btns[tabs.indexOf(name)].classList.add('active');
+
+  localStorage.setItem('tock-tab', name);
 
   if (name === 'scheduled') loadScheduled();
   if (name === 'history') loadHistory();
@@ -900,11 +1044,175 @@ function getDatesFromChips(chipsId) {
   return Array.from(container.querySelectorAll('.date-chip')).map(c => c.dataset.date);
 }
 
+// ── Calendar widget (schedule tab) ──
+const calState = { month: new Date(), selectedDates: [], dragging: false, dragMode: 'select', dragStart: null, origDates: [] };
+
+function calInit() {
+  const grid = document.getElementById('cal-grid');
+  grid.addEventListener('mousedown', e => {
+    const day = e.target.closest('.cal-day');
+    if (!day || day.classList.contains('other-month')) return;
+    e.preventDefault();
+    const d = day.dataset.date;
+    calState.dragging = true;
+    calState.dragStart = d;
+    calState.origDates = [...calState.selectedDates];
+    calState.dragMode = calState.selectedDates.includes(d) ? 'deselect' : 'select';
+    calToggle(d);
+  });
+  grid.addEventListener('mouseover', e => {
+    if (!calState.dragging) return;
+    const day = e.target.closest('.cal-day');
+    if (!day || day.classList.contains('other-month')) return;
+    calDragTo(day.dataset.date);
+  });
+  document.addEventListener('mouseup', () => {
+    if (calState.dragging) {
+      calState.dragging = false;
+      calState.dragStart = null;
+      calRender();
+    }
+  });
+
+  // Touch support
+  grid.addEventListener('touchstart', e => {
+    const day = e.target.closest('.cal-day');
+    if (!day || day.classList.contains('other-month')) return;
+    e.preventDefault();
+    const d = day.dataset.date;
+    calState.dragging = true;
+    calState.dragStart = d;
+    calState.origDates = [...calState.selectedDates];
+    calState.dragMode = calState.selectedDates.includes(d) ? 'deselect' : 'select';
+    calToggle(d);
+  }, { passive: false });
+  grid.addEventListener('touchmove', e => {
+    if (!calState.dragging) return;
+    const touch = e.touches[0];
+    const el = document.elementFromPoint(touch.clientX, touch.clientY);
+    const day = el && el.closest('.cal-day');
+    if (!day || day.classList.contains('other-month')) return;
+    e.preventDefault();
+    calDragTo(day.dataset.date);
+  }, { passive: false });
+  document.addEventListener('touchend', () => {
+    if (calState.dragging) {
+      calState.dragging = false;
+      calState.dragStart = null;
+      calRender();
+    }
+  });
+
+  calRender();
+}
+
+function calDragTo(dateStr) {
+  const start = new Date(calState.dragStart + 'T00:00:00');
+  const end = new Date(dateStr + 'T00:00:00');
+  const lo = start < end ? start : end;
+  const hi = start < end ? end : start;
+  const range = [];
+  for (let d = new Date(lo); d <= hi; d.setDate(d.getDate() + 1)) {
+    range.push(d.toISOString().slice(0, 10));
+  }
+  let newDates = [...calState.origDates];
+  if (calState.dragMode === 'select') {
+    range.forEach(d => { if (!newDates.includes(d)) newDates.push(d); });
+  } else {
+    newDates = newDates.filter(d => !range.includes(d));
+  }
+  calState.selectedDates = newDates;
+  calRender(range);
+}
+
+function calToggle(dateStr) {
+  const idx = calState.selectedDates.indexOf(dateStr);
+  if (idx >= 0) calState.selectedDates.splice(idx, 1);
+  else calState.selectedDates.push(dateStr);
+  calRender();
+}
+
+function calClearAll() {
+  calState.selectedDates = [];
+  calRender();
+}
+
+function calNav(dir) {
+  calState.month.setMonth(calState.month.getMonth() + dir);
+  calRender();
+}
+
+function calRender(dragRange) {
+  const grid = document.getElementById('cal-grid');
+  const year = calState.month.getFullYear();
+  const month = calState.month.getMonth();
+
+  // Month label
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  document.getElementById('cal-month-label').textContent = `${monthNames[month]} ${year}`;
+
+  // First day of month & grid start (Sunday)
+  const firstDay = new Date(year, month, 1);
+  const startDay = new Date(firstDay);
+  startDay.setDate(startDay.getDate() - firstDay.getDay());
+
+  const lastDay = new Date(year, month + 1, 0);
+  const endDay = new Date(lastDay);
+  endDay.setDate(endDay.getDate() + (6 - lastDay.getDay()));
+
+  let html = '';
+  for (let d = new Date(startDay); d <= endDay; d.setDate(d.getDate() + 1)) {
+    const ds = d.toISOString().slice(0, 10);
+    const isOther = d.getMonth() !== month;
+    const isSelected = calState.selectedDates.includes(ds);
+    const inDrag = dragRange && dragRange.includes(ds);
+
+    let cls = 'cal-day';
+    if (isOther) cls += ' other-month';
+    if (isSelected && !inDrag) cls += ' selected';
+    if (inDrag) cls += calState.dragMode === 'select' ? ' drag-select' : ' drag-deselect';
+
+    html += `<div class="${cls}" data-date="${ds}">${d.getDate()}</div>`;
+  }
+  grid.innerHTML = html;
+
+  // Update footer
+  const n = calState.selectedDates.length;
+  document.getElementById('cal-count').textContent = `${n} date${n !== 1 ? 's' : ''} selected`;
+  document.getElementById('cal-clear').style.display = n > 0 ? 'block' : 'none';
+}
+
+// ── Live notifications via SSE ──
+let _evtSource = null;
+function startEventStream() {
+  if (_evtSource) return; // already connected
+
+  if (Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+
+  const evtSource = new EventSource('/api/events');
+  _evtSource = evtSource;
+  evtSource.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    const blitzInfo = data.blitzMeta?.totalAttempted ? ` (attempt ${data.blitzMeta.winningAttempt}/${data.blitzMeta.totalAttempted})` : '';
+    const title = data.success ? 'Booking confirmed!' : 'Booking failed';
+    const body = data.success
+      ? `${data.restaurant} — ${data.date}, ${data.time}${blitzInfo}`
+      : `${data.restaurant} — ${data.error}`;
+
+    if (Notification.permission === 'granted') {
+      new Notification(title, { body, icon: data.success ? '✅' : '❌' });
+    }
+  };
+}
+
 // ── Load all data ──
 function loadAll() {
   loadStatus();
   setupDatePicker('book-date-picker', 'book-dates-chips');
-  setupDatePicker('sched-date-picker', 'sched-dates-chips');
+  calInit();
+  startEventStream();
 }
 
 async function loadStatus() {
@@ -997,7 +1305,8 @@ async function loadScheduled() {
           <span>restaurant:</span> ${s.restaurant}<br>
           <span>dates:</span> ${s.dates.join(', ')}<br>
           <span>time:</span> ${s.time} &middot; <span>party:</span> ${s.partySize}<br>
-          <span>cron:</span> ${s.cron}
+          <span>runs at:</span> ${s.runAt ? new Date(s.runAt).toLocaleString() : s.cron}
+          ${s.blitz && s.blitz.attempts > 1 ? `<br><span>blitz:</span> ${s.blitz.attempts}x @ ${s.blitz.staggerMs}ms` : ''}
         </div>
       </div>
     `).join('');
@@ -1006,27 +1315,56 @@ async function loadScheduled() {
   }
 }
 
+function setRunAtNow() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  document.getElementById('sched-run-at').value = `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+}
+
 async function addSchedule() {
   const restaurant = document.getElementById('sched-restaurant').value.trim();
-  const dates = getDatesFromChips('sched-dates-chips');
+  const dates = [...calState.selectedDates].sort();
   const partySize = parseInt(document.getElementById('sched-party').value);
   const time = document.getElementById('sched-time').value.trim();
-  const cronExpr = document.getElementById('sched-cron').value.trim();
+  const runAt = document.getElementById('sched-run-at').value.trim();
   const label = document.getElementById('sched-label').value.trim();
 
-  if (!restaurant || !dates.length || !cronExpr) return;
+  if (!restaurant || !dates.length || !runAt) {
+    const missing = [];
+    if (!restaurant) missing.push('restaurant');
+    if (!dates.length) missing.push('dates');
+    if (!runAt) missing.push('run at time');
+    alert('Missing: ' + missing.join(', '));
+    return;
+  }
 
-  await api('/api/scheduled', {
+  const blitzAttempts = parseInt(document.getElementById('sched-blitz-attempts').value) || 1;
+  const blitzStagger = parseInt(document.getElementById('sched-blitz-stagger').value) || 1000;
+  const blitz = blitzAttempts > 1 ? { attempts: blitzAttempts, staggerMs: blitzStagger } : undefined;
+
+  const resp = await api('/api/scheduled', {
     method: 'POST',
-    body: JSON.stringify({ restaurant, dates, partySize, time, cron: cronExpr, label, autoPurchase: true })
+    body: JSON.stringify({ restaurant, dates, partySize, time, runAt, label, autoPurchase: true, blitz })
   });
+
+  if (!resp.success) {
+    alert(resp.error || 'Failed to add schedule');
+    return;
+  }
 
   // Clear form
-  ['sched-label', 'sched-restaurant', 'sched-cron'].forEach(id => {
+  ['sched-label', 'sched-restaurant'].forEach(id => {
     document.getElementById(id).value = '';
   });
-  // Clear date chips
-  document.querySelectorAll('#sched-dates-chips .date-chip').forEach(c => c.remove());
+  document.getElementById('sched-run-at').value = '';
+  document.getElementById('sched-blitz-attempts').value = '1';
+  document.getElementById('sched-blitz-stagger').value = '1000';
+  calClearAll();
 
   loadScheduled();
 }
@@ -1039,8 +1377,10 @@ async function deleteSchedule(id) {
 // ── History ──
 async function loadHistory() {
   const list = document.getElementById('history-list');
+  const actions = document.getElementById('history-actions');
   try {
     const data = await api('/api/history');
+    actions.style.display = data.length ? 'block' : 'none';
     if (!data.length) {
       list.innerHTML = '<div class="empty">no booking history yet</div>';
       return;
@@ -1061,7 +1401,10 @@ async function loadHistory() {
             <div class="card-title">${h.restaurant}</div>
             <div class="card-meta" style="margin-top:2px">${time}</div>
           </div>
-          <div style="display:flex;gap:4px">${source}${badge}</div>
+          <div style="display:flex;gap:4px;align-items:center">
+            ${source}${badge}
+            <button class="btn btn-danger" style="width:auto;padding:4px 8px;font-size:11px;margin-left:4px" onclick="deleteHistory('${h.id}')">&times;</button>
+          </div>
         </div>
         <div class="card-meta">
           ${h.date ? `<span>date:</span> ${h.date} &middot; ` : ''}<span>time:</span> ${h.time || 'n/a'}
@@ -1073,6 +1416,17 @@ async function loadHistory() {
   } catch {
     list.innerHTML = '<div class="empty">failed to load</div>';
   }
+}
+
+async function deleteHistory(id) {
+  await api('/api/history/' + id, { method: 'DELETE' });
+  loadHistory();
+}
+
+async function clearAllHistory() {
+  if (!confirm('Clear all booking history?')) return;
+  await api('/api/history', { method: 'DELETE' });
+  loadHistory();
 }
 
 async function loadScreenshots(id) {
