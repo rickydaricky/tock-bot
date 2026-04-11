@@ -1331,7 +1331,9 @@ async function addSchedule() {
   const dates = [...calState.selectedDates].sort();
   const partySize = parseInt(document.getElementById('sched-party').value);
   const time = document.getElementById('sched-time').value.trim();
-  const runAt = document.getElementById('sched-run-at').value.trim();
+  const runAtLocal = document.getElementById('sched-run-at').value.trim();
+  // Convert local datetime to ISO with timezone so the server interprets it correctly
+  const runAt = runAtLocal ? new Date(runAtLocal).toISOString() : '';
   const label = document.getElementById('sched-label').value.trim();
 
   if (!restaurant || !dates.length || !runAt) {
