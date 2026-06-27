@@ -27,7 +27,7 @@ export interface BlitzResult {
 }
 
 /** Group attempt errors into a compact, human-readable summary. */
-function summarizeFailures(outcomes: AttemptOutcome[]): string {
+export function summarizeFailures(outcomes: AttemptOutcome[]): string {
   const counts = new Map<string, number>();
   for (const o of outcomes) {
     if (o.status === 'success') continue;
@@ -59,7 +59,7 @@ const VIEWPORTS = [
   { width: 1280, height: 800 },
 ];
 
-function getFingerprint(index: number) {
+export function getFingerprint(index: number) {
   return {
     userAgent: USER_AGENTS[index % USER_AGENTS.length],
     viewport: VIEWPORTS[index % VIEWPORTS.length],
@@ -71,7 +71,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Screenshot the page without throwing — used to capture failure state for diagnosis. */
-async function safeShot(page: Page): Promise<string | null> {
+export async function safeShot(page: Page): Promise<string | null> {
   try {
     return (await page.screenshot({ fullPage: false })).toString('base64');
   } catch {
