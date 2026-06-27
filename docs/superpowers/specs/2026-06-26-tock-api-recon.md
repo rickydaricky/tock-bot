@@ -2,6 +2,24 @@
 
 Reverse-engineered from saved Tock pages (`tock-*.html`: Noma, Restaurant Naides, Jungsik) cross-checked against this repo's working code. **Offline only** — the exact availability/lock endpoints and the live availability response schema are NOT in the saved pages; they require one live capture (checklist in §6). This doc seeds `sniper.ts` and the live-recon step.
 
+---
+
+## ✅ LIVE RECON UPDATE (2026-06-27) — confirmed, supersedes the guesses below
+
+Captured live on `lazybearsf` via Claude-in-Chrome (Redux store + an in-page `fetch`):
+
+- **There is NO JSON availability endpoint.** Changing date/party-size fires *only* analytics (Datadog/GA/Amplitude/Clarity). Tock server-renders the whole calendar; the SPA renders preloaded data. The offline guess that slots live in `availability.result` is **wrong** — that slice is `undefined` even with slots on screen.
+- **The poll mechanism:** `fetch(searchUrl, {credentials:'include'})` returns the full search HTML (~440 KB, **no Cloudflare challenge** at normal cadence) with `window.$REDUX_STATE = {…}` embedded. Parse that JSON and read **`calendar.offerings`**.
+- **Real slot model** (`calendar.offerings`):
+  - `openDate: string[]` — bookable dates (`"2026-07-22"`).
+  - `openTime: string[]` — bookable times in **24h** (`"17:00"…"21:00"`).
+  - `experience[]` — each `{ id, type, name, state: "AVAILABLE"|"SOLD", partySize: number[], price… }`. **`state` is the sold-out signal.**
+  - A slot is bookable when: date ∈ `openDate` **and** time ∈ `openTime` **and** an `experience` is `AVAILABLE` with the requested `partySize`. Grab target = that experience id (informational; the actual grab DOM-clicks the Book button by time).
+- **Implication:** `sniper.ts` `fetchOfferings()` fetches the HTML and extracts `$REDUX_STATE → calendar.offerings`; `parseAvailability(offerings, partySize)` matches the model above. The grab stays **DOM-click** (lock call is Turnstile-gated, purchase is Stripe-iframe), so the lock-call recon (§2/§6) was **not needed** and no real slot was held.
+- **Still open:** behaviour at an actual drop (does a new date appear in `openDate` / does `state` flip the instant inventory releases?) and whether high-frequency HTML fetches get Cloudflare-throttled — both only observable during a live FHH drop.
+
+---
+
 ## 1. Availability (READ)
 
 - REST base **`https://www.exploretock.com/api`**, namespace **`/api/consumer/...`** — HIGH confidence: the repo's `server/src/session.ts` already calls `https://www.exploretock.com/api/consumer/patron/profile` with cookie auth and treats 200 as authenticated. **Cookie auth is proven**; a same-origin in-page `fetch` from an exploretock.com tab sends the session cookies automatically.

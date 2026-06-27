@@ -70,37 +70,46 @@ test('computeWindowOffsets handles a zero-width window without NaN', () => {
 
 // --- parseAvailability (recon-seeded, isolated) ---
 
-test('parseAvailability normalizes availability entries', () => {
-  const sample = {
-    availability: [
-      { date: '2026-07-01', offers: [
-        { time: '8:00 PM', id: 'offer-1' },
-        { time: '8:15 PM', id: 'offer-2' },
-      ] },
-    ],
+// parseAvailability operates on Tock's real `calendar.offerings` model (confirmed
+// by live recon): openDate[] × openTime[] (24h) for AVAILABLE experiences matching size.
+
+test('parseAvailability builds slots from openDate × openTime for an AVAILABLE matching experience', () => {
+  const offerings = {
+    openDate: ['2026-07-22'],
+    openTime: ['17:00', '19:00'],
+    experience: [{ id: 612271, state: 'AVAILABLE', partySize: [2, 3] }],
   };
-  const out = parseAvailability(sample);
-  assert.deepEqual(out, [
-    { date: '2026-07-01', time12: '8:00 PM', offerId: 'offer-1' },
-    { date: '2026-07-01', time12: '8:15 PM', offerId: 'offer-2' },
+  assert.deepEqual(parseAvailability(offerings, 2), [
+    { date: '2026-07-22', time12: '5:00 PM', offerId: '612271' },
+    { date: '2026-07-22', time12: '7:00 PM', offerId: '612271' },
   ]);
 });
 
-test('parseAvailability normalizes the days/times/display/businessDate shape', () => {
-  const out = parseAvailability({
-    days: [{ businessDate: '2026-07-02', times: [{ display: '6:30 PM', offerId: 'x9' }] }],
-  });
-  assert.deepEqual(out, [{ date: '2026-07-02', time12: '6:30 PM', offerId: 'x9' }]);
+test('parseAvailability returns [] when no AVAILABLE experience matches the party size', () => {
+  const offerings = {
+    openDate: ['2026-07-22'],
+    openTime: ['19:00'],
+    experience: [
+      { id: 1, state: 'SOLD', partySize: [2] },         // sold out
+      { id: 2, state: 'AVAILABLE', partySize: [4, 5] },  // wrong size
+    ],
+  };
+  assert.deepEqual(parseAvailability(offerings, 2), []);
 });
 
-test('parseAvailability drops entries missing date or time, tolerates null', () => {
-  assert.deepEqual(parseAvailability(null), []);
-  const out = parseAvailability({
-    availability: [{ date: '2026-07-01', offers: [{ time: '8:00 PM', id: 'ok' }, { id: 'no-time' }] }],
-  });
-  assert.deepEqual(out, [{ date: '2026-07-01', time12: '8:00 PM', offerId: 'ok' }]);
+test('parseAvailability picks the first AVAILABLE matching experience id', () => {
+  const offerings = {
+    openDate: ['2026-07-01'],
+    openTime: ['20:00'],
+    experience: [
+      { id: 'a', state: 'AVAILABLE', partySize: [2] },
+      { id: 'b', state: 'AVAILABLE', partySize: [2] },
+    ],
+  };
+  assert.deepEqual(parseAvailability(offerings, 2), [{ date: '2026-07-01', time12: '8:00 PM', offerId: 'a' }]);
 });
 
-test('parseAvailability returns [] on unknown shape', () => {
-  assert.deepEqual(parseAvailability({ weird: true }), []);
+test('parseAvailability tolerates null and empty offerings', () => {
+  assert.deepEqual(parseAvailability(null, 2), []);
+  assert.deepEqual(parseAvailability({ openDate: [], openTime: [], experience: [] }, 2), []);
 });
