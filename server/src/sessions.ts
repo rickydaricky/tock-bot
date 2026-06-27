@@ -1,0 +1,95 @@
+// Registry of frozen booking sessions: when a sniper grab succeeds but the
+// purchase fails, we keep the winning browser alive (slot still held ~10 min)
+// so the user can recover it via canned dashboard actions. Page-driven actions
+// (re-enter-cvc, retry-purchase, screenshot) live in this module too; the
+// registry bookkeeping below is browser-agnostic and unit-tested with a fake handle.
+
+export interface SessionHandle {
+  browser: { close(): Promise<void> };
+  page: any; // Playwright Page in production; {} in tests
+}
+
+export interface FreezeInput {
+  handle: SessionHandle;
+  restaurant: string;
+  bookedDate?: string;
+  bookedTime?: string;
+  error?: string;
+  ttlMs?: number;
+}
+
+interface Entry extends FreezeInput {
+  id: string;
+  status: string;
+  createdAt: number;
+  ttlMs: number;
+}
+
+const DEFAULT_TTL = 10 * 60 * 1000; // ~Tock hold window
+const sessions = new Map<string, Entry>();
+let nowFn: () => number = () => Date.now();
+let counter = 0;
+
+/** Test seam: override the clock for deterministic age/TTL assertions. */
+export function _setNow(fn: () => number): void { nowFn = fn; }
+/** Test seam: clear the registry between tests. */
+export function _reset(): void { sessions.clear(); counter = 0; }
+
+export function freezeSession(input: FreezeInput): string {
+  const id = `s${++counter}_${nowFn()}`;
+  sessions.set(id, {
+    ...input,
+    id,
+    status: 'frozen',
+    createdAt: nowFn(),
+    ttlMs: input.ttlMs ?? DEFAULT_TTL,
+  });
+  return id;
+}
+
+export interface PublicSession {
+  id: string;
+  restaurant: string;
+  bookedDate?: string;
+  bookedTime?: string;
+  status: string;
+  ageMs: number;
+  error?: string;
+}
+
+export function listSessions(): PublicSession[] {
+  const t = nowFn();
+  return [...sessions.values()].map(e => ({
+    id: e.id,
+    restaurant: e.restaurant,
+    bookedDate: e.bookedDate,
+    bookedTime: e.bookedTime,
+    status: e.status,
+    ageMs: t - e.createdAt,
+    error: e.error,
+  }));
+}
+
+export function getSession(id: string): Entry | undefined {
+  return sessions.get(id);
+}
+
+export async function abortSession(id: string): Promise<boolean> {
+  const e = sessions.get(id);
+  if (!e) return false;
+  sessions.delete(id);
+  try { await e.handle.browser.close(); } catch { /* already gone */ }
+  return true;
+}
+
+/** Close + drop any session past its TTL (so we never leak a headless browser). */
+export function _sweep(): void {
+  const t = nowFn();
+  for (const e of [...sessions.values()]) {
+    if (t - e.createdAt > e.ttlMs) { void abortSession(e.id); }
+  }
+}
+
+// Periodic sweep in production. unref so it never keeps the process alive.
+const sweepTimer = setInterval(() => _sweep(), 30_000);
+sweepTimer.unref?.();
