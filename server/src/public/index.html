@@ -1015,6 +1015,11 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+// Escape text before interpolating into innerHTML (restaurant/error are server/page-derived).
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 // ── Date chip management ──
 function setupDatePicker(pickerId, chipsId) {
   const picker = document.getElementById(pickerId);
@@ -1387,18 +1392,19 @@ async function loadLiveSessions() {
     el.innerHTML = '<div class="section-title" style="color:var(--error)">⚠️ Frozen sessions — slot held ~10 min, recover now</div>' +
       sessions.map(s => {
         const age = Math.round((s.ageMs || 0) / 1000);
+        const id = encodeURIComponent(s.id);
         return `<div class="card" style="border:1px solid var(--error)">
           <div class="card-header"><div>
-            <div class="card-title">${s.restaurant}</div>
-            <div class="card-meta" style="margin-top:2px">${s.bookedDate || ''} ${s.bookedTime || ''} &middot; ${age}s ago &middot; ${s.status}</div>
+            <div class="card-title">${esc(s.restaurant)}</div>
+            <div class="card-meta" style="margin-top:2px">${esc(s.bookedDate || '')} ${esc(s.bookedTime || '')} &middot; ${age}s ago &middot; ${esc(s.status)}</div>
           </div></div>
-          ${s.error ? `<div class="card-meta"><span style="color:var(--error)">${s.error}</span></div>` : ''}
-          <img src="/api/sessions/${s.id}/screenshot?t=${Date.now()}" style="width:100%;border-radius:6px;margin:8px 0" onerror="this.style.display='none'"/>
+          ${s.error ? `<div class="card-meta"><span style="color:var(--error)">${esc(s.error)}</span></div>` : ''}
+          <img src="/api/sessions/${id}/screenshot?t=${Date.now()}" style="width:100%;border-radius:6px;margin:8px 0" onerror="this.style.display='none'"/>
           <div style="display:flex;gap:6px;flex-wrap:wrap">
-            <button class="btn btn-secondary" style="width:auto;padding:6px 10px;font-size:11px" onclick="sessionAction('${s.id}','re-enter-cvc')">Re-enter CVC</button>
-            <button class="btn btn-primary" style="width:auto;padding:6px 10px;font-size:11px" onclick="sessionAction('${s.id}','retry-purchase')">Retry purchase</button>
+            <button class="btn btn-secondary" style="width:auto;padding:6px 10px;font-size:11px" onclick="sessionAction('${id}','re-enter-cvc')">Re-enter CVC</button>
+            <button class="btn btn-primary" style="width:auto;padding:6px 10px;font-size:11px" onclick="sessionAction('${id}','retry-purchase')">Retry purchase</button>
             <button class="btn btn-secondary" style="width:auto;padding:6px 10px;font-size:11px" onclick="loadLiveSessions()">Refresh</button>
-            <button class="btn btn-danger" style="width:auto;padding:6px 10px;font-size:11px" onclick="sessionAction('${s.id}','abort')">Abort</button>
+            <button class="btn btn-danger" style="width:auto;padding:6px 10px;font-size:11px" onclick="sessionAction('${id}','abort')">Abort</button>
           </div>
         </div>`;
       }).join('');

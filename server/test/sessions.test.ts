@@ -5,6 +5,7 @@ import {
   listSessions,
   getSession,
   abortSession,
+  applyAction,
   _setNow,
   _sweep,
   _reset,
@@ -48,4 +49,43 @@ test('_sweep closes sessions past their ttl', async () => {
   await new Promise(r => setTimeout(r, 5)); // let the async close settle
   assert.equal(listSessions().length, 0);
   assert.equal(state.closed, true);
+});
+
+test('_sweep leaves an un-expired session open (strict ttl boundary)', async () => {
+  let now = 0; _setNow(() => now);
+  const { handle, state } = fakeHandle();
+  const id = freezeSession({ handle: handle as any, restaurant: 'x', ttlMs: 1000 });
+  now = 1000; // age == ttl, NOT past it
+  _sweep();
+  await new Promise(r => setTimeout(r, 5));
+  assert.equal(state.closed, false);
+  assert.equal(getSession(id) !== undefined, true);
+});
+
+test('abortSession returns false for an unknown id', async () => {
+  assert.equal(await abortSession('does-not-exist'), false);
+});
+
+test('abortSession drops the entry even if close() throws', async () => {
+  const handle = { browser: { close: async () => { throw new Error('boom'); } }, page: {} };
+  const id = freezeSession({ handle: handle as any, restaurant: 'x' });
+  assert.equal(await abortSession(id), true);   // error swallowed
+  assert.equal(getSession(id), undefined);      // no zombie entry
+});
+
+test('applyAction: missing session and unknown action return clear errors', async () => {
+  assert.deepEqual(await applyAction('nope', 'abort'), { ok: false, error: 'session not found' });
+  const { handle } = fakeHandle();
+  const id = freezeSession({ handle: handle as any, restaurant: 'x' });
+  assert.deepEqual(await applyAction(id, 'bogus' as any), { ok: false, error: 'unknown action: bogus' });
+});
+
+test('applyAction: refresh-screenshot is a no-op ok; abort closes + drops', async () => {
+  const { handle, state } = fakeHandle();
+  const id = freezeSession({ handle: handle as any, restaurant: 'x' });
+  assert.deepEqual(await applyAction(id, 'refresh-screenshot'), { ok: true });
+  assert.equal(getSession(id) !== undefined, true); // still alive
+  assert.deepEqual(await applyAction(id, 'abort'), { ok: true });
+  assert.equal(state.closed, true);
+  assert.equal(getSession(id), undefined);
 });

@@ -4,12 +4,16 @@
 // (re-enter-cvc, retry-purchase, screenshot) live in this module too; the
 // registry bookkeeping below is browser-agnostic and unit-tested with a fake handle.
 
+import type { Page } from 'playwright';
 import { handlePurchaseFlow } from './booker';
 import { getPayment } from './stripe';
 
+/** Lifecycle of a frozen recovery session. */
+export type SessionStatus = 'frozen' | 'cvc-filled' | 'retry-failed';
+
 export interface SessionHandle {
   browser: { close(): Promise<void> };
-  page: any; // Playwright Page in production; {} in tests
+  page: Page;
 }
 
 export interface FreezeInput {
@@ -23,7 +27,7 @@ export interface FreezeInput {
 
 interface Entry extends FreezeInput {
   id: string;
-  status: string;
+  status: SessionStatus;
   createdAt: number;
   ttlMs: number;
 }
@@ -55,7 +59,7 @@ export interface PublicSession {
   restaurant: string;
   bookedDate?: string;
   bookedTime?: string;
-  status: string;
+  status: SessionStatus;
   ageMs: number;
   error?: string;
 }
@@ -132,9 +136,9 @@ export async function applyAction(id: string, action: SessionAction, value?: str
 
     if (action === 'retry-purchase') {
       const ok = await handlePurchaseFlow(page, false, []);
-      if (ok) { await abortSession(id); }   // success → release/close
-      else { e.status = 'retry-failed'; }
-      return { ok };
+      if (ok) { await abortSession(id); return { ok: true }; }   // success → release/close
+      e.status = 'retry-failed';
+      return { ok: false, error: 'retry purchase did not complete (timeout or payment step failed) — check the live screenshot' };
     }
 
     return { ok: false, error: `unknown action: ${action}` };

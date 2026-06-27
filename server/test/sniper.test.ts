@@ -27,6 +27,11 @@ test('pickSlot returns null when time absent (no fuzzy fallback)', () => {
   assert.equal(pickSlot(slots, '2026-07-15', '20:00'), null);
 });
 
+test('pickSlot matches case-insensitively on the slot time', () => {
+  const m = pickSlot([{ date: '2026-07-15', time12: '8:00 pm', offerId: 'b' }], '2026-07-15', '20:00');
+  assert.equal(m?.offerId, 'b');
+});
+
 // --- SingleWinnerLock ---
 
 test('SingleWinnerLock grants exactly one winner', () => {
@@ -51,6 +56,18 @@ test('computeWindowOffsets pool=1 starts at window start', () => {
   assert.deepEqual(computeWindowOffsets(1, -1000, 10000), [-1000]);
 });
 
+test('computeWindowOffsets pool=2 hits both endpoints', () => {
+  assert.deepEqual(computeWindowOffsets(2, -1000, 10000), [-1000, 10000]);
+});
+
+test('computeWindowOffsets clamps non-positive pool to a single offset', () => {
+  assert.deepEqual(computeWindowOffsets(0, -1000, 10000), [-1000]);
+});
+
+test('computeWindowOffsets handles a zero-width window without NaN', () => {
+  assert.deepEqual(computeWindowOffsets(3, 5000, 5000), [5000, 5000, 5000]);
+});
+
 // --- parseAvailability (recon-seeded, isolated) ---
 
 test('parseAvailability normalizes availability entries', () => {
@@ -67,6 +84,21 @@ test('parseAvailability normalizes availability entries', () => {
     { date: '2026-07-01', time12: '8:00 PM', offerId: 'offer-1' },
     { date: '2026-07-01', time12: '8:15 PM', offerId: 'offer-2' },
   ]);
+});
+
+test('parseAvailability normalizes the days/times/display/businessDate shape', () => {
+  const out = parseAvailability({
+    days: [{ businessDate: '2026-07-02', times: [{ display: '6:30 PM', offerId: 'x9' }] }],
+  });
+  assert.deepEqual(out, [{ date: '2026-07-02', time12: '6:30 PM', offerId: 'x9' }]);
+});
+
+test('parseAvailability drops entries missing date or time, tolerates null', () => {
+  assert.deepEqual(parseAvailability(null), []);
+  const out = parseAvailability({
+    availability: [{ date: '2026-07-01', offers: [{ time: '8:00 PM', id: 'ok' }, { id: 'no-time' }] }],
+  });
+  assert.deepEqual(out, [{ date: '2026-07-01', time12: '8:00 PM', offerId: 'ok' }]);
 });
 
 test('parseAvailability returns [] on unknown shape', () => {

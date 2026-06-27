@@ -259,7 +259,6 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
     pollIntervalMs: sniper?.pollIntervalMs ?? 200,
     windowStartMs: sniper?.windowStartMs ?? -1000,
     windowEndMs: sniper?.windowEndMs ?? 10000,
-    maxPrice: sniper?.maxPrice,
   };
   try {
     const result = await runSniper(bk, cfg, sniper?.runAt);
@@ -276,7 +275,7 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
     };
     addToHistory(entry);
     schedulerEvents.emit('booking-result', entry);
-    await notifyResult(bk.restaurant, result as any);
+    await notifyResult(bk.restaurant, result);
     res.json(result);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);

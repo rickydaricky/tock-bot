@@ -72,7 +72,6 @@ export interface SniperConfig {
   pollIntervalMs: number;  // per-loop poll cadence
   windowStartMs: number;   // offset vs runAt (e.g. -1000)
   windowEndMs: number;     // offset vs runAt (e.g. +10000)
-  maxPrice?: number;       // optional cap (config hook; enforcement TBD — see spec §4.5)
 }
 
 export interface SniperResult {
@@ -113,26 +112,54 @@ async function fetchAvailability(page: Page, url: string): Promise<any> {
   }, url);
 }
 
+/** Scrape the ACTUAL rendered, enabled slot times for the currently-shown date.
+ *  Used by the DOM-fallback poller so it matches real times instead of assuming
+ *  the requested time is present (which would burn the single-winner lock on a
+ *  date-only false positive). */
+async function scrapeDomSlots(page: Page, date: string): Promise<NormalizedSlot[]> {
+  const times: string[] = await page.$$eval(
+    '[data-testid="booking-card-button"], [data-testid^="offering-book-button"]',
+    (els) => els
+      .filter((el: any) => !el.disabled && el.getAttribute('aria-disabled') !== 'true')
+      .map((el: any) => {
+        let node: any = el;
+        for (let i = 0; i < 6; i++) {
+          node = node?.parentElement; if (!node) break;
+          const m = (node.textContent || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+          if (m) return m[0];
+        }
+        return '';
+      })
+      .filter(Boolean),
+  ).catch(() => [] as string[]);
+  return times.map(t => ({ date, time12: t }));
+}
+
+export type GrabResult = { ok: true } | { ok: false; reason: string };
+
 /** Reload-on-hit DOM grab: the poller detected a slot via fetch, but the DOM still
  *  shows stale state, so reload once (slot now renders) and click the ENABLED Book
- *  button whose time matches. Fails fast instead of hammering a disabled button. */
-async function grabViaDom(page: Page, date: string, time24: string): Promise<boolean> {
+ *  button whose time matches. Fails fast instead of hammering a disabled button.
+ *  Returns a discriminated reason so the caller can distinguish a genuine lost race
+ *  from a stale-session/page error. */
+async function grabViaDom(page: Page, date: string, time24: string): Promise<GrabResult> {
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
   try {
     await page.waitForSelector('.ConsumerCalendar', { state: 'visible', timeout: 15000 });
-  } catch { return false; }
+  } catch { return { ok: false, reason: 'calendar did not render (stale session or blocked page?)' }; }
 
   // Select the date if a date button exists (no-op if already selected).
   const dateBtn = page.locator(`.ConsumerCalendar-day.is-in-month.is-available[aria-label="${date}"]:not([disabled])`).first();
   if (await dateBtn.count().catch(() => 0)) {
     await dateBtn.scrollIntoViewIfNeeded().catch(() => {});
-    await dateBtn.click({ timeout: 5000 }).catch(() => {});
+    const clicked = await dateBtn.click({ timeout: 5000 }).then(() => true).catch(() => false);
+    if (!clicked) console.warn(`   ⚠️ grab: date button click for ${date} did not land; proceeding`);
     await sleep(400);
   }
 
   try {
     await page.waitForSelector('[data-testid="booking-card-button"], [data-testid^="offering-book-button"]', { timeout: 10000 });
-  } catch { return false; }
+  } catch { return { ok: false, reason: 'no booking buttons rendered for the date' }; }
 
   const want = to12Hour(time24).toLowerCase();
   const buttons = await page.$$('[data-testid="booking-card-button"], [data-testid^="offering-book-button"]');
@@ -150,11 +177,12 @@ async function grabViaDom(page: Page, date: string, time24: string): Promise<boo
     });
     if (timeText && timeText.toLowerCase() === want) {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
-      await btn.click({ timeout: 5000 });
-      return true;
+      try { await btn.click({ timeout: 5000 }); }
+      catch { return { ok: false, reason: 'matched slot button click failed' }; }
+      return { ok: true };
     }
   }
-  return false;
+  return { ok: false, reason: 'no enabled slot matched the requested time (lost the race)' };
 }
 
 /**
@@ -180,30 +208,42 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
 
   try {
     // --- Phase 1: warm the pool + auto-discover the availability endpoint ---
-    await Promise.allSettled(Array.from({ length: pool }, async (_, i) => {
-      const fp = getFingerprint(i);
+    const warmResults = await Promise.allSettled(Array.from({ length: pool }, async (_, i) => {
       const browser = await chromium.launch({ headless: true, args: STEALTH_ARGS });
-      const context = await browser.newContext({ viewport: fp.viewport, userAgent: fp.userAgent });
-      const cookies = await injectCookies(context);
-      if (cookies === 0) { await browser.close(); throw new Error('No Tock cookies configured'); }
-      const page = await context.newPage();
+      try {
+        const fp = getFingerprint(i);
+        const context = await browser.newContext({ viewport: fp.viewport, userAgent: fp.userAgent });
+        const cookies = await injectCookies(context);
+        if (cookies === 0) throw new Error('No Tock cookies configured');
+        const page = await context.newPage();
 
-      let availabilityUrl: string | undefined;
-      page.on('response', (resp) => {
-        const u = resp.url();
-        if (availabilityUrl || !u.includes('/api/') || !u.includes(req.restaurant) && !u.includes('consumer')) return;
-        resp.json().then(j => { if (parseAvailability(j).length >= 0 && /availab|search|calendar/i.test(u)) availabilityUrl = u; }).catch(() => {});
-      });
+        let captured: string | undefined;
+        page.on('response', (resp) => {
+          const u = resp.url();
+          if (captured || !u.includes('/api/') || (!u.includes(req.restaurant) && !u.includes('consumer'))) return;
+          // Latch on URL shape + a successful JSON parse. We do NOT require slots to be
+          // present: pre-drop the availability response is legitimately empty, so a
+          // slot-count check would never capture the endpoint before the release.
+          resp.json().then(() => { if (/availab|search|calendar/i.test(u)) captured = u; }).catch(() => {});
+        });
 
-      await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(1500); // let the availability XHR fire so the listener can capture it
-      warm[i] = { browser, page, availabilityUrl };
-      console.log(`   browser #${i + 1} warm${availabilityUrl ? ' (availability endpoint captured)' : ' (DOM fallback)'}`);
+        await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await sleep(1500); // let the availability XHR fire so the listener can capture it
+        warm[i] = { browser, page, availabilityUrl: captured };
+        console.log(`   browser #${i + 1} warm${captured ? ' (availability endpoint captured)' : ' (DOM fallback)'}`);
+      } catch (e) {
+        await browser.close().catch(() => {}); // no leak on cookie/nav failure
+        throw e;
+      }
     }));
 
+    const warmFailures = warmResults.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
+    for (const f of warmFailures) console.error(`   ⚠️ warm-up failed: ${f.reason instanceof Error ? f.reason.message : f.reason}`);
     const live = warm.filter(Boolean) as Warm[];
+    console.log(`   warmed ${live.length}/${pool} browsers`);
     if (live.length === 0) {
-      return { success: false, error: 'No browsers warmed (cookies missing or all launches failed)', durationMs: Date.now() - startTime, polls: { total: 0, matched: 0 } };
+      const why = warmFailures[0]?.reason;
+      return { success: false, error: `No browsers warmed: ${why instanceof Error ? why.message : why ?? 'unknown'}`, durationMs: Date.now() - startTime, polls: { total: 0, matched: 0 } };
     }
 
     // --- Phase 2: wait for the window, then poll ---
@@ -216,63 +256,71 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     let bookedTime: string | undefined;
 
     const loops = live.map(async (w, i) => {
-      const startAt = base + offsets[i];
-      const waitMs = startAt - Date.now();
-      if (waitMs > 0) await sleep(waitMs);
+      try {
+        const startAt = base + offsets[i];
+        const waitMs = startAt - Date.now();
+        if (waitMs > 0) await sleep(waitMs);
 
-      while (Date.now() < windowEnd && !lock.won) {
-        let slots: NormalizedSlot[] = [];
-        let lastErr = '';
-        if (w.availabilityUrl) {
-          const body = await fetchAvailability(w.page, withDate(w.availabilityUrl, req.dates[0]));
-          if (body?.__status === 401) { lastErr = 'session expired (401)'; }
-          else if (body?.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); }
-          else if (body) slots = parseAvailability(body);
-        } else {
-          // DOM fallback: reload + scrape (slower; coarse window coverage)
-          try {
-            await w.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-            const labels = await w.page.$$eval('.ConsumerCalendar-day.is-available.is-in-month:not(.is-disabled):not(.is-sold)',
-              els => els.map(e => e.getAttribute('aria-label')).filter(Boolean) as string[]);
-            // Presence of the date in the calendar; time match resolved during grab.
-            slots = labels.filter(d => req.dates.includes(d)).map(d => ({ date: d, time12: to12Hour(req.time) }));
-          } catch { lastErr = 'reload failed'; }
-        }
-        pollTotal++;
-
-        let match: NormalizedSlot | null = null;
-        for (const d of req.dates) { match = pickSlot(slots, d, req.time); if (match) break; }
-
-        if (match) {
-          pollMatched++;
-          if (lock.tryAcquire()) {
-            winner = w;
-            bookedDate = match.date;
-            console.log(`\n🏆 Sniper match: ${match.date} ${req.time} (browser #${i + 1}) — grabbing`);
-            return;
+        // `<=` so the loop whose start offset equals windowEnd still polls once.
+        while (Date.now() <= windowEnd && !lock.won) {
+          let slots: NormalizedSlot[] = [];
+          let lastErr = '';
+          if (w.availabilityUrl) {
+            // Poll EVERY requested date (priority order), not just the first.
+            for (const d of req.dates) {
+              const body = await fetchAvailability(w.page, withDate(w.availabilityUrl, d));
+              if (body == null) { lastErr = 'availability fetch failed (network/in-page error)'; break; }
+              if (body.__status === 401) { lastErr = 'session expired (401)'; break; }
+              if (body.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); break; }
+              if (typeof body.__status === 'number') { lastErr = `availability HTTP ${body.__status}`; break; } // 403 anti-bot, 5xx, etc.
+              slots.push(...parseAvailability(body));
+            }
+          } else {
+            // DOM fallback: reload + scrape the ACTUAL rendered slot times (never fake the time).
+            try {
+              await w.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+              slots = await scrapeDomSlots(w.page, req.dates[0]);
+            } catch { lastErr = 'reload failed'; }
           }
-        } else if (lastErr) {
-          outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr });
-          if (lastErr.startsWith('session expired')) return; // no point continuing
+          pollTotal++;
+
+          let match: NormalizedSlot | null = null;
+          for (const d of req.dates) { match = pickSlot(slots, d, req.time); if (match) break; }
+
+          if (match) {
+            pollMatched++;
+            if (lock.tryAcquire()) {
+              winner = w;
+              bookedDate = match.date;
+              console.log(`\n🏆 Sniper match: ${match.date} ${req.time} (browser #${i + 1}) — grabbing`);
+              return;
+            }
+          } else if (lastErr) {
+            outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr });
+            if (lastErr.startsWith('session expired')) return; // unrecoverable within the window
+          }
+          await sleep(cfg.pollIntervalMs);
         }
-        await sleep(cfg.pollIntervalMs);
+        if (!lock.won) outcomes.push({ attempt: i + 1, status: 'failed', error: 'no match in window' });
+      } catch (err) {
+        // One crashed browser must not abort the others or discard an existing winner.
+        outcomes.push({ attempt: i + 1, status: 'crashed', error: err instanceof Error ? err.message : String(err) });
       }
-      if (!lock.won) outcomes.push({ attempt: i + 1, status: 'failed', error: 'no match in window' });
     });
 
-    await Promise.all(loops);
+    await Promise.allSettled(loops);
     const durationMs = () => Date.now() - startTime;
 
     if (!winner || !bookedDate) {
-      return { success: false, error: `No matching slot in window — ${summarizeFailures(outcomes) || 'none seen'}`, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
+      return { success: false, error: `No matching slot in window — ${summarizeFailures(outcomes)}`, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
     }
 
     // --- Phase 3: grab + blind auto-purchase ---
     const screenshots: string[] = [];
-    const grabbed = await grabViaDom(winner.page, bookedDate, req.time);
-    if (!grabbed) {
+    const grab = await grabViaDom(winner.page, bookedDate, req.time);
+    if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
-      return { success: false, bookedDate, error: 'Slot vanished before grab (lost the race)', screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
+      return { success: false, bookedDate, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
     }
     bookedTime = to12Hour(req.time);
 
@@ -280,7 +328,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     try {
       purchased = await handlePurchaseFlow(winner.page, false, screenshots);
     } catch (err) {
-      outcomes.push({ attempt: 0, status: 'crashed', error: err instanceof Error ? err.message : String(err) });
+      outcomes.push({ attempt: 1, status: 'crashed', error: `purchase: ${err instanceof Error ? err.message : String(err)}` });
     }
 
     if (purchased) {
