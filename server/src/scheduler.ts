@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { EventEmitter } from 'events';
 import { runBooking, BookingRequest } from './booker';
 import { BlitzConfig, runBlitz, AttemptOutcome } from './blitz';
+import { runSniper, SniperConfig } from './sniper';
 import { notifyResult } from './notify';
 
 export const schedulerEvents = new EventEmitter();
@@ -11,6 +12,7 @@ export interface ScheduledBooking extends BookingRequest {
   cron: string;          // cron expression e.g. "0 10 1 4 *"
   runAt?: string;        // ISO datetime — converted to cron on save
   blitz?: BlitzConfig;   // optional blitz mode config
+  sniper?: SniperConfig; // optional sniper mode config (takes precedence over blitz)
   label?: string;        // human-friendly label
   createdAt: string;     // ISO timestamp
 }
@@ -70,7 +72,9 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
     let result: import('./booker').BookingResult;
     let blitzMeta: BlitzMeta | undefined;
 
-    if (booking.blitz && booking.blitz.attempts > 1) {
+    if (booking.sniper) {
+      result = await runSniper(booking, booking.sniper, booking.runAt);
+    } else if (booking.blitz && booking.blitz.attempts > 1) {
       const blitzResult = await runBlitz(booking, booking.blitz, booking.runAt);
       result = blitzResult.result;
       blitzMeta = {
@@ -128,13 +132,14 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
 
   if (booking.runAt) {
     // Use setTimeout for exact datetime scheduling.
-    // For blitz, fire early to allow browser pre-launch (~15s).
-    // The blitz engine uses runAt for precise stagger timing internally.
+    // For blitz/sniper, fire early to allow browser pre-launch + warmup (~15s).
+    // Those engines use runAt for precise stagger/window timing internally.
     const targetTime = new Date(booking.runAt).getTime();
     if (targetTime - Date.now() < -5000) {
       return { success: false, error: `Run time is in the past (${Math.round((Date.now() - targetTime) / 1000)}s ago)` };
     }
-    const earlyMs = booking.blitz && booking.blitz.attempts > 1 ? 15_000 : 0;
+    const needsWarmup = booking.sniper || (booking.blitz && booking.blitz.attempts > 1);
+    const earlyMs = needsWarmup ? 15_000 : 0;
     const delayMs = Math.max(0, targetTime - earlyMs - Date.now());
 
     const timer = setTimeout(() => {

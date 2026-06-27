@@ -4,6 +4,9 @@
 // (re-enter-cvc, retry-purchase, screenshot) live in this module too; the
 // registry bookkeeping below is browser-agnostic and unit-tested with a fake handle.
 
+import { handlePurchaseFlow } from './booker';
+import { getPayment } from './stripe';
+
 export interface SessionHandle {
   browser: { close(): Promise<void> };
   page: any; // Playwright Page in production; {} in tests
@@ -93,3 +96,49 @@ export function _sweep(): void {
 // Periodic sweep in production. unref so it never keeps the process alive.
 const sweepTimer = setInterval(() => _sweep(), 30_000);
 sweepTimer.unref?.();
+
+// --- Page-driven recovery actions (operate on the live frozen browser) ---
+
+/** Fresh screenshot of a frozen session's page, or null. */
+export async function sessionScreenshot(id: string): Promise<string | null> {
+  const e = sessions.get(id);
+  if (!e) return null;
+  try { return (await e.handle.page.screenshot({ fullPage: false })).toString('base64'); }
+  catch { return null; }
+}
+
+export type SessionAction = 're-enter-cvc' | 'retry-purchase' | 'refresh-screenshot' | 'abort';
+
+/** Apply a canned recovery action to a frozen session's live page. */
+export async function applyAction(id: string, action: SessionAction, value?: string): Promise<{ ok: boolean; error?: string }> {
+  const e = sessions.get(id);
+  if (!e) return { ok: false, error: 'session not found' };
+  const page = e.handle.page;
+  try {
+    if (action === 'abort') { await abortSession(id); return { ok: true }; }
+    if (action === 'refresh-screenshot') { return { ok: true }; } // caller re-fetches /screenshot
+
+    if (action === 're-enter-cvc') {
+      const cvc = value ?? getPayment()?.cvc;
+      if (!cvc) return { ok: false, error: 'no CVC provided or configured' };
+      const frame = page.frames().find((f: any) => /stripe|braintree/.test(f.url()));
+      const target = frame ?? page;
+      const input = target.locator('input[name="cvv"], input[name="cvc"], input[placeholder="CVC"], input[autocomplete="cc-csc"]').first();
+      await input.click({ timeout: 5000 });
+      await input.fill(cvc);
+      e.status = 'cvc-filled';
+      return { ok: true };
+    }
+
+    if (action === 'retry-purchase') {
+      const ok = await handlePurchaseFlow(page, false, []);
+      if (ok) { await abortSession(id); }   // success → release/close
+      else { e.status = 'retry-failed'; }
+      return { ok };
+    }
+
+    return { ok: false, error: `unknown action: ${action}` };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
