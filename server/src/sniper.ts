@@ -63,6 +63,11 @@ export function parseAvailability(offerings: unknown, partySize: number): Normal
   if (!dates.length || !times24.length || !bookable.length) return [];
   const offerId = String(bookable[0].id);
   const out: NormalizedSlot[] = [];
+  // ASSUMPTION (confirmed for prepaid uniform-service venues like Lazy Bear / FHH,
+  // unconfirmed for variable-service restaurants — see recon doc): every openTime is
+  // valid for every openDate, so we emit the full cross-product. If a venue varied
+  // times per date, this could over-emit and a phantom match would burn the lock when
+  // grabViaDom finds no enabled button — revisit per-date granularity after a live drop.
   for (const date of dates) {
     for (const t of times24) {
       out.push({ date: String(date), time12: to12Hour(String(t)), offerId });
@@ -103,18 +108,24 @@ function searchUrlFor(req: BookingRequest, date: string): string {
  *  the embedded `window.$REDUX_STATE`, and return `calendar.offerings`. Live recon
  *  (2026-06-27) confirmed there is NO JSON availability endpoint — availability is
  *  server-rendered into the page, so polling means re-fetching this HTML. Returns the
- *  offerings object, `{ __status }` on a non-OK response, `{ __noState: true }` if the
- *  state couldn't be parsed (e.g. a Cloudflare challenge), or null on a thrown error. */
+ *  offerings object (possibly `{}` when the calendar is legitimately empty),
+ *  `{ __status }` on a non-OK response, `{ __noState: true }` when the embedded state
+ *  can't be located/parsed (e.g. a Cloudflare challenge or a Tock layout change), or
+ *  null only on a genuine network/in-page fetch error. Network and parse failures are
+ *  kept distinct so the operator isn't pointed at the network for a layout change. */
 async function fetchOfferings(page: Page, url: string): Promise<any> {
   return page.evaluate(async (u: string) => {
+    let html: string;
     try {
       const r = await fetch(u, { credentials: 'include' });
       if (!r.ok) return { __status: r.status };
-      const html = await r.text();
-      const marker = '$REDUX_STATE = ';
-      const start = html.indexOf(marker);
-      if (start < 0) return { __noState: true };
-      const i = start + marker.length;
+      html = await r.text();
+    } catch { return null; } // genuine network / in-page fetch failure ONLY
+    try {
+      // Tolerant marker (handles minified `$REDUX_STATE=` and spacing variants).
+      const m = html.match(/\$REDUX_STATE\s*=\s*/);
+      if (!m || m.index === undefined) return { __noState: true };
+      const i = m.index + m[0].length;
       if (html[i] !== '{') return { __noState: true };
       // Brace-match the JSON object (string-aware) to find where it ends.
       let depth = 0, inStr = false, esc = false, end = -1;
@@ -127,8 +138,11 @@ async function fetchOfferings(page: Page, url: string): Promise<any> {
       }
       if (end < 0) return { __noState: true };
       const state = JSON.parse(html.slice(i, end));
-      return (state.calendar && state.calendar.offerings) || { __noState: true };
-    } catch { return null; }
+      // `offerings` present-but-empty (null/{}) is a valid "nothing yet" state — return {}
+      // (parseAvailability yields []). Only a missing key is a real parse anomaly.
+      if (!state.calendar || !('offerings' in state.calendar)) return { __noState: true };
+      return state.calendar.offerings ?? {};
+    } catch { return { __noState: true }; } // parse / layout failure — NOT a network error
   }, url);
 }
 
@@ -184,7 +198,7 @@ async function grabViaDom(page: Page, date: string, time24: string): Promise<Gra
 
 /**
  * Sniper engine: warm a small browser pool on the search page, densely poll the
- * availability endpoint via in-page fetch across the drop window, and let the first
+ * search page's embedded availability ($REDUX_STATE) via in-page fetch across the drop window, and let the first
  * loop to find an EXACT date+time match win an atomic lock, grab the slot
  * (reload-on-hit DOM-click), and auto-purchase. On purchase failure the winning
  * browser is frozen for human recovery; all other browsers are closed.
@@ -242,6 +256,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     let bookedTime: string | undefined;
 
     const loops = live.map(async (w, i) => {
+      let readablePolls = 0; // dates that returned parseable offerings — distinguishes "sold out" from "blocked"
       try {
         const startAt = base + offsets[i];
         const waitMs = startAt - Date.now();
@@ -253,13 +268,15 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
           let lastErr = '';
           // Poll EVERY requested date (priority order). Each poll re-fetches the search
           // HTML and reads calendar.offerings (no JSON endpoint exists — see recon).
+          // Per-date, non-session errors `continue` so one bad date doesn't skip the rest.
           for (const d of req.dates) {
             const offerings = await fetchOfferings(w.page, searchUrlFor(req, d));
-            if (offerings == null) { lastErr = 'availability fetch failed (network/in-page error)'; break; }
-            if (offerings.__status === 401) { lastErr = 'session expired (401)'; break; }
-            if (offerings.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); break; }
-            if (typeof offerings.__status === 'number') { lastErr = `availability HTTP ${offerings.__status}`; break; } // 403 anti-bot, 5xx
+            if (offerings == null) { lastErr = 'availability fetch failed (network/in-page error)'; continue; }
+            if (offerings.__status === 401) { lastErr = 'session expired (401)'; outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr }); return; } // session dead — stop this browser
+            if (offerings.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); continue; }
+            if (typeof offerings.__status === 'number') { lastErr = `availability HTTP ${offerings.__status}`; continue; } // 403 anti-bot, 5xx
             if (offerings.__noState) { lastErr = 'could not parse availability (challenge or layout change)'; continue; }
+            readablePolls++;
             slots.push(...parseAvailability(offerings, req.partySize));
           }
           pollTotal++;
@@ -277,11 +294,16 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
             }
           } else if (lastErr) {
             outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr });
-            if (lastErr.startsWith('session expired')) return; // unrecoverable within the window
           }
           await sleep(cfg.pollIntervalMs);
         }
-        if (!lock.won) outcomes.push({ attempt: i + 1, status: 'failed', error: 'no match in window' });
+        // Distinguish "the restaurant had no availability" from "we never got a readable
+        // page" (challenge/block) — otherwise a fully-blocked run looks like a sold-out one.
+        if (!lock.won) {
+          outcomes.push({ attempt: i + 1, status: 'failed', error: readablePolls === 0
+            ? 'availability never readable in window (challenge/block/session)'
+            : 'no match in window' });
+        }
       } catch (err) {
         // One crashed browser must not abort the others or discard an existing winner.
         outcomes.push({ attempt: i + 1, status: 'crashed', error: err instanceof Error ? err.message : String(err) });

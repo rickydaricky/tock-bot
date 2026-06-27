@@ -109,6 +109,58 @@ test('parseAvailability picks the first AVAILABLE matching experience id', () =>
   assert.deepEqual(parseAvailability(offerings, 2), [{ date: '2026-07-01', time12: '8:00 PM', offerId: 'a' }]);
 });
 
+test('parseAvailability converts noon/midnight/12:30 openTimes correctly (24h→12h)', () => {
+  const offerings = {
+    openDate: ['2026-07-22'],
+    openTime: ['00:00', '12:00', '12:30'],
+    experience: [{ id: 5, state: 'AVAILABLE', partySize: [2] }],
+  };
+  assert.deepEqual(parseAvailability(offerings, 2), [
+    { date: '2026-07-22', time12: '12:00 AM', offerId: '5' },
+    { date: '2026-07-22', time12: '12:00 PM', offerId: '5' },
+    { date: '2026-07-22', time12: '12:30 PM', offerId: '5' },
+  ]);
+});
+
+test('parseAvailability emits the full date × time cross-product (dates outer)', () => {
+  const offerings = {
+    openDate: ['2026-07-22', '2026-07-23'],
+    openTime: ['17:00', '19:00'],
+    experience: [{ id: 9, state: 'AVAILABLE', partySize: [2] }],
+  };
+  assert.deepEqual(parseAvailability(offerings, 2), [
+    { date: '2026-07-22', time12: '5:00 PM', offerId: '9' },
+    { date: '2026-07-22', time12: '7:00 PM', offerId: '9' },
+    { date: '2026-07-23', time12: '5:00 PM', offerId: '9' },
+    { date: '2026-07-23', time12: '7:00 PM', offerId: '9' },
+  ]);
+});
+
+test('parseAvailability skips experiences missing partySize without throwing', () => {
+  const offerings = {
+    openDate: ['2026-07-22'],
+    openTime: ['19:00'],
+    experience: [
+      { id: 1, state: 'AVAILABLE' },                 // partySize undefined → skipped
+      { id: 2, state: 'AVAILABLE', partySize: [2] },
+    ],
+  };
+  assert.deepEqual(parseAvailability(offerings, 2), [{ date: '2026-07-22', time12: '7:00 PM', offerId: '2' }]);
+});
+
+test('parseAvailability excludes experiences whose state is not exactly AVAILABLE', () => {
+  const offerings = {
+    openDate: ['2026-07-22'],
+    openTime: ['19:00'],
+    experience: [
+      { id: 1, state: 'WAITLIST', partySize: [2] },
+      { id: 2, state: undefined as any, partySize: [2] },
+      { id: 3, state: 'available', partySize: [2] }, // wrong case
+    ],
+  };
+  assert.deepEqual(parseAvailability(offerings, 2), []);
+});
+
 test('parseAvailability tolerates null and empty offerings', () => {
   assert.deepEqual(parseAvailability(null, 2), []);
   assert.deepEqual(parseAvailability({ openDate: [], openTime: [], experience: [] }, 2), []);
