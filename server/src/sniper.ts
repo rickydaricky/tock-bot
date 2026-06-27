@@ -40,28 +40,37 @@ export function computeWindowOffsets(pool: number, windowStartMs: number, window
   return Array.from({ length: n }, (_, i) => windowStartMs + Math.round((span * i) / (n - 1)));
 }
 
-/** Normalize a Tock availability response into NormalizedSlot[].
- *  THE ONLY recon-dependent unit. The exact live shape is unconfirmed
- *  (see docs/superpowers/specs/2026-06-26-tock-api-recon.md): the real slot
- *  schema lives in Redux `availability.result`, capturable only live. This
- *  tolerates the shapes seen in saved pages and returns [] on anything
- *  unrecognized — the engine then falls back to reload-on-hit DOM scraping. */
-export function parseAvailability(json: unknown): NormalizedSlot[] {
+/** Tock's `calendar.offerings`, extracted from the search page's embedded
+ *  `$REDUX_STATE` (confirmed by live recon 2026-06-27 — see the recon doc).
+ *  There is NO JSON availability endpoint; this is the real slot source. */
+export interface TockOfferings {
+  openDate?: string[];   // bookable dates, "YYYY-MM-DD"
+  openTime?: string[];   // bookable times, 24h "HH:MM"
+  experience?: Array<{ id: number | string; state?: string; partySize?: number[] }>;
+}
+
+/** Build the bookable slots for a party size from Tock's `calendar.offerings`.
+ *  A slot is bookable when its date is in `openDate`, its time in `openTime`, AND
+ *  at least one `experience` is `AVAILABLE` for that party size. `openTime` is 24h
+ *  and is converted to the 12h form `pickSlot` matches on. Returns [] if nothing
+ *  is bookable (e.g. all experiences SOLD, or wrong party size). */
+export function parseAvailability(offerings: unknown, partySize: number): NormalizedSlot[] {
+  const o = offerings as TockOfferings | null;
+  const dates = Array.isArray(o?.openDate) ? o!.openDate : [];
+  const times24 = Array.isArray(o?.openTime) ? o!.openTime : [];
+  const bookable = (Array.isArray(o?.experience) ? o!.experience : [])
+    .filter(e => e?.state === 'AVAILABLE' && Array.isArray(e?.partySize) && e.partySize!.includes(partySize));
+  if (!dates.length || !times24.length || !bookable.length) return [];
+  const offerId = String(bookable[0].id);
   const out: NormalizedSlot[] = [];
-  const root: any = json;
-  const days: any[] = Array.isArray(root?.availability) ? root.availability
-    : Array.isArray(root?.days) ? root.days
-    : [];
-  for (const day of days) {
-    const date = day?.date ?? day?.businessDate;
-    const offers: any[] = Array.isArray(day?.offers) ? day.offers
-      : Array.isArray(day?.times) ? day.times
-      : [];
-    for (const o of offers) {
-      const time12 = o?.time ?? o?.display ?? o?.label;
-      if (date && time12) {
-        out.push({ date: String(date), time12: String(time12), offerId: o?.id ?? o?.offerId });
-      }
+  // ASSUMPTION (confirmed for prepaid uniform-service venues like Lazy Bear / FHH,
+  // unconfirmed for variable-service restaurants — see recon doc): every openTime is
+  // valid for every openDate, so we emit the full cross-product. If a venue varied
+  // times per date, this could over-emit and a phantom match would burn the lock when
+  // grabViaDom finds no enabled button — revisit per-date granularity after a live drop.
+  for (const date of dates) {
+    for (const t of times24) {
+      out.push({ date: String(date), time12: to12Hour(String(t)), offerId });
     }
   }
   return out;
@@ -85,7 +94,7 @@ export interface SniperResult {
   polls: { total: number; matched: number };
 }
 
-interface Warm { browser: Browser; page: Page; availabilityUrl?: string }
+interface Warm { browser: Browser; page: Page }
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -95,44 +104,46 @@ function searchUrlFor(req: BookingRequest, date: string): string {
   return `https://www.exploretock.com/${req.restaurant}/search?date=${date}&size=${req.partySize}&time=${encodeURIComponent(req.time)}`;
 }
 
-/** Swap the ?date= param of a captured availability URL to poll another date. */
-function withDate(url: string, date: string): string {
-  return url.replace(/([?&]date=)[^&]*/, `$1${date}`);
-}
-
-/** Fetch availability JSON from inside the page's authenticated context.
- *  Returns the parsed body, or { __status } on a non-OK response, or null on error. */
-async function fetchAvailability(page: Page, url: string): Promise<any> {
+/** Fetch the search page HTML from inside the page's authenticated context, extract
+ *  the embedded `window.$REDUX_STATE`, and return `calendar.offerings`. Live recon
+ *  (2026-06-27) confirmed there is NO JSON availability endpoint — availability is
+ *  server-rendered into the page, so polling means re-fetching this HTML. Returns the
+ *  offerings object (possibly `{}` when the calendar is legitimately empty),
+ *  `{ __status }` on a non-OK response, `{ __noState: true }` when the embedded state
+ *  can't be located/parsed (e.g. a Cloudflare challenge or a Tock layout change), or
+ *  null only on a genuine network/in-page fetch error. Network and parse failures are
+ *  kept distinct so the operator isn't pointed at the network for a layout change. */
+async function fetchOfferings(page: Page, url: string): Promise<any> {
   return page.evaluate(async (u: string) => {
+    let html: string;
     try {
-      const r = await fetch(u, { credentials: 'include', headers: { accept: 'application/json' } });
+      const r = await fetch(u, { credentials: 'include' });
       if (!r.ok) return { __status: r.status };
-      return await r.json();
-    } catch { return null; }
+      html = await r.text();
+    } catch { return null; } // genuine network / in-page fetch failure ONLY
+    try {
+      // Tolerant marker (handles minified `$REDUX_STATE=` and spacing variants).
+      const m = html.match(/\$REDUX_STATE\s*=\s*/);
+      if (!m || m.index === undefined) return { __noState: true };
+      const i = m.index + m[0].length;
+      if (html[i] !== '{') return { __noState: true };
+      // Brace-match the JSON object (string-aware) to find where it ends.
+      let depth = 0, inStr = false, esc = false, end = -1;
+      for (let j = i; j < html.length; j++) {
+        const c = html[j];
+        if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; }
+        else if (c === '"') inStr = true;
+        else if (c === '{') depth++;
+        else if (c === '}') { if (--depth === 0) { end = j + 1; break; } }
+      }
+      if (end < 0) return { __noState: true };
+      const state = JSON.parse(html.slice(i, end));
+      // `offerings` present-but-empty (null/{}) is a valid "nothing yet" state — return {}
+      // (parseAvailability yields []). Only a missing key is a real parse anomaly.
+      if (!state.calendar || !('offerings' in state.calendar)) return { __noState: true };
+      return state.calendar.offerings ?? {};
+    } catch { return { __noState: true }; } // parse / layout failure — NOT a network error
   }, url);
-}
-
-/** Scrape the ACTUAL rendered, enabled slot times for the currently-shown date.
- *  Used by the DOM-fallback poller so it matches real times instead of assuming
- *  the requested time is present (which would burn the single-winner lock on a
- *  date-only false positive). */
-async function scrapeDomSlots(page: Page, date: string): Promise<NormalizedSlot[]> {
-  const times: string[] = await page.$$eval(
-    '[data-testid="booking-card-button"], [data-testid^="offering-book-button"]',
-    (els) => els
-      .filter((el: any) => !el.disabled && el.getAttribute('aria-disabled') !== 'true')
-      .map((el: any) => {
-        let node: any = el;
-        for (let i = 0; i < 6; i++) {
-          node = node?.parentElement; if (!node) break;
-          const m = (node.textContent || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-          if (m) return m[0];
-        }
-        return '';
-      })
-      .filter(Boolean),
-  ).catch(() => [] as string[]);
-  return times.map(t => ({ date, time12: t }));
 }
 
 export type GrabResult = { ok: true } | { ok: false; reason: string };
@@ -187,7 +198,7 @@ async function grabViaDom(page: Page, date: string, time24: string): Promise<Gra
 
 /**
  * Sniper engine: warm a small browser pool on the search page, densely poll the
- * availability endpoint via in-page fetch across the drop window, and let the first
+ * search page's embedded availability ($REDUX_STATE) via in-page fetch across the drop window, and let the first
  * loop to find an EXACT date+time match win an atomic lock, grab the slot
  * (reload-on-hit DOM-click), and auto-purchase. On purchase failure the winning
  * browser is frozen for human recovery; all other browsers are closed.
@@ -207,7 +218,8 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
   console.log(`   ${req.restaurant} | dates ${req.dates.join(', ')} | size ${req.partySize} | ${req.time}`);
 
   try {
-    // --- Phase 1: warm the pool + auto-discover the availability endpoint ---
+    // --- Phase 1: warm the pool (land on the exploretock.com origin so the poller's
+    // same-origin fetch carries the session cookies) ---
     const warmResults = await Promise.allSettled(Array.from({ length: pool }, async (_, i) => {
       const browser = await chromium.launch({ headless: true, args: STEALTH_ARGS });
       try {
@@ -216,21 +228,9 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         const cookies = await injectCookies(context);
         if (cookies === 0) throw new Error('No Tock cookies configured');
         const page = await context.newPage();
-
-        let captured: string | undefined;
-        page.on('response', (resp) => {
-          const u = resp.url();
-          if (captured || !u.includes('/api/') || (!u.includes(req.restaurant) && !u.includes('consumer'))) return;
-          // Latch on URL shape + a successful JSON parse. We do NOT require slots to be
-          // present: pre-drop the availability response is legitimately empty, so a
-          // slot-count check would never capture the endpoint before the release.
-          resp.json().then(() => { if (/availab|search|calendar/i.test(u)) captured = u; }).catch(() => {});
-        });
-
         await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await sleep(1500); // let the availability XHR fire so the listener can capture it
-        warm[i] = { browser, page, availabilityUrl: captured };
-        console.log(`   browser #${i + 1} warm${captured ? ' (availability endpoint captured)' : ' (DOM fallback)'}`);
+        warm[i] = { browser, page };
+        console.log(`   browser #${i + 1} warm`);
       } catch (e) {
         await browser.close().catch(() => {}); // no leak on cookie/nav failure
         throw e;
@@ -256,6 +256,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     let bookedTime: string | undefined;
 
     const loops = live.map(async (w, i) => {
+      let readablePolls = 0; // dates that returned parseable offerings — distinguishes "sold out" from "blocked"
       try {
         const startAt = base + offsets[i];
         const waitMs = startAt - Date.now();
@@ -263,24 +264,20 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
 
         // `<=` so the loop whose start offset equals windowEnd still polls once.
         while (Date.now() <= windowEnd && !lock.won) {
-          let slots: NormalizedSlot[] = [];
+          const slots: NormalizedSlot[] = [];
           let lastErr = '';
-          if (w.availabilityUrl) {
-            // Poll EVERY requested date (priority order), not just the first.
-            for (const d of req.dates) {
-              const body = await fetchAvailability(w.page, withDate(w.availabilityUrl, d));
-              if (body == null) { lastErr = 'availability fetch failed (network/in-page error)'; break; }
-              if (body.__status === 401) { lastErr = 'session expired (401)'; break; }
-              if (body.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); break; }
-              if (typeof body.__status === 'number') { lastErr = `availability HTTP ${body.__status}`; break; } // 403 anti-bot, 5xx, etc.
-              slots.push(...parseAvailability(body));
-            }
-          } else {
-            // DOM fallback: reload + scrape the ACTUAL rendered slot times (never fake the time).
-            try {
-              await w.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-              slots = await scrapeDomSlots(w.page, req.dates[0]);
-            } catch { lastErr = 'reload failed'; }
+          // Poll EVERY requested date (priority order). Each poll re-fetches the search
+          // HTML and reads calendar.offerings (no JSON endpoint exists — see recon).
+          // Per-date, non-session errors `continue` so one bad date doesn't skip the rest.
+          for (const d of req.dates) {
+            const offerings = await fetchOfferings(w.page, searchUrlFor(req, d));
+            if (offerings == null) { lastErr = 'availability fetch failed (network/in-page error)'; continue; }
+            if (offerings.__status === 401) { lastErr = 'session expired (401)'; outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr }); return; } // session dead — stop this browser
+            if (offerings.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); continue; }
+            if (typeof offerings.__status === 'number') { lastErr = `availability HTTP ${offerings.__status}`; continue; } // 403 anti-bot, 5xx
+            if (offerings.__noState) { lastErr = 'could not parse availability (challenge or layout change)'; continue; }
+            readablePolls++;
+            slots.push(...parseAvailability(offerings, req.partySize));
           }
           pollTotal++;
 
@@ -297,11 +294,16 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
             }
           } else if (lastErr) {
             outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr });
-            if (lastErr.startsWith('session expired')) return; // unrecoverable within the window
           }
           await sleep(cfg.pollIntervalMs);
         }
-        if (!lock.won) outcomes.push({ attempt: i + 1, status: 'failed', error: 'no match in window' });
+        // Distinguish "the restaurant had no availability" from "we never got a readable
+        // page" (challenge/block) — otherwise a fully-blocked run looks like a sold-out one.
+        if (!lock.won) {
+          outcomes.push({ attempt: i + 1, status: 'failed', error: readablePolls === 0
+            ? 'availability never readable in window (challenge/block/session)'
+            : 'no match in window' });
+        }
       } catch (err) {
         // One crashed browser must not abort the others or discard an existing winner.
         outcomes.push({ attempt: i + 1, status: 'crashed', error: err instanceof Error ? err.message : String(err) });

@@ -6,16 +6,17 @@ import { freezeSession, listSessions, abortSession, _reset, _setNow } from '../s
 // Detect → single-winner grab, over a feed that flips none→slot mid-flight.
 test('concurrent poll loops over a none→slot feed yield exactly one winner', async () => {
   let flipped = false;
+  // Mirrors Tock's real calendar.offerings model: none → an AVAILABLE slot mid-window.
   const feed = () => flipped
-    ? { availability: [{ date: '2026-07-01', offers: [{ time: '8:00 PM', id: 'win' }] }] }
-    : { availability: [] };
+    ? { openDate: ['2026-07-01'], openTime: ['20:00'], experience: [{ id: 'win', state: 'AVAILABLE', partySize: [2] }] }
+    : { openDate: [], openTime: [], experience: [] };
   setTimeout(() => { flipped = true; }, 50);
 
   const lock = new SingleWinnerLock();
   const winners: string[] = [];
   async function loop() {
     for (let i = 0; i < 80; i++) {
-      const slot = pickSlot(parseAvailability(feed()), '2026-07-01', '20:00');
+      const slot = pickSlot(parseAvailability(feed(), 2), '2026-07-01', '20:00');
       if (slot && lock.tryAcquire()) { winners.push(slot.offerId!); return; }
       await new Promise(r => setTimeout(r, 10));
     }
