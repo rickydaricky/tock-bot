@@ -168,7 +168,13 @@ app.post('/api/blitz', requireAuth, async (req, res) => {
       screenshots: result.result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'manual' as const,
-      blitzMeta: { winningAttempt: result.winningAttempt, totalAttempted: result.totalAttempted },
+      blitzMeta: {
+        winningAttempt: result.winningAttempt,
+        totalAttempted: result.totalAttempted,
+        totalAborted: result.totalAborted,
+        durationMs: result.durationMs,
+        attempts: result.attempts,
+      },
     };
     addToHistory(entry);
     schedulerEvents.emit('booking-result', entry);

@@ -7,6 +7,15 @@ export interface BlitzConfig {
   staggerMs: number;   // ms between each attempt, e.g. 1000
 }
 
+/** Outcome of a single blitz attempt — captured for post-run visibility. */
+export interface AttemptOutcome {
+  attempt: number;           // 1-indexed
+  status: 'success' | 'failed' | 'aborted' | 'skipped' | 'crashed';
+  error?: string;
+  bookedDate?: string;
+  bookedTime?: string;
+}
+
 export interface BlitzResult {
   success: boolean;
   winningAttempt?: number;   // 1-indexed
@@ -14,6 +23,22 @@ export interface BlitzResult {
   totalAborted: number;
   result: BookingResult;
   durationMs: number;
+  attempts: AttemptOutcome[]; // per-attempt outcomes (why each one failed)
+}
+
+/** Group attempt errors into a compact, human-readable summary. */
+function summarizeFailures(outcomes: AttemptOutcome[]): string {
+  const counts = new Map<string, number>();
+  for (const o of outcomes) {
+    if (o.status === 'success') continue;
+    const key = (o.error || o.status).replace(/\s+/g, ' ').trim();
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  if (counts.size === 0) return 'no attempt details captured';
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([msg, n]) => `${n}× ${msg}`)
+    .join('; ');
 }
 
 // -- Fingerprint pool for anti-detection --
@@ -43,6 +68,15 @@ function getFingerprint(index: number) {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Screenshot the page without throwing — used to capture failure state for diagnosis. */
+async function safeShot(page: Page): Promise<string | null> {
+  try {
+    return (await page.screenshot({ fullPage: false })).toString('base64');
+  } catch {
+    return null;
+  }
 }
 
 interface WarmBrowser {
@@ -125,10 +159,12 @@ export async function runBlitz(
     const launchFailures = launchResults.filter(r => r.status === 'rejected');
     if (launchFailures.length === n) {
       const err = (launchFailures[0] as PromiseRejectedResult).reason;
+      const errMsg = err instanceof Error ? err.message : String(err);
       return {
         success: false, totalAttempted: 0, totalAborted: 0,
-        result: { success: false, error: `All browsers failed to launch: ${err}` },
+        result: { success: false, error: `All browsers failed to launch: ${errMsg}` },
         durationMs: Date.now() - startTime,
+        attempts: [],
       };
     }
     if (launchFailures.length > 0) {
@@ -150,12 +186,15 @@ export async function runBlitz(
     let winningResult: BookingResult | undefined;
     let attempted = 0;
     let aborted = 0;
+    const outcomes: AttemptOutcome[] = [];
+    const failureShots: string[] = []; // screenshots from failed attempts (for diagnosis)
 
     const attemptPromises = warmBrowsers.map(async (wb: WarmBrowser | undefined, i: number) => {
       const attemptNum = i + 1;
       if (!wb) {
         console.log(`   Attempt #${attemptNum} skipped (browser warmup failed)`);
         aborted++;
+        outcomes.push({ attempt: attemptNum, status: 'skipped', error: 'browser warmup failed' });
         return;
       }
 
@@ -168,6 +207,7 @@ export async function runBlitz(
         if (signal.aborted) {
           aborted++;
           console.log(`   Attempt #${attemptNum} aborted before refresh`);
+          outcomes.push({ attempt: attemptNum, status: 'aborted', error: 'aborted before refresh' });
           return;
         }
 
@@ -181,6 +221,7 @@ export async function runBlitz(
 
         if (signal.aborted) {
           console.log(`   Attempt #${attemptNum} aborted after refresh`);
+          outcomes.push({ attempt: attemptNum, status: 'aborted', error: 'aborted after refresh' });
           return;
         }
 
@@ -191,12 +232,21 @@ export async function runBlitz(
           console.log(`\n🏆 Attempt #${attemptNum} SUCCEEDED — aborting others`);
           winningAttempt = attemptNum;
           winningResult = result;
+          outcomes.push({ attempt: attemptNum, status: 'success', bookedDate: result.bookedDate, bookedTime: result.bookedTime });
           abortController.abort();
-        } else if (!result.success && !signal.aborted) {
-          console.log(`   Attempt #${attemptNum} failed: ${result.error}`);
+        } else {
+          const status: AttemptOutcome['status'] = signal.aborted ? 'aborted' : 'failed';
+          if (!signal.aborted) {
+            console.log(`   Attempt #${attemptNum} failed: ${result.error}`);
+            // Keep this attempt's failure screenshot(s) for post-run diagnosis
+            if (result.screenshots?.length) failureShots.push(...result.screenshots);
+          }
+          outcomes.push({ attempt: attemptNum, status, error: result.error, bookedDate: result.bookedDate, bookedTime: result.bookedTime });
         }
       } catch (err) {
-        console.error(`   Attempt #${attemptNum} crashed:`, err instanceof Error ? err.message : err);
+        const error = err instanceof Error ? err.message : String(err);
+        console.error(`   Attempt #${attemptNum} crashed:`, error);
+        outcomes.push({ attempt: attemptNum, status: 'crashed', error });
       }
     });
 
@@ -208,6 +258,7 @@ export async function runBlitz(
     }
 
     const durationMs = Date.now() - startTime;
+    outcomes.sort((a, b) => a.attempt - b.attempt);
 
     if (winningResult) {
       console.log(`\n⚡ Blitz complete: attempt #${winningAttempt} won in ${Math.round(durationMs / 1000)}s`);
@@ -218,16 +269,24 @@ export async function runBlitz(
         totalAborted: aborted,
         result: winningResult,
         durationMs,
+        attempts: outcomes,
       };
     }
 
-    console.log(`\n⚡ Blitz complete: all ${attempted} attempts failed`);
+    const summary = summarizeFailures(outcomes);
+    console.log(`\n⚡ Blitz complete: all ${attempted} attempts failed — ${summary}`);
     return {
       success: false,
       totalAttempted: attempted,
       totalAborted: aborted,
-      result: { success: false, error: `All ${attempted} blitz attempts failed` },
+      // Surface WHY each attempt failed (grouped) + a few failure screenshots, capped to bound memory.
+      result: {
+        success: false,
+        error: `All ${attempted || n} blitz attempts failed — ${summary}`,
+        screenshots: failureShots.slice(0, 3),
+      },
       durationMs,
+      attempts: outcomes,
     };
 
   } finally {
@@ -259,6 +318,8 @@ async function runBookingFromPage(
     try {
       await page.waitForSelector('.ConsumerCalendar', { state: 'visible', timeout: 15000 });
     } catch {
+      const shot = await safeShot(page);
+      if (shot) screenshots.push(shot);
       return { success: false, error: 'Calendar did not load after refresh', screenshots };
     }
 
@@ -272,6 +333,8 @@ async function runBookingFromPage(
 
     const datesToTry = req.dates.filter(d => availableDates.includes(d));
     if (datesToTry.length === 0) {
+      const shot = await safeShot(page);
+      if (shot) screenshots.push(shot);
       return { success: false, error: `No dates available. Found: ${availableDates.join(', ') || 'none'}`, screenshots };
     }
 
@@ -334,6 +397,8 @@ async function runBookingFromPage(
     }
 
     if (!bookedDate) {
+      const shot = await safeShot(page);
+      if (shot) screenshots.push(shot);
       return { success: false, error: 'No time slots found on any date', screenshots };
     }
 
@@ -356,6 +421,8 @@ async function runBookingFromPage(
 
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
+    const shot = await safeShot(page);
+    if (shot) screenshots.push(shot);
     return { success: false, error, screenshots };
   }
 }

@@ -1,7 +1,7 @@
 import cron from 'node-cron';
 import { EventEmitter } from 'events';
 import { runBooking, BookingRequest } from './booker';
-import { BlitzConfig, runBlitz } from './blitz';
+import { BlitzConfig, runBlitz, AttemptOutcome } from './blitz';
 import { notifyResult } from './notify';
 
 export const schedulerEvents = new EventEmitter();
@@ -25,7 +25,15 @@ export interface BookingHistoryEntry {
   screenshots?: string[];
   ranAt: string;         // ISO timestamp
   source: 'manual' | 'scheduled';
-  blitzMeta?: { winningAttempt?: number; totalAttempted?: number };
+  blitzMeta?: BlitzMeta;
+}
+
+export interface BlitzMeta {
+  winningAttempt?: number;
+  totalAttempted?: number;
+  totalAborted?: number;
+  durationMs?: number;
+  attempts?: AttemptOutcome[]; // per-attempt outcomes (why each one failed)
 }
 
 interface Stoppable { stop(): void; }
@@ -60,7 +68,7 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
     console.log(`\n⏰ Triggered: ${booking.label || booking.restaurant}`);
 
     let result: import('./booker').BookingResult;
-    let blitzMeta: { winningAttempt?: number; totalAttempted?: number } | undefined;
+    let blitzMeta: BlitzMeta | undefined;
 
     if (booking.blitz && booking.blitz.attempts > 1) {
       const blitzResult = await runBlitz(booking, booking.blitz, booking.runAt);
@@ -68,6 +76,9 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       blitzMeta = {
         winningAttempt: blitzResult.winningAttempt,
         totalAttempted: blitzResult.totalAttempted,
+        totalAborted: blitzResult.totalAborted,
+        durationMs: blitzResult.durationMs,
+        attempts: blitzResult.attempts,
       };
     } else {
       result = await runBooking(booking);
