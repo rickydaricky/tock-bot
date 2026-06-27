@@ -42,12 +42,12 @@ Per browser, an in-page `fetch` loop hitting the discovered availability endpoin
 ### 4.3 Single-winner lock
 An in-process compare-and-set flag. The first poll loop to find a matching slot atomically claims the grab; all other loops stop immediately. **Critical** — without it, multiple pollers could grab/buy duplicate reservations (double-booking, double-charge).
 
-### 4.4 Grab (direct Book-call preferred, DOM-click fallback)
-On winning the lock:
-- **Preferred:** fire the Book/cart-hold call as an **in-page `fetch`** from the warmed browser, using the offer/slot identifier from the availability response. Browser supplies cookies/headers/CSRF → no auth reverse-engineering, lower detection than a raw server request.
-- **Fallback:** if the direct call is rejected or its shape is unknown, click the real Book button in the DOM. This path also folds in the disabled-button fix (wait for the button to be *enabled* / filter `:not([disabled])` instead of hammering a disabled button for 30 s).
+### 4.4 Grab (reload-on-hit DOM-click default; direct Book-call as pending optimization)
+**Revised after offline recon (`2026-06-26-tock-api-recon.md`).** Tock uses a LOCK(hold)→PURCHASE model; the lock (Book) call **may be gated by Cloudflare Turnstile** and may require a server-issued slot id — both unconfirmed, and either would defeat a raw direct call. Purchase is cross-origin Stripe/Braintree (browser-bound). So:
+- **Default (reliable): reload-on-hit + DOM-click.** The poller detects via in-page `fetch` (fast). On a match, the winner **reloads the page once** (so the DOM renders the live slot), then clicks the now-visible Book button — `[data-testid="booking-card-button"]` / `offering-book-button_*`, waiting for it to be **enabled** (folds in the disabled-button-hang fix). Turnstile is already satisfied by the live page. This still fixes the timing problem: we pay the reload cost **once, precisely when a slot is known to exist**, instead of reloading blindly 5×.
+- **Optimization (pending live recon): direct in-page lock-call.** If the live capture (§8) shows the lock endpoint accepts a same-origin in-page `fetch` without a Turnstile token and using only known IDs, the winner fires that directly (skipping the reload), guarded by try/catch with automatic fallback to reload-on-hit. Cookie auth for `/api/consumer/*` is already proven (`session.ts`).
 
-The exact Book request (URL, method, payload, which IDs) is captured in **implementation step 1 (recon)**; until then the fallback is the active grab. Offline recon of saved `tock-*.html` pages seeds this; a one-time live capture finalizes it.
+Purchase always runs through the browser via `handlePurchaseFlow` (Stripe/Braintree iframes can't be cleanly replayed).
 
 ### 4.5 Purchase
 Blind full-auto: reuse `handlePurchaseFlow` (add-ons → gratuity → consent → saved-card CVC / Stripe → purchase) with `dryRun=false`. No match/price gating (owner's explicit choice). An optional `maxPrice` guard is left as a one-line hook in config, default off.
