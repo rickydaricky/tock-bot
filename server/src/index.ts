@@ -3,6 +3,8 @@ import path from 'path';
 import crypto from 'crypto';
 import { runBooking, BookingRequest } from './booker';
 import { runBlitz, BlitzConfig } from './blitz';
+import { runSniper, SniperConfig } from './sniper';
+import { listSessions, sessionScreenshot, applyAction } from './sessions';
 import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, deleteHistoryEntry, clearHistory, ScheduledBooking, schedulerEvents, BookingHistoryEntry } from './scheduler';
 import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
@@ -168,7 +170,13 @@ app.post('/api/blitz', requireAuth, async (req, res) => {
       screenshots: result.result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'manual' as const,
-      blitzMeta: { winningAttempt: result.winningAttempt, totalAttempted: result.totalAttempted },
+      blitzMeta: {
+        winningAttempt: result.winningAttempt,
+        totalAttempted: result.totalAttempted,
+        totalAborted: result.totalAborted,
+        durationMs: result.durationMs,
+        attempts: result.attempts,
+      },
     };
     addToHistory(entry);
     schedulerEvents.emit('booking-result', entry);
@@ -237,6 +245,59 @@ app.get('/api/history/:id/screenshot/:index', requireAuth, (req, res) => {
   const buf = Buffer.from(entry.screenshots[idx], 'base64');
   res.setHeader('Content-Type', 'image/png');
   res.send(buf);
+});
+
+// --- Sniper (high-frequency drop capture) ---
+
+app.post('/api/sniper', requireAuth, async (req, res) => {
+  const { sniper, ...bk } = req.body;
+  if (!bk.restaurant || !bk.dates?.length || !bk.time || !bk.partySize) {
+    return res.status(400).json({ success: false, error: 'Missing required fields: restaurant, dates, time, partySize' });
+  }
+  const cfg: SniperConfig = {
+    pool: Math.min(Math.max(sniper?.pool ?? 5, 1), 6),
+    pollIntervalMs: sniper?.pollIntervalMs ?? 200,
+    windowStartMs: sniper?.windowStartMs ?? -1000,
+    windowEndMs: sniper?.windowEndMs ?? 10000,
+  };
+  try {
+    const result = await runSniper(bk, cfg, sniper?.runAt);
+    const entry = {
+      id: crypto.randomUUID(),
+      restaurant: bk.restaurant,
+      date: result.bookedDate,
+      time: result.bookedTime,
+      success: result.success,
+      error: result.error,
+      screenshots: result.screenshots,
+      ranAt: new Date().toISOString(),
+      source: 'manual' as const,
+    };
+    addToHistory(entry);
+    schedulerEvents.emit('booking-result', entry);
+    await notifyResult(bk.restaurant, result);
+    res.json(result);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    console.error('❌ Sniper endpoint error:', error);
+    res.status(500).json({ success: false, error: `Sniper failed: ${error}` });
+  }
+});
+
+// --- Frozen recovery sessions ---
+
+app.get('/api/sessions', requireAuth, (_req, res) => res.json(listSessions()));
+
+app.get('/api/sessions/:id/screenshot', requireAuth, async (req, res) => {
+  const b64 = await sessionScreenshot(req.params.id);
+  if (!b64) { res.status(404).json({ error: 'Session or screenshot not found' }); return; }
+  res.setHeader('Content-Type', 'image/png');
+  res.send(Buffer.from(b64, 'base64'));
+});
+
+app.post('/api/sessions/:id/action', requireAuth, async (req, res) => {
+  const { action, value } = req.body ?? {};
+  res.json(await applyAction(req.params.id, action, value));
 });
 
 // --- Cookies ---
