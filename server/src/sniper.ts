@@ -106,46 +106,35 @@ function searchUrlFor(req: BookingRequest, date: string): string {
   return `https://www.exploretock.com/${req.restaurant}/search?date=${date}&size=${req.partySize}&time=${encodeURIComponent(req.time)}`;
 }
 
-/** Fetch the search page HTML from inside the page's authenticated context, extract
- *  the embedded `window.$REDUX_STATE`, and return `calendar.offerings`. Live recon
- *  (2026-06-27) confirmed there is NO JSON availability endpoint — availability is
- *  server-rendered into the page, so polling means re-fetching this HTML. Returns the
- *  offerings object (possibly `{}` when the calendar is legitimately empty),
- *  `{ __status }` on a non-OK response, `{ __noState: true }` when the embedded state
- *  can't be located/parsed (e.g. a Cloudflare challenge or a Tock layout change), or
- *  null only on a genuine network/in-page fetch error. Network and parse failures are
- *  kept distinct so the operator isn't pointed at the network for a layout change. */
+/** Load the search page and read `calendar.offerings` from the live Redux store.
+ *  Live recon (2026-06-27): there is NO JSON availability endpoint, and the embedded
+ *  `$REDUX_STATE` is a JS object literal (contains `undefined`), so `JSON.parse` on it
+ *  fails. Instead we navigate (which Tock/Cloudflare allow — confirmed on Railway via
+ *  /api/diag: store hydrates, offerings present) and read `window.store.getState()`.
+ *  Returns the offerings object (possibly `{}` when the calendar is empty), null on a
+ *  navigation failure, or `{ __noState: true }` if the store never hydrated (challenge
+ *  page or a very slow load). Heavier than a raw fetch but correct and proven. */
 async function fetchOfferings(page: Page, url: string): Promise<any> {
-  return page.evaluate(async (u: string) => {
-    let html: string;
-    try {
-      const r = await fetch(u, { credentials: 'include' });
-      if (!r.ok) return { __status: r.status };
-      html = await r.text();
-    } catch { return null; } // genuine network / in-page fetch failure ONLY
-    try {
-      // Tolerant marker (handles minified `$REDUX_STATE=` and spacing variants).
-      const m = html.match(/\$REDUX_STATE\s*=\s*/);
-      if (!m || m.index === undefined) return { __noState: true };
-      const i = m.index + m[0].length;
-      if (html[i] !== '{') return { __noState: true };
-      // Brace-match the JSON object (string-aware) to find where it ends.
-      let depth = 0, inStr = false, esc = false, end = -1;
-      for (let j = i; j < html.length; j++) {
-        const c = html[j];
-        if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; }
-        else if (c === '"') inStr = true;
-        else if (c === '{') depth++;
-        else if (c === '}') { if (--depth === 0) { end = j + 1; break; } }
-      }
-      if (end < 0) return { __noState: true };
-      const state = JSON.parse(html.slice(i, end));
-      // `offerings` present-but-empty (null/{}) is a valid "nothing yet" state — return {}
-      // (parseAvailability yields []). Only a missing key is a real parse anomaly.
-      if (!state.calendar || !('offerings' in state.calendar)) return { __noState: true };
-      return state.calendar.offerings ?? {};
-    } catch { return { __noState: true }; } // parse / layout failure — NOT a network error
-  }, url);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  } catch {
+    return null; // navigation failed (network / timeout)
+  }
+  try {
+    await page.waitForFunction(
+      () => !!((globalThis as any).window?.store?.getState),
+      { timeout: 12000 },
+    );
+  } catch {
+    return { __noState: true }; // never hydrated — challenge page or too slow
+  }
+  return page.evaluate(() => {
+    const st = (globalThis as any).window.store.getState();
+    // `offerings` present-but-empty is a valid "nothing yet" state (parseAvailability → []).
+    // Only a missing key is a real anomaly.
+    if (!st?.calendar || !('offerings' in st.calendar)) return { __noState: true };
+    return st.calendar.offerings ?? {};
+  });
 }
 
 export type GrabResult = { ok: true } | { ok: false; reason: string };
@@ -266,20 +255,19 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
 
         // `<=` so the loop whose start offset equals windowEnd still polls once.
         while (Date.now() <= windowEnd && !lock.won) {
-          const slots: NormalizedSlot[] = [];
+          let slots: NormalizedSlot[] = [];
           let lastErr = '';
-          // Poll EVERY requested date (priority order). Each poll re-fetches the search
-          // HTML and reads calendar.offerings (no JSON endpoint exists — see recon).
-          // Per-date, non-session errors `continue` so one bad date doesn't skip the rest.
-          for (const d of req.dates) {
-            const offerings = await fetchOfferings(w.page, searchUrlFor(req, d));
-            if (offerings == null) { lastErr = 'availability fetch failed (network/in-page error)'; continue; }
-            if (offerings.__status === 401) { lastErr = 'session expired (401)'; outcomes.push({ attempt: i + 1, status: 'failed', error: lastErr }); return; } // session dead — stop this browser
-            if (offerings.__status === 429) { lastErr = 'throttled (429)'; await sleep(cfg.pollIntervalMs * 3); continue; }
-            if (typeof offerings.__status === 'number') { lastErr = `availability HTTP ${offerings.__status}`; continue; } // 403 anti-bot, 5xx
-            if (offerings.__noState) { lastErr = 'could not parse availability (challenge or layout change)'; continue; }
+          // One navigation per poll: the store's calendar.offerings carries the WHOLE
+          // calendar (openDate spans ~3 months), so a single load covers every requested
+          // date. We then check each req.date against it below.
+          const offerings = await fetchOfferings(w.page, searchUrlFor(req, req.dates[0]));
+          if (offerings == null) {
+            lastErr = 'page navigation failed (network/timeout)';
+          } else if (offerings.__noState) {
+            lastErr = 'page did not hydrate (challenge or slow load)';
+          } else {
             readablePolls++;
-            slots.push(...parseAvailability(offerings, req.partySize));
+            slots = parseAvailability(offerings, req.partySize);
           }
           pollTotal++;
 

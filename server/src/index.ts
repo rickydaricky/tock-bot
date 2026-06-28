@@ -302,41 +302,6 @@ app.post('/api/sessions/:id/action', requireAuth, async (req, res) => {
   res.json(await applyAction(req.params.id, action, value));
 });
 
-// --- TEMP diagnostic: does this host (Railway IP) get the real Tock page, or a Cloudflare challenge? ---
-app.get('/api/diag', requireAuth, async (_req, res) => {
-  const { chromium } = await import('playwright');
-  const { injectCookies } = await import('./cookies');
-  const { STEALTH_ARGS } = await import('./booker');
-  const url = 'https://www.exploretock.com/lazybearsf/search?date=2026-07-29&size=2&time=19:00';
-  let browser: import('playwright').Browser | undefined;
-  try {
-    browser = await chromium.launch({ headless: true, args: STEALTH_ARGS });
-    const ctx = await browser.newContext({ userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' });
-    const nCookies = await injectCookies(ctx);
-    const page = await ctx.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    let storeReady = false;
-    try { await page.waitForFunction(() => !!((globalThis as any).window?.store?.getState), { timeout: 10000 }); storeReady = true; } catch { /* not hydrated */ }
-    const navInfo = await page.evaluate(() => {
-      const st = (globalThis as any).window?.store?.getState?.();
-      const offs = st?.calendar?.offerings;
-      return { title: (globalThis as any).document?.title, hasStore: !!st, offeringsCount: offs?.experience?.length ?? null, bodyStart: ((globalThis as any).document?.body?.innerText || '').slice(0, 140).replace(/\s+/g, ' ') };
-    });
-    const fetchInfo = await page.evaluate(async (u: string) => {
-      try {
-        const r = await fetch(u, { credentials: 'include' });
-        const h = await r.text();
-        return { status: r.status, len: h.length, hasRedux: h.includes('$REDUX_STATE'), challenge: /just a moment|attention required|cf-chl|turnstile|cloudflare/i.test(h.slice(0, 3000)), sample: h.slice(0, 220).replace(/\s+/g, ' ') };
-      } catch (e) { return { error: String(e) }; }
-    }, url);
-    res.json({ nCookies, storeReady, navInfo, fetchInfo });
-  } catch (e) {
-    res.json({ error: e instanceof Error ? e.message : String(e) });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-});
-
 // --- Cookies ---
 
 app.get('/api/cookies/status', requireAuth, (_req, res) => {
