@@ -81,6 +81,7 @@ export interface SniperConfig {
   pollIntervalMs: number;  // per-loop poll cadence
   windowStartMs: number;   // offset vs runAt (e.g. -1000)
   windowEndMs: number;     // offset vs runAt (e.g. +10000)
+  dryRun?: boolean;        // rehearse: detect → grab → fill checkout, but DON'T click purchase
 }
 
 export interface SniperResult {
@@ -91,6 +92,7 @@ export interface SniperResult {
   screenshots?: string[];
   durationMs: number;
   pausedSessionId?: string;
+  dryRun?: boolean;        // true when this run rehearsed and did not purchase
   polls: { total: number; matched: number };
 }
 
@@ -317,29 +319,39 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       return { success: false, error: `No matching slot in window — ${summarizeFailures(outcomes)}`, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
     }
 
-    // --- Phase 3: grab + blind auto-purchase ---
+    // --- Phase 3: grab + purchase (or rehearse, if dryRun) ---
+    const dryRun = cfg.dryRun ?? false;
     const screenshots: string[] = [];
     const grab = await grabViaDom(winner.page, bookedDate, req.time);
     if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
-      return { success: false, bookedDate, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
+      return { success: false, bookedDate, dryRun, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
     }
     bookedTime = to12Hour(req.time);
 
+    // handlePurchaseFlow with dryRun=true fills the checkout (add-ons/gratuity/CVC) and
+    // stops BEFORE clicking purchase, capturing screenshots — a no-charge rehearsal.
     let purchased = false;
     try {
-      purchased = await handlePurchaseFlow(winner.page, false, screenshots);
+      purchased = await handlePurchaseFlow(winner.page, dryRun, screenshots);
     } catch (err) {
       outcomes.push({ attempt: 1, status: 'crashed', error: `purchase: ${err instanceof Error ? err.message : String(err)}` });
     }
 
     if (purchased) {
-      console.log(`\n🎉 Sniper purchased: ${bookedDate} ${bookedTime}`);
-      return { success: true, bookedDate, bookedTime, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
+      console.log(dryRun
+        ? `\n🧪 Sniper DRY RUN reached checkout (no purchase): ${bookedDate} ${bookedTime}`
+        : `\n🎉 Sniper purchased: ${bookedDate} ${bookedTime}`);
+      return { success: true, bookedDate, bookedTime, dryRun, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
     }
 
-    // Purchase failed: freeze the winning session for human recovery (slot still held ~10 min).
+    // A rehearsal that couldn't complete checkout is just a failed test — report it, don't freeze.
     const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
+    if (dryRun) {
+      return { success: false, bookedDate, bookedTime, dryRun: true, error: 'Dry run: grabbed the slot but the checkout flow did not complete', screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched } };
+    }
+
+    // Real purchase failed: freeze the winning session for human recovery (slot held ~10 min).
     frozenBrowser = winner.browser;
     const pausedSessionId = freezeSession({
       handle: { browser: winner.browser, page: winner.page },

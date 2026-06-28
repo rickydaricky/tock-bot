@@ -259,6 +259,7 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
     pollIntervalMs: sniper?.pollIntervalMs ?? 200,
     windowStartMs: sniper?.windowStartMs ?? -1000,
     windowEndMs: sniper?.windowEndMs ?? 10000,
+    dryRun: !!sniper?.dryRun,
   };
   try {
     const result = await runSniper(bk, cfg, sniper?.runAt);
@@ -268,7 +269,8 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
       date: result.bookedDate,
       time: result.bookedTime,
       success: result.success,
-      error: result.error,
+      // Make a rehearsal unmistakable in history (no charge happened).
+      error: result.dryRun ? `[DRY RUN] ${result.error ?? 'reached checkout, no purchase'}` : result.error,
       screenshots: result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'manual' as const,
