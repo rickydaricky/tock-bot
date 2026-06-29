@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { runBooking, BookingRequest } from './booker';
 import { runBlitz, BlitzConfig } from './blitz';
-import { runSniper, SniperConfig } from './sniper';
+import { runSniper, SniperConfig, validateSniperConfig } from './sniper';
 import { listSessions, sessionScreenshot, applyAction } from './sessions';
 import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, deleteHistoryEntry, clearHistory, ScheduledBooking, schedulerEvents, BookingHistoryEntry } from './scheduler';
@@ -260,7 +260,14 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
     windowStartMs: sniper?.windowStartMs ?? -1000,
     windowEndMs: sniper?.windowEndMs ?? 10000,
     dryRun: !!sniper?.dryRun,
+    timeWindowStart24: sniper?.timeWindowStart24,
+    timeWindowEnd24: sniper?.timeWindowEnd24,
+    maxPriceCents: sniper?.maxPriceCents,
   };
+  const cfgError = validateSniperConfig(cfg);
+  if (cfgError) {
+    return res.status(400).json({ success: false, error: cfgError });
+  }
   try {
     const result = await runSniper(bk, cfg, sniper?.runAt);
     const entry = {
