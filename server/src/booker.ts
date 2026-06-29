@@ -228,7 +228,31 @@ export async function runBooking(req: BookingRequest): Promise<BookingResult> {
   }
 }
 
-export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshots: string[]): Promise<boolean> {
+/** Parse the grand-total "Amount due $X" out of confirm-page text → cents.
+ *  - Requires a literal `$` directly after "Amount due" (allowing whitespace/colon), so a
+ *    "per person" line ("Amount due per person $125") does NOT match here and non-currency
+ *    text ("Amount due 50% deposit") can never false-match a bogus low number.
+ *  - Returns the LARGEST matching amount (the grand total is the biggest "Amount due $…").
+ *  - null when no dollar total is present — the caller treats null as fail-closed (abort). */
+export function parseAmountDueCents(text: string): number | null {
+  const matches = [...String(text).matchAll(/amount due\s*:?\s*\$\s*([\d,]+(?:\.\d{2})?)/gi)];
+  if (!matches.length) return null;
+  const cents = matches.map(m => Math.round(parseFloat(m[1].replace(/,/g, '')) * 100));
+  return Math.max(...cents);
+}
+
+/** Read the grand-total "Amount due" on the confirm page, in cents; null if unreadable. */
+async function readAmountDueCents(page: Page): Promise<number | null> {
+  try {
+    const txt: string = await page.evaluate(() => (globalThis as any).document?.body?.innerText || '');
+    return parseAmountDueCents(txt);
+  } catch (err) {
+    console.error('❌ readAmountDueCents failed:', err instanceof Error ? err.message : String(err));
+    return null;
+  }
+}
+
+export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshots: string[], maxPriceCents?: number): Promise<boolean> {
   console.log('🛒 Starting purchase flow...');
   await page.waitForTimeout(1000);
 
@@ -261,7 +285,7 @@ export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshot
     const purchaseBtn = await page.$('[data-testid="purchase-button"]');
     if (purchaseBtn) {
       console.log('💳 Purchase confirmation page detected');
-      return await handlePurchaseConfirmation(page, dryRun, screenshots);
+      return await handlePurchaseConfirmation(page, dryRun, screenshots, maxPriceCents);
     }
 
     await page.waitForTimeout(300);
@@ -271,7 +295,7 @@ export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshot
   return false;
 }
 
-async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screenshots: string[]): Promise<boolean> {
+async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screenshots: string[], maxPriceCents?: number): Promise<boolean> {
   // Gratuity — select "No gratuity" if present
   const gratuityBtn = await page.$('[data-testid="gratuity-button-zero"]');
   if (gratuityBtn) {
@@ -362,6 +386,24 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
       screenshots.push(await takeScreenshot(page));
       return false;
     }
+  }
+
+  // Price cap (TOTAL amount due, the authoritative overspend guard): never purchase (or
+  // "succeed" a dry run) if the actual grand-total amount due exceeds the cap. If a cap is
+  // set but the amount can't be read, abort to be safe — don't buy blind.
+  if (maxPriceCents != null) {
+    const dueCents = await readAmountDueCents(page);
+    if (dueCents == null) {
+      console.log('🛑 Price cap set but could not read amount due — aborting (no blind purchase)');
+      screenshots.push(await takeScreenshot(page));
+      return false;
+    }
+    if (dueCents > maxPriceCents) {
+      console.log(`🛑 Amount due $${(dueCents / 100).toFixed(2)} exceeds cap $${(maxPriceCents / 100).toFixed(2)} — aborting purchase`);
+      screenshots.push(await takeScreenshot(page));
+      return false;
+    }
+    console.log(`💵 Amount due $${(dueCents / 100).toFixed(2)} is within cap $${(maxPriceCents / 100).toFixed(2)}`);
   }
 
   if (dryRun) {
