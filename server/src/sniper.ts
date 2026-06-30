@@ -148,6 +148,8 @@ export interface SniperConfig {
   maxPriceCents?: number;     // hard cap on the *total* (per-person × party + fees/tax): soft
                               // pre-filter in detection, and abort purchase if the actual
                               // "Amount due" exceeds it. Omit for no cap.
+  fastPoll?: boolean;         // use the in-page-fetch fast read path (default true). Set false
+                              // to force the slower navigate path (A/B or if fast is throttled).
 }
 
 /** Validate a sniper config's money/time fields BEFORE warming any browser. Returns an
@@ -186,7 +188,9 @@ export interface SniperResult {
   durationMs: number;
   pausedSessionId?: string;
   dryRun?: boolean;        // true when this run rehearsed and did not purchase
-  polls: { total: number; matched: number };
+  // `fast`/`nav` = polls served by the fast in-page-fetch vs the navigate fallback;
+  // `challenges` = polls where the fast fetch hit a Cloudflare challenge (throttle signal).
+  polls: { total: number; matched: number; fast?: number; nav?: number; challenges?: number };
   seen?: SniperSeen;       // instrumentation: what availability the bot observed
 }
 
@@ -200,6 +204,119 @@ function searchUrlFor(req: BookingRequest, date: string): string {
   return `https://www.exploretock.com/${req.restaurant}/search?date=${date}&size=${req.partySize}&time=${encodeURIComponent(req.time)}`;
 }
 
+/** String-aware scan for the index of the brace that closes the object opening at the first
+ *  `{` at/after `openIdx`. Braces inside double/single-quoted strings are ignored, so nested
+ *  objects and braces-in-strings don't truncate the match. Returns -1 if unbalanced. */
+function matchObjectEnd(s: string, openIdx: number): number {
+  let depth = 0, inStr = false, q = '', esc = false;
+  for (let k = openIdx; k < s.length; k++) {
+    const c = s[k];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === q) inStr = false;
+    } else if (c === '"' || c === "'") { inStr = true; q = c; }
+    else if (c === '{') depth++;
+    else if (c === '}') { if (--depth === 0) return k; }
+  }
+  return -1;
+}
+
+/** Replace value-position `undefined` (outside strings) with `null`, turning a JS-literal
+ *  subtree into valid JSON. Tock's `offerings` subtree contains bare `undefined` (68 of them
+ *  in a live sample) but — unlike the wider $REDUX_STATE — NO functions, so this normalization
+ *  + JSON.parse is sufficient and needs no eval. String-aware so an `undefined` inside a quoted
+ *  value (none observed, but cheap insurance) is never touched. */
+function jsUndefinedToNull(sub: string): string {
+  let out = '', inStr = false, q = '', esc = false;
+  for (let i = 0; i < sub.length; i++) {
+    const c = sub[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === q) inStr = false;
+    } else if (c === '"' || c === "'") { inStr = true; q = c; out += c; }
+    else if (sub.startsWith('undefined', i)) { out += 'null'; i += 'undefined'.length - 1; }
+    else out += c;
+  }
+  return out;
+}
+
+/** FAST availability parse: surgically pull just the `"offerings":{…}` subtree out of the
+ *  embedded `$REDUX_STATE` JS literal in a Tock search page's HTML and JSON-parse it. The full
+ *  literal can't be JSON.parsed — it embeds functions (e.g. `"onClose":function…`), which is
+ *  why the original poller navigated + read `window.store` instead. But the offerings subtree
+ *  is pure availability data, so extracting just it (anchored after `"calendar":`) and
+ *  normalizing `undefined`→`null` parses cleanly. CSP-safe (no eval) and pure (unit-tested).
+ *  Returns the offerings object (possibly `{}`), or null if the marker/subtree is absent or
+ *  unparseable (caller falls back to the navigate path). */
+export function extractOfferingsFromHtml(html: string): any | null {
+  const mi = html.indexOf('$REDUX_STATE');
+  if (mi < 0) return null;
+  const litStart = html.indexOf('{', html.indexOf('=', mi));
+  if (litStart < 0) return null;
+  const litEnd = matchObjectEnd(html, litStart);
+  if (litEnd < 0) return null;
+  const lit = html.slice(litStart, litEnd + 1);
+  const calIdx = lit.indexOf('"calendar":');           // anchor so we get calendar.offerings
+  const oi = lit.indexOf('"offerings":', calIdx >= 0 ? calIdx : 0);
+  if (oi < 0) return null;
+  const os = lit.indexOf('{', oi);
+  if (os < 0) return null;
+  const oe = matchObjectEnd(lit, os);
+  if (oe < 0) return null;
+  try {
+    return JSON.parse(jsUndefinedToNull(lit.slice(os, oe + 1)));
+  } catch {
+    return null;
+  }
+}
+
+/** FAST offerings read: from a WARM (already Cloudflare-cleared) page, do a same-origin in-page
+ *  `fetch` of the search HTML — it carries cf_clearance so Cloudflare serves the real page (no
+ *  new challenge, confirmed live) — and parse the offerings subtree. ~3-4× faster than a full
+ *  navigation (skips the document lifecycle + hydration): ~0.5s vs ~1.9s/poll. Returns the
+ *  offerings object, `{ __challenge: true }` if Cloudflare served a challenge, `{ __noState:
+ *  true }` if the offerings couldn't be parsed, or null if the fetch threw. */
+async function fetchOfferingsFast(page: Page, url: string): Promise<any> {
+  let html: string | null;
+  try {
+    html = await page.evaluate(async (u) => {
+      const r = await fetch(u, { credentials: 'include' });
+      return await r.text();
+    }, url);
+  } catch {
+    return null; // fetch threw in-page (navigated away / network)
+  }
+  if (!html) return null;
+  if (/just a moment|challenge-platform|cf-chl|_cf_chl/i.test(html)) return { __challenge: true };
+  return extractOfferingsFromHtml(html) ?? { __noState: true };
+}
+
+interface FastState { useFast: boolean; fastFails: number; }
+interface PathStats { fast: number; nav: number; challenges: number; }
+
+/** One availability read: try the FAST in-page-fetch path first; on any non-offerings result
+ *  (challenge / unparseable / threw) fall back to the proven navigate path for THIS poll (so no
+ *  poll is wasted) and, after 2 consecutive fast misses, latch fast off for the rest of this
+ *  loop (avoid paying fetch+navigate every poll). Never regresses below the navigate path. */
+async function readOfferings(page: Page, url: string, st: FastState, stats: PathStats): Promise<any> {
+  if (st.useFast) {
+    const fast = await fetchOfferingsFast(page, url);
+    if (fast && fast.__challenge) { stats.challenges++; st.fastFails++; }
+    else if (fast != null && !fast.__noState) { stats.fast++; st.fastFails = 0; return fast; }
+    else { st.fastFails++; }
+    if (st.useFast && st.fastFails >= 2) {
+      st.useFast = false;
+      console.warn('   ⚠️ fast poll path disabled (2 consecutive misses) — using navigate fallback');
+    }
+  }
+  const nav = await fetchOfferingsViaNavigate(page, url);
+  stats.nav++;
+  return nav;
+}
+
 /** Load the search page and read `calendar.offerings` from the live Redux store.
  *  Live recon (2026-06-27): there is NO JSON availability endpoint, and the embedded
  *  `$REDUX_STATE` is a JS object literal (contains `undefined`), so `JSON.parse` on it
@@ -207,8 +324,9 @@ function searchUrlFor(req: BookingRequest, date: string): string {
  *  /api/diag: store hydrates, offerings present) and read `window.store.getState()`.
  *  Returns the offerings object (possibly `{}` when the calendar is empty), null on a
  *  navigation failure, or `{ __noState: true }` if the store never hydrated (challenge
- *  page or a very slow load). Heavier than a raw fetch but correct and proven. */
-async function fetchOfferings(page: Page, url: string): Promise<any> {
+ *  page or a very slow load). Heavier than a raw fetch but correct and proven — used as
+ *  the FALLBACK when the fast in-page-fetch path (fetchOfferingsFast) can't parse. */
+async function fetchOfferingsViaNavigate(page: Page, url: string): Promise<any> {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   } catch {
@@ -309,6 +427,9 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
   let pollTotal = 0;
   let pollMatched = 0;
   let frozenBrowser: Browser | undefined;
+  // Fast-vs-navigate poll accounting (speed + Cloudflare-throttle visibility).
+  const pathStats: PathStats = { fast: 0, nav: 0, challenges: 0 };
+  const pollStats = () => ({ total: pollTotal, matched: pollMatched, fast: pathStats.fast, nav: pathStats.nav, challenges: pathStats.challenges });
 
   // --- instrumentation: what the bot actually saw (so a miss is never a black box) ---
   const seenDates = new Set<string>();
@@ -365,6 +486,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
 
     const loops = live.map(async (w, i) => {
       let readablePolls = 0; // dates that returned parseable offerings — distinguishes "sold out" from "blocked"
+      const fastState: FastState = { useFast: cfg.fastPoll !== false, fastFails: 0 };
       try {
         const startAt = base + offsets[i];
         const waitMs = startAt - Date.now();
@@ -374,10 +496,10 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         while (Date.now() <= windowEnd && !lock.won) {
           let slots: NormalizedSlot[] = [];
           let lastErr = '';
-          // One navigation per poll: the store's calendar.offerings carries the WHOLE
-          // calendar (openDate spans ~3 months), so a single load covers every requested
-          // date. We then check each req.date against it below.
-          const offerings = await fetchOfferings(w.page, searchUrlFor(req, req.dates[0]));
+          // One read per poll: calendar.offerings carries the WHOLE calendar (openDate spans
+          // ~3 months), so a single fetch covers every requested date. Fast in-page-fetch path
+          // first, navigate fallback on miss. We then check each req.date against it below.
+          const offerings = await readOfferings(w.page, searchUrlFor(req, req.dates[0]), fastState, pathStats);
           if (offerings == null) {
             lastErr = 'page navigation failed (network/timeout)';
           } else if (offerings.__noState) {
@@ -442,7 +564,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         ? `requested date was bookable but no time matched (window ${cfg.timeWindowStart24 ?? 'any'}–${cfg.timeWindowEnd24 ?? 'any'}); times seen on target date: [${seen.targetDateTimes.join(', ') || 'none'}]`
         : 'requested date never became bookable in the window';
       console.log(`\n❌ Sniper no match — ${why}`);
-      return { success: false, error: `No matching slot in window — ${why} · ${summarizeFailures(outcomes)}`, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched }, seen, screenshots: shot ? [shot] : undefined };
+      return { success: false, error: `No matching slot in window — ${why} · ${summarizeFailures(outcomes)}`, durationMs: durationMs(), polls: pollStats(), seen, screenshots: shot ? [shot] : undefined };
     }
 
     // --- Phase 3: grab + purchase (or rehearse, if dryRun) ---
@@ -451,7 +573,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     const grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24);
     if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
-      return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched }, seen };
+      return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
     }
     bookedTime = winnerSlot.time12;
 
@@ -473,13 +595,13 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       console.log(dryRun
         ? `\n🧪 Sniper DRY RUN reached checkout (no purchase): ${bookedDate} ${bookedTime}`
         : `\n🎉 Sniper purchased: ${bookedDate} ${bookedTime}`);
-      return { success: true, bookedDate, bookedTime, dryRun, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched }, seen };
+      return { success: true, bookedDate, bookedTime, dryRun, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
     }
 
     // A rehearsal (or a price-capped/failed checkout) didn't complete — report it, don't freeze.
     const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
     if (dryRun) {
-      return { success: false, bookedDate, bookedTime, dryRun: true, error: `Dry run: grabbed the slot but checkout did not complete${purchaseErr ? ' — ' + purchaseErr : ''}`, screenshots, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched }, seen };
+      return { success: false, bookedDate, bookedTime, dryRun: true, error: `Dry run: grabbed the slot but checkout did not complete${purchaseErr ? ' — ' + purchaseErr : ''}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
     }
 
     // Real purchase failed: freeze the winning session for human recovery (slot held ~10 min).
@@ -490,10 +612,10 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       error: 'purchase failed after grab',
     });
     console.log(`\n⚠️ Sniper grabbed but purchase failed — session frozen (${pausedSessionId})`);
-    return { success: false, bookedDate, bookedTime, error: 'Grabbed the slot but purchase failed — session frozen for recovery', screenshots, pausedSessionId, durationMs: durationMs(), polls: { total: pollTotal, matched: pollMatched }, seen };
+    return { success: false, bookedDate, bookedTime, error: 'Grabbed the slot but purchase failed — session frozen for recovery', screenshots, pausedSessionId, durationMs: durationMs(), polls: pollStats(), seen };
 
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startTime, polls: { total: pollTotal, matched: pollMatched } };
+    return { success: false, error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startTime, polls: pollStats() };
   } finally {
     // Close every browser EXCEPT the one handed off to a frozen session.
     await Promise.allSettled(warm.map(w => (w && w.browser !== frozenBrowser) ? w.browser.close() : Promise.resolve()));
