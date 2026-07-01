@@ -2,7 +2,7 @@ import cron from 'node-cron';
 import { EventEmitter } from 'events';
 import { runBooking, BookingRequest } from './booker';
 import { BlitzConfig, runBlitz, AttemptOutcome } from './blitz';
-import { runSniper, SniperConfig } from './sniper';
+import { runSniper, SniperConfig, SniperResult, SniperSeen } from './sniper';
 import { notifyResult } from './notify';
 
 export const schedulerEvents = new EventEmitter();
@@ -28,6 +28,16 @@ export interface BookingHistoryEntry {
   ranAt: string;         // ISO timestamp
   source: 'manual' | 'scheduled';
   blitzMeta?: BlitzMeta;
+  sniperMeta?: SniperMeta;
+}
+
+/** Structured sniper diagnostics attached to the history entry, so a miss is inspectable
+ *  from the dashboard/API without console access. History is in-memory like the logs —
+ *  this doesn't survive a deploy restart, it just makes the data queryable while it lives. */
+export interface SniperMeta {
+  polls?: SniperResult['polls'];
+  seen?: SniperSeen;
+  durationMs?: number;
 }
 
 export interface BlitzMeta {
@@ -71,9 +81,12 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
 
     let result: import('./booker').BookingResult;
     let blitzMeta: BlitzMeta | undefined;
+    let sniperMeta: SniperMeta | undefined;
 
     if (booking.sniper) {
-      result = await runSniper(booking, booking.sniper, booking.runAt);
+      const sniperResult = await runSniper(booking, booking.sniper, booking.runAt);
+      result = sniperResult;
+      sniperMeta = { polls: sniperResult.polls, seen: sniperResult.seen, durationMs: sniperResult.durationMs };
     } else if (booking.blitz && booking.blitz.attempts > 1) {
       const blitzResult = await runBlitz(booking, booking.blitz, booking.runAt);
       result = blitzResult.result;
@@ -99,6 +112,7 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       ranAt: new Date().toISOString(),
       source: 'scheduled',
       blitzMeta,
+      sniperMeta,
     };
     bookingHistory.unshift(entry);
     schedulerEvents.emit('booking-result', entry);
