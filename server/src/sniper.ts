@@ -200,6 +200,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function searchUrlFor(req: BookingRequest, date: string): string {
   return `https://www.exploretock.com/${req.restaurant}/search?date=${date}&size=${req.partySize}&time=${encodeURIComponent(req.time)}`;
 }
@@ -351,6 +355,71 @@ async function fetchOfferingsViaNavigate(page: Page, url: string): Promise<any> 
 
 export type GrabResult = { ok: true } | { ok: false; reason: string };
 
+/** Walk up from a button to the nearest ancestor whose text contains a slot time, and
+ *  return that time (e.g. "7:00 PM"). Stopping at the NEAREST time-bearing ancestor is
+ *  what scopes a button to its own card — higher containers hold every card's times and
+ *  would match the first card on the page instead.
+ *  Serialized into the page by evaluate(): must stay self-contained (no outer references). */
+export function nearestTimeText(el: any): string {
+  let node = el;
+  for (let i = 0; i < 10; i++) {
+    node = node?.parentElement || null;
+    if (!node) break;
+    const m = (node.textContent || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    if (m) return m[0];
+  }
+  return '';
+}
+
+/** Multi-seating experiences don't navigate on Book: the card expands a "Select a seating
+ *  option" chooser in place, and every time card on the page expands at once (Tock redux
+ *  field `experience.seatingArea`, observed live 2026-07: JouJou non-empty → chooser,
+ *  FHH [] → direct book). Click the option scoped to OUR time, or a neighboring card's
+ *  option would book the wrong slot. Direct-book restaurants render no seating-area
+ *  buttons, so this only costs them the settle sleep (overlapping checkout navigation). */
+export async function clickSeatingAreaForTime(page: Page, time24: string): Promise<GrabResult> {
+  const want = to12Hour(time24).toLowerCase();
+
+  // Phase 1: settle + query. A throw HERE is plausibly the direct-book flow racing to
+  // checkout (execution context destroyed mid-navigation) — treat as success, but say so:
+  // handlePurchaseFlow fails loudly right after if the page actually died.
+  let areas;
+  try {
+    await sleep(700); // let the accordion (or checkout navigation) render
+    areas = await page.$$('[data-testid^="seating-area-"]');
+  } catch (err) {
+    console.log(`   🪑 seating-area query threw (${errMsg(err)}) — assuming checkout navigation`);
+    return { ok: true };
+  }
+  if (!areas.length) {
+    console.log('   🪑 no seating chooser — direct-book flow');
+    return { ok: true };
+  }
+
+  // Phase 2: the chooser exists, so Book did NOT navigate — from here every failure is
+  // real (a multi-seating slot never reaches checkout without a seating click).
+  let visible = 0;
+  const timesSeen: string[] = [];
+  try {
+    for (const area of areas) {
+      if (!(await area.isVisible().catch(() => false))) continue;
+      visible++;
+      const timeText = await area.evaluate(nearestTimeText);
+      if (timeText) timesSeen.push(timeText);
+      if (timeText && timeText.toLowerCase() === want) {
+        const areaId = await area.getAttribute('data-testid').catch(() => null);
+        try { await area.click({ timeout: 5000 }); }
+        catch (err) { return { ok: false, reason: `seating option click failed: ${errMsg(err)}` }; }
+        console.log(`   🪑 Seating chooser: picked ${areaId ?? 'option'} for ${timeText}`);
+        return { ok: true };
+      }
+    }
+    return { ok: false, reason: `seating chooser rendered but no option matched — ${areas.length} options, ${visible} visible, times seen [${[...new Set(timesSeen)].join(', ')}], wanted ${want}` };
+  } catch (err) {
+    return { ok: false, reason: `seating chooser handling failed: ${errMsg(err)}` };
+  }
+}
+
 /** Reload-on-hit DOM grab: the poller detected a slot via fetch, but the DOM still
  *  shows stale state, so reload once (slot now renders) and click the ENABLED Book
  *  button whose time matches. Fails fast instead of hammering a disabled button.
@@ -379,21 +448,12 @@ async function grabViaDom(page: Page, date: string, time24: string): Promise<Gra
   const buttons = await page.$$('[data-testid="booking-card-button"], [data-testid^="offering-book-button"]');
   for (const btn of buttons) {
     if (!(await btn.isEnabled().catch(() => false))) continue; // skip disabled — the hang fix
-    const timeText = await btn.evaluate((el: any) => {
-      let node = el;
-      for (let i = 0; i < 6; i++) {
-        node = node?.parentElement || null;
-        if (!node) break;
-        const m = (node.textContent || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-        if (m) return m[0];
-      }
-      return '';
-    });
+    const timeText = await btn.evaluate(nearestTimeText);
     if (timeText && timeText.toLowerCase() === want) {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
       try { await btn.click({ timeout: 5000 }); }
       catch { return { ok: false, reason: 'matched slot button click failed' }; }
-      return { ok: true };
+      return clickSeatingAreaForTime(page, time24);
     }
   }
   return { ok: false, reason: 'no enabled slot matched the requested time (lost the race)' };
@@ -587,7 +647,8 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     try {
       purchased = await handlePurchaseFlow(winner.page, dryRun, screenshots, maxPriceCents);
     } catch (err) {
-      purchaseErr = err instanceof Error ? err.message : String(err);
+      purchaseErr = errMsg(err);
+      console.error(`   ❌ purchase flow threw: ${purchaseErr}`);
       outcomes.push({ attempt: 1, status: 'crashed', error: `purchase: ${purchaseErr}` });
     }
 
@@ -612,7 +673,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       error: 'purchase failed after grab',
     });
     console.log(`\n⚠️ Sniper grabbed but purchase failed — session frozen (${pausedSessionId})`);
-    return { success: false, bookedDate, bookedTime, error: 'Grabbed the slot but purchase failed — session frozen for recovery', screenshots, pausedSessionId, durationMs: durationMs(), polls: pollStats(), seen };
+    return { success: false, bookedDate, bookedTime, error: `Grabbed the slot but purchase failed — session frozen for recovery${purchaseErr ? ' — ' + purchaseErr : ''}`, screenshots, pausedSessionId, durationMs: durationMs(), polls: pollStats(), seen };
 
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startTime, polls: pollStats() };

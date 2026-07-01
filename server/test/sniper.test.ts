@@ -10,6 +10,8 @@ import {
   validateSniperConfig,
   NormalizedSlot,
   SniperConfig,
+  nearestTimeText,
+  clickSeatingAreaForTime,
 } from '../src/sniper';
 
 // Compare only the date/time12/offerId of slots (ignore time24/priceCents) where those are the focus.
@@ -237,4 +239,107 @@ test('parseAvailability excludes experiences whose state is not exactly AVAILABL
 test('parseAvailability tolerates null and empty offerings', () => {
   assert.deepEqual(parseAvailability(null, 2), []);
   assert.deepEqual(parseAvailability({ openDate: [], openTime: [], experience: [] }, 2), []);
+});
+
+// --- nearestTimeText: scopes a button to its own card's time ---
+// Models the DOM as a parentElement chain. textContent on a real node includes all
+// descendant text, so ancestors ABOVE the card carry every card's times — the walk-up
+// must stop at the nearest time-bearing ancestor (the card) or a multi-card page would
+// always match the first card on the page.
+
+const chainNode = (textContent: string, parentElement: any = null) => ({ textContent, parentElement });
+
+test('nearestTimeText returns the nearest ancestor time (the button\'s own card)', () => {
+  const page = chainNode('6:45 PMDining Room · CounterBook7:00 PMDining Room · CounterBook');
+  const card = chainNode('7:00 PMDining Room · CounterBook', page);
+  const row = chainNode('Dining Room', card);
+  const btn = chainNode('Dining Room', row);
+  assert.equal(nearestTimeText(btn), '7:00 PM');
+});
+
+test('nearestTimeText does not leak a sibling card\'s time through a shared container', () => {
+  const page = chainNode('6:45 PM…7:00 PM…7:15 PM…');
+  const otherCard = chainNode('6:45 PMBook', page);
+  const card = chainNode('7:15 PMDining Room · CounterBook', page);
+  const btn = chainNode('Counter', chainNode('Counter', card));
+  assert.equal(nearestTimeText(btn), '7:15 PM'); // card wins, not 6:45 from `page`
+  assert.equal(nearestTimeText(chainNode('Book', otherCard)), '6:45 PM');
+});
+
+test('nearestTimeText returns empty when no ancestor within 10 levels has a time', () => {
+  let node: any = chainNode('no times anywhere');
+  for (let i = 0; i < 12; i++) node = chainNode('still none', node);
+  assert.equal(nearestTimeText(node), '');
+  assert.equal(nearestTimeText(null), '');
+});
+
+test('nearestTimeText matches AM/PM case-insensitively and single-digit hours', () => {
+  const card = chainNode('9:15 am · Patio');
+  assert.equal(nearestTimeText(chainNode('Patio', card)), '9:15 am');
+});
+
+// --- clickSeatingAreaForTime branch coverage (faked Playwright page/elements) ---
+// The function's contract: a throw BEFORE the chooser is known to exist is the direct-book
+// flow racing to checkout (ok); once seating options are found, Book did NOT navigate, so
+// every failure is real and must carry a reason (never masked as ok).
+
+const fakeArea = (opts: { time?: string; visible?: boolean; testid?: string; clickThrows?: boolean; evaluateThrows?: boolean; onClick?: () => void }) => ({
+  isVisible: async () => opts.visible !== false,
+  evaluate: async (fn: (el: any) => string) => {
+    if (opts.evaluateThrows) throw new Error('Execution context was destroyed');
+    return fn(chainNode('x', chainNode(`${opts.time ?? ''}Seating`)));
+  },
+  getAttribute: async () => opts.testid ?? null,
+  click: async () => {
+    if (opts.clickThrows) throw new Error('element is not attached to the DOM');
+    opts.onClick?.();
+  },
+});
+const fakePage = (areas: any[] | 'throws') => ({
+  $$: async () => {
+    if (areas === 'throws') throw new Error('Execution context was destroyed');
+    return areas;
+  },
+});
+
+test('clickSeatingAreaForTime: query throw before chooser is known = navigation, ok', async () => {
+  const r = await clickSeatingAreaForTime(fakePage('throws') as any, '19:00');
+  assert.deepEqual(r, { ok: true });
+});
+
+test('clickSeatingAreaForTime: no seating buttons = direct-book flow, ok', async () => {
+  const r = await clickSeatingAreaForTime(fakePage([]) as any, '19:00');
+  assert.deepEqual(r, { ok: true });
+});
+
+test('clickSeatingAreaForTime clicks the option scoped to the requested time', async () => {
+  let clicked = '';
+  const areas = [
+    fakeArea({ time: '6:45 PM', testid: 'seating-area-40034', onClick: () => { clicked = '6:45'; } }),
+    fakeArea({ time: '7:00 PM', testid: 'seating-area-40035', onClick: () => { clicked = '7:00'; } }),
+  ];
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  assert.deepEqual(r, { ok: true });
+  assert.equal(clicked, '7:00'); // not the 6:45 sibling
+});
+
+test('clickSeatingAreaForTime: a throw AFTER the chooser exists is a real failure, not ok', async () => {
+  const areas = [fakeArea({ time: '7:00 PM', evaluateThrows: true })];
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  assert.equal(r.ok, false);
+  assert.match((r as any).reason, /seating chooser handling failed: Execution context was destroyed/);
+});
+
+test('clickSeatingAreaForTime: no matching option reports what it saw', async () => {
+  const areas = [fakeArea({ time: '6:45 PM' }), fakeArea({ time: '7:15 PM', visible: false })];
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  assert.equal(r.ok, false);
+  assert.match((r as any).reason, /2 options, 1 visible, times seen \[6:45 PM\], wanted 7:00 pm/);
+});
+
+test('clickSeatingAreaForTime: click failure carries the underlying error', async () => {
+  const areas = [fakeArea({ time: '7:00 PM', clickThrows: true })];
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  assert.equal(r.ok, false);
+  assert.match((r as any).reason, /seating option click failed: element is not attached/);
 });

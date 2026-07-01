@@ -281,6 +281,7 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
       screenshots: result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'manual' as const,
+      sniperMeta: { polls: result.polls, seen: result.seen, durationMs: result.durationMs },
     };
     addToHistory(entry);
     schedulerEvents.emit('booking-result', entry);
