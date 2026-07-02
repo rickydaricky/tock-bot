@@ -18,6 +18,38 @@ export function timeToMin(t24: string): number {
   return (h || 0) * 60 + (m || 0);
 }
 
+/** Minutes-of-day for a 12h "H:MM AM/PM" card label, or null if it doesn't parse. */
+export function time12ToMin(t12: string): number | null {
+  const m = String(t12).match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = Number(m[1]) % 12;
+  if (m[3].toUpperCase() === 'PM') h += 12;
+  return h * 60 + Number(m[2]);
+}
+
+/** When the originally matched time's button is gone at grab (sold in the detect→reload
+ *  gap, or a calendar cross-product false positive — openTime[] is global, not per-date),
+ *  choose the closest surviving in-window time instead of losing the whole run. Times are
+ *  the 12h card labels; ties go to the earlier slot. Null when nothing in-window survives. */
+export function pickFallbackTime12(times12: string[], target24: string, winStart24?: string, winEnd24?: string): string | null {
+  const target = timeToMin(target24);
+  const lo = winStart24 ? timeToMin(winStart24) : -Infinity;
+  const hi = winEnd24 ? timeToMin(winEnd24) : Infinity;
+  let best: string | null = null;
+  let bestMin = 0;
+  for (const t of times12) {
+    const min = time12ToMin(t);
+    if (min == null || min < lo || min > hi) continue;
+    if (best === null
+      || Math.abs(min - target) < Math.abs(bestMin - target)
+      || (Math.abs(min - target) === Math.abs(bestMin - target) && min < bestMin)) {
+      best = t;
+      bestMin = min;
+    }
+  }
+  return best;
+}
+
 /** Exact date+time match (strict mode). Kept for the strict option + tests. */
 export function pickSlot(slots: NormalizedSlot[], date: string, time24: string): NormalizedSlot | null {
   const want = to12Hour(time24).toLowerCase();
@@ -358,7 +390,7 @@ async function fetchOfferingsViaNavigate(page: Page, url: string): Promise<any> 
   });
 }
 
-export type GrabResult = { ok: true } | { ok: false; reason: string };
+export type GrabResult = { ok: true; time12?: string } | { ok: false; reason: string };
 
 /** Walk up from a button to the nearest ancestor whose text contains a slot time, and
  *  return that time (e.g. "7:00 PM"). Stopping at the NEAREST time-bearing ancestor is
@@ -382,8 +414,8 @@ export function nearestTimeText(el: any): string {
  *  FHH [] → direct book). Click the option scoped to OUR time, or a neighboring card's
  *  option would book the wrong slot. Direct-book restaurants render no seating-area
  *  buttons, so this only costs them the settle sleep (overlapping checkout navigation). */
-export async function clickSeatingAreaForTime(page: Page, time24: string): Promise<GrabResult> {
-  const want = to12Hour(time24).toLowerCase();
+export async function clickSeatingAreaForTime(page: Page, want12: string): Promise<GrabResult> {
+  const want = want12.toLowerCase();
 
   // Phase 1: settle + query. A throw HERE is plausibly the direct-book flow racing to
   // checkout (execution context destroyed mid-navigation) — treat as success, but say so:
@@ -430,7 +462,7 @@ export async function clickSeatingAreaForTime(page: Page, time24: string): Promi
  *  button whose time matches. Fails fast instead of hammering a disabled button.
  *  Returns a discriminated reason so the caller can distinguish a genuine lost race
  *  from a stale-session/page error. */
-async function grabViaDom(page: Page, date: string, time24: string): Promise<GrabResult> {
+async function grabViaDom(page: Page, date: string, time24: string, winStart24?: string, winEnd24?: string): Promise<GrabResult> {
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
   try {
     await page.waitForSelector('.ConsumerCalendar', { state: 'visible', timeout: 15000 });
@@ -449,19 +481,45 @@ async function grabViaDom(page: Page, date: string, time24: string): Promise<Gra
     await page.waitForSelector('[data-testid="booking-card-button"], [data-testid^="offering-book-button"]', { timeout: 10000 });
   } catch { return { ok: false, reason: 'no booking buttons rendered for the date' }; }
 
+  // Collect every ENABLED button with its card time (disabled = sold; skipping them is
+  // the hang fix). Buttons with no time within nearestTimeText's walk-up range are
+  // excluded (typically experience-level "Book now" — though one can inherit a broad
+  // container's time; the in-window filter and checkout cap bound the damage).
   const want = to12Hour(time24).toLowerCase();
   const buttons = await page.$$('[data-testid="booking-card-button"], [data-testid^="offering-book-button"]');
-  for (const btn of buttons) {
-    if (!(await btn.isEnabled().catch(() => false))) continue; // skip disabled — the hang fix
-    const timeText = await btn.evaluate(nearestTimeText);
-    if (timeText && timeText.toLowerCase() === want) {
-      await btn.scrollIntoViewIfNeeded().catch(() => {});
-      try { await btn.click({ timeout: 5000 }); }
-      catch { return { ok: false, reason: 'matched slot button click failed' }; }
-      return clickSeatingAreaForTime(page, time24);
+  const candidates: { btn: (typeof buttons)[number]; time12: string }[] = [];
+  try {
+    for (const btn of buttons) {
+      if (!(await btn.isEnabled().catch(() => false))) continue;
+      const timeText = await btn.evaluate(nearestTimeText);
+      if (timeText) candidates.push({ btn, time12: timeText });
     }
+  } catch (err) {
+    // Keep a mid-scan page death on the labeled, screenshotted grab-fail path instead of
+    // bubbling a bare Playwright error out of the whole run.
+    return { ok: false, reason: `candidate scan failed: ${errMsg(err)}` };
   }
-  return { ok: false, reason: 'no enabled slot matched the requested time (lost the race)' };
+
+  let pick = candidates.find(c => c.time12.toLowerCase() === want);
+  if (!pick) {
+    // The detected time vanished in the detect→reload gap (sold, or a cross-product
+    // false positive). Grab the closest surviving in-window time on THIS date instead
+    // of losing the run — the checkout-side price cap still guards the total.
+    const fb = pickFallbackTime12(candidates.map(c => c.time12), time24, winStart24, winEnd24);
+    pick = fb != null ? candidates.find(c => c.time12 === fb) : undefined;
+    if (pick) console.log(`   ⚠️ ${to12Hour(time24)} gone at grab — falling back to ${pick.time12}`);
+  }
+  if (!pick) {
+    // Include the raw button count: "N buttons, enabled times [none]" reads as a dead or
+    // odd page; a real lost race shows buttons with out-of-window/sold times.
+    return { ok: false, reason: `no enabled in-window slot at grab (lost the race) — ${buttons.length} buttons, enabled times seen [${[...new Set(candidates.map(c => c.time12))].join(', ') || 'none'}]` };
+  }
+
+  await pick.btn.scrollIntoViewIfNeeded().catch(() => {});
+  try { await pick.btn.click({ timeout: 5000 }); }
+  catch { return { ok: false, reason: 'matched slot button click failed' }; }
+  const seat = await clickSeatingAreaForTime(page, pick.time12);
+  return seat.ok ? { ok: true, time12: pick.time12 } : seat;
 }
 
 /**
@@ -625,8 +683,14 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       // No match — capture what one browser sees + the structured `seen` data, so we know
       // whether the target date/time was ever present (vs sold-out vs blocked). No black box.
       const shot = live[0] ? await safeShot(live[0].page) : null;
+      // "No time matched" with in-window times visible usually means the PRICE filter
+      // rejected them — say so, or a cap-miss reads like a mysterious window-miss.
+      // (priceCentsSeen is the LAST price seen anywhere, so phrase as likely, not certain.)
+      const capNote = maxPriceCents != null && seen.priceCentsSeen != null && seen.priceCentsSeen * req.partySize > maxPriceCents
+        ? ` — likely PRICE-CAPPED: last seen $${(seen.priceCentsSeen / 100).toFixed(0)}/person × ${req.partySize} = $${(seen.priceCentsSeen * req.partySize / 100).toFixed(0)} exceeds cap $${(maxPriceCents / 100).toFixed(0)}`
+        : '';
       const why = seen.anyTargetDate
-        ? `requested date was bookable but no time matched (window ${cfg.timeWindowStart24 ?? 'any'}–${cfg.timeWindowEnd24 ?? 'any'}); times seen on target date: [${seen.targetDateTimes.join(', ') || 'none'}]`
+        ? `requested date was bookable but no time matched (window ${cfg.timeWindowStart24 ?? 'any'}–${cfg.timeWindowEnd24 ?? 'any'}); times seen on target date: [${seen.targetDateTimes.join(', ') || 'none'}]${capNote}`
         : 'requested date never became bookable in the window';
       console.log(`\n❌ Sniper no match — ${why}`);
       return { success: false, error: `No matching slot in window — ${why} · ${summarizeFailures(outcomes)}`, durationMs: durationMs(), polls: pollStats(), seen, screenshots: shot ? [shot] : undefined };
@@ -635,12 +699,13 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     // --- Phase 3: grab + purchase (or rehearse, if dryRun) ---
     const dryRun = cfg.dryRun ?? false;
     const screenshots: string[] = [];
-    const grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24);
+    const grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24, cfg.timeWindowStart24, cfg.timeWindowEnd24);
     if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
       return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
     }
-    bookedTime = winnerSlot.time12;
+    // The grab may have fallen back to a different surviving time — report what was held.
+    bookedTime = grab.time12 ?? winnerSlot.time12;
 
     // handlePurchaseFlow with dryRun=true fills the checkout (add-ons/gratuity/CVC) and
     // stops BEFORE clicking purchase, capturing screenshots — a no-charge rehearsal.

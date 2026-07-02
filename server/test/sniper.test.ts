@@ -12,6 +12,8 @@ import {
   SniperConfig,
   nearestTimeText,
   clickSeatingAreaForTime,
+  time12ToMin,
+  pickFallbackTime12,
 } from '../src/sniper';
 
 // Compare only the date/time12/offerId of slots (ignore time24/priceCents) where those are the focus.
@@ -312,12 +314,12 @@ const fakePage = (areas: any[] | 'throws') => ({
 });
 
 test('clickSeatingAreaForTime: query throw before chooser is known = navigation, ok', async () => {
-  const r = await clickSeatingAreaForTime(fakePage('throws') as any, '19:00');
+  const r = await clickSeatingAreaForTime(fakePage('throws') as any, '7:00 PM');
   assert.deepEqual(r, { ok: true });
 });
 
 test('clickSeatingAreaForTime: no seating buttons = direct-book flow, ok', async () => {
-  const r = await clickSeatingAreaForTime(fakePage([]) as any, '19:00');
+  const r = await clickSeatingAreaForTime(fakePage([]) as any, '7:00 PM');
   assert.deepEqual(r, { ok: true });
 });
 
@@ -327,28 +329,61 @@ test('clickSeatingAreaForTime clicks the option scoped to the requested time', a
     fakeArea({ time: '6:45 PM', testid: 'seating-area-40034', onClick: () => { clicked = '6:45'; } }),
     fakeArea({ time: '7:00 PM', testid: 'seating-area-40035', onClick: () => { clicked = '7:00'; } }),
   ];
-  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '7:00 PM');
   assert.deepEqual(r, { ok: true });
   assert.equal(clicked, '7:00'); // not the 6:45 sibling
 });
 
 test('clickSeatingAreaForTime: a throw AFTER the chooser exists is a real failure, not ok', async () => {
   const areas = [fakeArea({ time: '7:00 PM', evaluateThrows: true })];
-  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '7:00 PM');
   assert.equal(r.ok, false);
   assert.match((r as any).reason, /seating chooser handling failed: Execution context was destroyed/);
 });
 
 test('clickSeatingAreaForTime: no matching option reports what it saw', async () => {
   const areas = [fakeArea({ time: '6:45 PM' }), fakeArea({ time: '7:15 PM', visible: false })];
-  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '7:00 PM');
   assert.equal(r.ok, false);
   assert.match((r as any).reason, /2 options, 1 visible, times seen \[6:45 PM\], wanted 7:00 pm/);
 });
 
 test('clickSeatingAreaForTime: click failure carries the underlying error', async () => {
   const areas = [fakeArea({ time: '7:00 PM', clickThrows: true })];
-  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '19:00');
+  const r = await clickSeatingAreaForTime(fakePage(areas) as any, '7:00 PM');
   assert.equal(r.ok, false);
   assert.match((r as any).reason, /seating option click failed: element is not attached/);
+});
+
+// --- time12ToMin / pickFallbackTime12 (grab-time fallback when the picked slot vanished) ---
+
+test('time12ToMin parses card labels incl. noon/midnight edges', () => {
+  assert.equal(time12ToMin('7:00 PM'), 19 * 60);
+  assert.equal(time12ToMin('9:15 am'), 9 * 60 + 15);
+  assert.equal(time12ToMin('12:00 PM'), 12 * 60); // noon
+  assert.equal(time12ToMin('12:30 AM'), 30);      // after midnight
+  assert.equal(time12ToMin('Book'), null);
+});
+
+test('pickFallbackTime12 picks the closest surviving in-window time', () => {
+  const times = ['5:00 PM', '5:15 PM', '8:00 PM'];
+  // target 19:00 → 8:00 PM (60 min away) beats 5:15 PM (105 min away)
+  assert.equal(pickFallbackTime12(times, '19:00', '17:00', '20:00'), '8:00 PM');
+});
+
+test('pickFallbackTime12 never leaves the accept window', () => {
+  // Only out-of-window times survive → no fallback, run must fail rather than book 4 PM
+  assert.equal(pickFallbackTime12(['4:00 PM', '9:30 PM'], '19:00', '17:00', '20:00'), null);
+});
+
+test('pickFallbackTime12 without a window considers everything and breaks ties earlier', () => {
+  assert.equal(pickFallbackTime12(['4:00 PM', '9:30 PM'], '19:00'), '9:30 PM'); // 150 vs 180 min
+  // 6:30 and 7:30 are both 30 min from 19:00 → earlier wins
+  assert.equal(pickFallbackTime12(['7:30 PM', '6:30 PM'], '19:00'), '6:30 PM');
+});
+
+test('pickFallbackTime12 ignores unparseable labels and empty input', () => {
+  assert.equal(pickFallbackTime12([], '19:00'), null);
+  assert.equal(pickFallbackTime12(['Book', 'Notify'], '19:00'), null);
+  assert.equal(pickFallbackTime12(['Book', '7:15 PM'], '19:00', '17:00', '20:00'), '7:15 PM');
 });

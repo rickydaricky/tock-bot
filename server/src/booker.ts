@@ -258,14 +258,26 @@ export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshot
 
   const maxWait = 30000;
   const start = Date.now();
+  // Obstacles hit along the way. Surfaced by THROWING at timeout/abort — every caller
+  // catches and persists the message, so a purchase-stage failure is diagnosable from
+  // history within the ~10-min hold window, not just from Railway stdout.
+  const problems: string[] = [];
+  const note = (m: string) => { problems.push(m); console.log(`   ⚠️ ${m}`); };
 
   while (Date.now() - start < maxWait) {
-    // Check for add-ons page
+    // Check for add-ons page. A DISABLED confirm (seen live on Lazy Bear 2026-07-02)
+    // must not block the loop on a 30s click wait — keep cycling so the purchase page
+    // can still be caught if it appears another way, or the loop times out cleanly.
     const addOnsBtn = await page.$('[data-testid="supplement-group-confirm-button"]');
     if (addOnsBtn) {
-      console.log('📦 Skipping add-ons...');
-      await addOnsBtn.click();
-      await page.waitForTimeout(1500);
+      if (await addOnsBtn.isEnabled().catch(() => false)) {
+        console.log('📦 Skipping add-ons...');
+        await addOnsBtn.click({ timeout: 5000 }).catch(err => note(`add-ons confirm click failed: ${err instanceof Error ? err.message : err}`));
+        await page.waitForTimeout(1500);
+      } else {
+        if (!problems.includes('add-ons confirm present but disabled')) note('add-ons confirm present but disabled');
+        await page.waitForTimeout(500);
+      }
       continue;
     }
 
@@ -273,10 +285,10 @@ export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshot
     const viewOrderBtn = await page.$('[data-testid="supplement-page-view-order"]');
     if (viewOrderBtn) {
       console.log('📦 Clicking View Order...');
-      await viewOrderBtn.click();
+      await viewOrderBtn.click({ timeout: 5000 }).catch(err => note(`view-order click failed: ${err instanceof Error ? err.message : err}`));
       await page.waitForTimeout(500);
       const modalBtn = await page.$('.MuiDialogActions-root button');
-      if (modalBtn) await modalBtn.click();
+      if (modalBtn) await modalBtn.click({ timeout: 5000 }).catch(err => note(`view-order modal click failed: ${err instanceof Error ? err.message : err}`));
       await page.waitForTimeout(1500);
       continue;
     }
@@ -285,17 +297,21 @@ export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshot
     const purchaseBtn = await page.$('[data-testid="purchase-button"]');
     if (purchaseBtn) {
       console.log('💳 Purchase confirmation page detected');
-      return await handlePurchaseConfirmation(page, dryRun, screenshots, maxPriceCents);
+      const ok = await handlePurchaseConfirmation(page, dryRun, screenshots, maxPriceCents, problems);
+      // A reasoned abort (price cap, unreadable amount) must reach history, not just stdout.
+      if (!ok && problems.length) throw new Error(`checkout aborted — ${[...new Set(problems)].slice(-3).join('; ')}`);
+      return ok;
     }
 
     await page.waitForTimeout(300);
   }
 
-  console.log('⏱️ Timeout waiting for purchase page');
-  return false;
+  const detail = problems.length ? ` — obstacles: ${[...new Set(problems)].slice(-3).join('; ')}` : '';
+  console.log(`⏱️ Timeout waiting for purchase page${detail}`);
+  throw new Error(`Timeout waiting for purchase page${detail}`);
 }
 
-async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screenshots: string[], maxPriceCents?: number): Promise<boolean> {
+async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screenshots: string[], maxPriceCents?: number, problems?: string[]): Promise<boolean> {
   // Gratuity — select "No gratuity" if present
   const gratuityBtn = await page.$('[data-testid="gratuity-button-zero"]');
   if (gratuityBtn) {
@@ -395,11 +411,13 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
     const dueCents = await readAmountDueCents(page);
     if (dueCents == null) {
       console.log('🛑 Price cap set but could not read amount due — aborting (no blind purchase)');
+      problems?.push('price cap set but "Amount due $" not readable on confirm page — aborted, no blind purchase');
       screenshots.push(await takeScreenshot(page));
       return false;
     }
     if (dueCents > maxPriceCents) {
       console.log(`🛑 Amount due $${(dueCents / 100).toFixed(2)} exceeds cap $${(maxPriceCents / 100).toFixed(2)} — aborting purchase`);
+      problems?.push(`amount due $${(dueCents / 100).toFixed(2)} exceeds cap $${(maxPriceCents / 100).toFixed(2)} — aborted`);
       screenshots.push(await takeScreenshot(page));
       return false;
     }
