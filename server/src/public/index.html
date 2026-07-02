@@ -846,6 +846,61 @@ html, body {
         <div class="hint">delay between each attempt</div>
       </div>
     </div>
+    <div class="section-title" style="margin-top:16px;font-size:11px;color:var(--text-muted)">Sniper Mode <span style="font-weight:400">(optional — for competitive drops; takes precedence over blitz)</span></div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none">
+        <input type="checkbox" id="sched-sniper-enabled" style="width:auto;margin:0" onchange="toggleSniperFields()"> Enable sniper (warm browser pool + high-frequency polling around the drop)
+      </label>
+    </div>
+    <div id="sniper-fields" style="display:none">
+      <div class="field-row">
+        <div class="field">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none">
+            <input type="checkbox" id="sched-sniper-dryrun" style="width:auto;margin:0" checked> Dry run
+          </label>
+          <div class="hint">rehearse to checkout, never purchase</div>
+        </div>
+        <div class="field">
+          <label>Max Total Price ($)</label>
+          <input type="number" id="sched-sniper-maxprice" placeholder="700" min="1" step="1">
+          <div class="hint">hard cap on the checkout total — required for real runs</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Earliest Time</label>
+          <input type="time" id="sched-sniper-timestart">
+          <div class="hint">optional — accept slots from</div>
+        </div>
+        <div class="field">
+          <label>Latest Time</label>
+          <input type="time" id="sched-sniper-timeend">
+          <div class="hint">optional — accept slots until</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Browser Pool</label>
+          <input type="number" id="sched-sniper-pool" value="4" min="1" max="6">
+        </div>
+        <div class="field">
+          <label>Poll Interval (ms)</label>
+          <input type="number" id="sched-sniper-poll" value="250" min="100" step="50">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Window Start (ms)</label>
+          <input type="number" id="sched-sniper-wstart" value="-3000" step="500">
+          <div class="hint">vs Run At; negative = before</div>
+        </div>
+        <div class="field">
+          <label>Window End (ms)</label>
+          <input type="number" id="sched-sniper-wend" value="30000" step="500">
+          <div class="hint">how long to keep polling</div>
+        </div>
+      </div>
+    </div>
     <button class="btn btn-primary" onclick="addSchedule()">Add Schedule</button>
   </div>
 
@@ -1312,6 +1367,7 @@ async function loadScheduled() {
           <span>dates:</span> ${s.dates.join(', ')}<br>
           <span>time:</span> ${s.time} &middot; <span>party:</span> ${s.partySize}<br>
           <span>runs at:</span> ${s.runAt ? new Date(s.runAt).toLocaleString() : s.cron}
+          ${s.sniper ? `<br><span>sniper:</span> <span style="color:${s.sniper.dryRun ? 'var(--text-secondary)' : 'var(--accent)'}">${sniperSummary(s.sniper)}</span>` : ''}
           ${s.blitz && s.blitz.attempts > 1 ? `<br><span>blitz:</span> ${s.blitz.attempts}x @ ${s.blitz.staggerMs}ms` : ''}
         </div>
       </div>
@@ -1355,9 +1411,32 @@ async function addSchedule() {
   const blitzStagger = parseInt(document.getElementById('sched-blitz-stagger').value) || 1000;
   const blitz = blitzAttempts > 1 ? { attempts: blitzAttempts, staggerMs: blitzStagger } : undefined;
 
+  let sniper;
+  if (document.getElementById('sched-sniper-enabled').checked) {
+    const dryRun = document.getElementById('sched-sniper-dryrun').checked;
+    const maxDollars = parseFloat(document.getElementById('sched-sniper-maxprice').value);
+    if (!dryRun && !(maxDollars > 0)) {
+      alert('A real (non-dry) sniper run requires a Max Total Price — that cap is the only overspend guard.');
+      return;
+    }
+    sniper = {
+      dryRun,
+      maxPriceCents: maxDollars > 0 ? Math.round(maxDollars * 100) : undefined,
+      timeWindowStart24: document.getElementById('sched-sniper-timestart').value || undefined,
+      timeWindowEnd24: document.getElementById('sched-sniper-timeend').value || undefined,
+      pool: parseInt(document.getElementById('sched-sniper-pool').value) || 4,
+      pollIntervalMs: parseInt(document.getElementById('sched-sniper-poll').value) || 250,
+      windowStartMs: parseInt(document.getElementById('sched-sniper-wstart').value),
+      windowEndMs: parseInt(document.getElementById('sched-sniper-wend').value),
+      fastPoll: true,
+    };
+    if (isNaN(sniper.windowStartMs)) sniper.windowStartMs = -3000;
+    if (isNaN(sniper.windowEndMs)) sniper.windowEndMs = 30000;
+  }
+
   const resp = await api('/api/scheduled', {
     method: 'POST',
-    body: JSON.stringify({ restaurant, dates, partySize, time, runAt, label, autoPurchase: true, blitz })
+    body: JSON.stringify({ restaurant, dates, partySize, time, runAt, label, autoPurchase: true, blitz, sniper })
   });
 
   if (!resp.success) {
@@ -1372,9 +1451,30 @@ async function addSchedule() {
   document.getElementById('sched-run-at').value = '';
   document.getElementById('sched-blitz-attempts').value = '1';
   document.getElementById('sched-blitz-stagger').value = '1000';
+  document.getElementById('sched-sniper-enabled').checked = false;
+  // Reset sniper sub-fields to SAFE defaults — dry-run on, cap cleared — so re-opening
+  // the panel never comes pre-armed as a real run with a stale cap.
+  document.getElementById('sched-sniper-dryrun').checked = true;
+  document.getElementById('sched-sniper-maxprice').value = '';
+  toggleSniperFields();
   calClearAll();
 
   loadScheduled();
+}
+
+function toggleSniperFields() {
+  const on = document.getElementById('sched-sniper-enabled').checked;
+  document.getElementById('sniper-fields').style.display = on ? 'block' : 'none';
+}
+
+/** Compact human description of a sniper config for the scheduled list / history. */
+function sniperSummary(sn) {
+  if (!sn) return '';
+  const parts = [sn.dryRun ? 'DRY RUN' : 'REAL'];
+  if (sn.maxPriceCents) parts.push(`cap $${(sn.maxPriceCents / 100).toFixed(0)}`);
+  if (sn.timeWindowStart24 || sn.timeWindowEnd24) parts.push(`${sn.timeWindowStart24 || 'any'}–${sn.timeWindowEnd24 || 'any'}`);
+  parts.push(`pool ${sn.pool}`, `${sn.pollIntervalMs}ms`, `[${sn.windowStartMs}..${sn.windowEndMs}]ms`);
+  return parts.join(' · ');
 }
 
 async function deleteSchedule(id) {
@@ -1457,6 +1557,7 @@ async function loadHistory() {
         <div class="card-meta">
           ${h.date ? `<span>date:</span> ${h.date} &middot; ` : ''}<span>time:</span> ${h.time || 'n/a'}
           ${h.error ? `<br><span style="color:var(--error)">${h.error}</span>` : ''}
+          ${sniperMetaSummary(h.sniperMeta)}
         </div>
         ${screenshotHtml}
       </div>`;
@@ -1464,6 +1565,25 @@ async function loadHistory() {
   } catch {
     list.innerHTML = '<div class="empty">failed to load</div>';
   }
+}
+
+/** Render the persisted sniper diagnostics (polls/seen) on a history card, if present. */
+function sniperMetaSummary(m) {
+  if (!m || (!m.polls && !m.seen)) return '';
+  const bits = [];
+  if (m.polls) {
+    let p = `${m.polls.total} polls, ${m.polls.matched} matched`;
+    if (m.polls.fast != null) p += ` (fast ${m.polls.fast} / nav ${m.polls.nav || 0}${m.polls.challenges ? ` / challenges ${m.polls.challenges}` : ''})`;
+    bits.push(p);
+  }
+  if (m.durationMs != null) bits.push(`${(m.durationMs / 1000).toFixed(1)}s`);
+  if (m.seen) {
+    bits.push(m.seen.anyTargetDate
+      ? `target date seen; times [${(m.seen.targetDateTimes || []).join(', ') || 'none'}]`
+      : 'target date never bookable');
+    if (m.seen.priceCentsSeen != null) bits.push(`~$${(m.seen.priceCentsSeen / 100).toFixed(0)}/person seen`);
+  }
+  return `<br><span>sniper:</span> ${bits.join(' · ')}`;
 }
 
 async function deleteHistory(id) {
