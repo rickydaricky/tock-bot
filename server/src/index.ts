@@ -110,7 +110,7 @@ app.get('/api/scheduled', requireAuth, (_req, res) => {
 });
 
 app.post('/api/scheduled', requireAuth, (req, res) => {
-  const { runAt, blitz, ...rest } = req.body;
+  const { runAt, blitz, sniper, ...rest } = req.body;
 
   if (runAt && isNaN(new Date(runAt).getTime())) {
     return res.status(400).json({ success: false, error: 'Invalid runAt datetime' });
@@ -123,6 +123,27 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
     return res.status(400).json({ success: false, error: 'Either runAt or cron is required' });
   }
 
+  // Normalize + validate sniper config NOW, not at fire time — a bad config (or a real
+  // run without a price cap) must fail the schedule request, not the drop.
+  let sniperCfg: SniperConfig | undefined;
+  if (sniper) {
+    sniperCfg = {
+      pool: Math.min(Math.max(sniper.pool ?? 5, 1), 6),
+      pollIntervalMs: sniper.pollIntervalMs ?? 200,
+      windowStartMs: sniper.windowStartMs ?? -1000,
+      windowEndMs: sniper.windowEndMs ?? 10000,
+      dryRun: !!sniper.dryRun,
+      timeWindowStart24: sniper.timeWindowStart24 || undefined,
+      timeWindowEnd24: sniper.timeWindowEnd24 || undefined,
+      maxPriceCents: sniper.maxPriceCents,
+      fastPoll: sniper.fastPoll !== false,
+    };
+    const cfgError = validateSniperConfig(sniperCfg);
+    if (cfgError) {
+      return res.status(400).json({ success: false, error: `Invalid sniper config: ${cfgError}` });
+    }
+  }
+
   const booking: ScheduledBooking = {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
@@ -130,6 +151,7 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
     cron: cronExpr || '',
     runAt,
     blitz: blitz && blitz.attempts > 1 ? blitz : undefined,
+    sniper: sniperCfg,
   };
   const result = addScheduledBooking(booking);
   if (result.success) {

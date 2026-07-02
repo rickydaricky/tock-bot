@@ -158,6 +158,11 @@ export interface SniperConfig {
  *  runSniper) get the same guard — a malformed cap must never silently disable overspend
  *  protection (NaN → comparisons are all false) or silently block every booking (0/""). */
 export function validateSniperConfig(cfg: SniperConfig): string | null {
+  // A real (non-dry) run without a cap has no overspend guard — reject at every gate
+  // (schedule time, request time, and fire time) rather than discover it at the drop.
+  if (!cfg.dryRun && cfg.maxPriceCents == null) {
+    return 'maxPriceCents is required for a real (non-dry) sniper run — set a total price cap or enable dryRun';
+  }
   if (cfg.maxPriceCents != null) {
     if (typeof cfg.maxPriceCents !== 'number' || !Number.isFinite(cfg.maxPriceCents) || cfg.maxPriceCents <= 0) {
       return `maxPriceCents must be a positive number of cents (got ${JSON.stringify(cfg.maxPriceCents)})`;

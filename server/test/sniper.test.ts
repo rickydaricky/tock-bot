@@ -100,11 +100,20 @@ test('pickBestSlot price cap is on the TOTAL (per-person × party size)', () => 
 });
 
 // --- validateSniperConfig (fail-closed gate on the money/time fields) ---
-const baseCfg: SniperConfig = { pool: 5, pollIntervalMs: 200, windowStartMs: -1000, windowEndMs: 10000 };
+// baseCfg is a DRY run: capless is only legal when no purchase can happen.
+const baseCfg: SniperConfig = { pool: 5, pollIntervalMs: 200, windowStartMs: -1000, windowEndMs: 10000, dryRun: true };
 
 test('validateSniperConfig accepts a clean config (with and without a cap)', () => {
   assert.equal(validateSniperConfig(baseCfg), null);
   assert.equal(validateSniperConfig({ ...baseCfg, maxPriceCents: 50000, timeWindowStart24: '18:00', timeWindowEnd24: '20:00' }), null);
+});
+
+test('validateSniperConfig requires a price cap for a real (non-dry) run', () => {
+  // No cap + no dryRun = no overspend guard: must be rejected at every gate.
+  assert.match(validateSniperConfig({ ...baseCfg, dryRun: false }) ?? '', /maxPriceCents is required/);
+  assert.match(validateSniperConfig({ pool: 5, pollIntervalMs: 200, windowStartMs: -1000, windowEndMs: 10000 }) ?? '', /maxPriceCents is required/);
+  // With a cap, a real run is legal.
+  assert.equal(validateSniperConfig({ ...baseCfg, dryRun: false, maxPriceCents: 70000 }), null);
 });
 
 test('validateSniperConfig rejects a non-positive or non-finite price cap', () => {
