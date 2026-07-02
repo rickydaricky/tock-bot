@@ -390,7 +390,51 @@ async function fetchOfferingsViaNavigate(page: Page, url: string): Promise<any> 
   });
 }
 
-export type GrabResult = { ok: true; time12?: string } | { ok: false; reason: string };
+/** Post-click hold decision from what the page shows. Pure so it's unit-testable:
+ *  checkout markers or having left the search page = the hold started; still on search
+ *  with Tock's "no longer available" message = we lost the click race (retryable);
+ *  neither yet = keep waiting. */
+export function holdStateFromPage(hasCheckout: boolean, takenMsg: boolean, onSearch: boolean): 'held' | 'taken' | 'pending' {
+  if (hasCheckout || !onSearch) return 'held';
+  if (takenMsg) return 'taken';
+  return 'pending';
+}
+
+/** After the Book (+ seating) click, verify the hold actually started. A button can be
+ *  rendered enabled yet already taken — Tock then shows "this time slot is no longer
+ *  available" (owner-observed) WITHOUT navigating, which previously burned the full 30s
+ *  purchase-flow timeout and ended the run. Poll briefly; a lost click race is reported
+ *  as retryable within ~2s instead. Inconclusive → treat as held (handlePurchaseFlow's
+ *  30s gate still applies — this check can only fail fast, never falsely abort). */
+async function verifyHoldStarted(page: Page): Promise<'held' | 'taken'> {
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline) {
+    let st: { hasCheckout: boolean; takenMsg: boolean; onSearch: boolean };
+    try {
+      st = await page.evaluate(() => {
+        const d = (globalThis as any).document;
+        return {
+          hasCheckout: !!d.querySelector('[data-testid="supplement-group-confirm-button"], [data-testid="supplement-page-view-order"], [data-testid="purchase-button"]'),
+          takenMsg: /no longer available/i.test(d.body?.innerText || ''),
+          onSearch: /\/search/.test((globalThis as any).location?.pathname || ''),
+        };
+      });
+    } catch (err) {
+      // Mid-navigation context destruction — checkout is loading. (A dead page lands
+      // here too; handlePurchaseFlow's throw-on-timeout reports it loudly right after.)
+      console.log(`   ⏳ hold-verify evaluate threw (${errMsg(err)}) — treating as navigation`);
+      return 'held';
+    }
+    const state = holdStateFromPage(st.hasCheckout, st.takenMsg, st.onSearch);
+    if (state !== 'pending') return state;
+    await sleep(300);
+  }
+  return 'held'; // inconclusive — let the purchase flow's own gate decide
+}
+
+export type GrabResult =
+  | { ok: true; time12?: string }
+  | { ok: false; reason: string; slotTakenAtClick?: boolean; failedTime12?: string };
 
 /** Walk up from a button to the nearest ancestor whose text contains a slot time, and
  *  return that time (e.g. "7:00 PM"). Stopping at the NEAREST time-bearing ancestor is
@@ -462,7 +506,7 @@ export async function clickSeatingAreaForTime(page: Page, want12: string): Promi
  *  button whose time matches. Fails fast instead of hammering a disabled button.
  *  Returns a discriminated reason so the caller can distinguish a genuine lost race
  *  from a stale-session/page error. */
-async function grabViaDom(page: Page, date: string, time24: string, winStart24?: string, winEnd24?: string): Promise<GrabResult> {
+async function grabViaDom(page: Page, date: string, time24: string, winStart24?: string, winEnd24?: string, excludeTimes12: string[] = []): Promise<GrabResult> {
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
   try {
     await page.waitForSelector('.ConsumerCalendar', { state: 'visible', timeout: 15000 });
@@ -487,12 +531,14 @@ async function grabViaDom(page: Page, date: string, time24: string, winStart24?:
   // container's time; the in-window filter and checkout cap bound the damage).
   const want = to12Hour(time24).toLowerCase();
   const buttons = await page.$$('[data-testid="booking-card-button"], [data-testid^="offering-book-button"]');
+  const exclude = new Set(excludeTimes12.map(t => t.toLowerCase()));
   const candidates: { btn: (typeof buttons)[number]; time12: string }[] = [];
   try {
     for (const btn of buttons) {
       if (!(await btn.isEnabled().catch(() => false))) continue;
       const timeText = await btn.evaluate(nearestTimeText);
-      if (timeText) candidates.push({ btn, time12: timeText });
+      // excludeTimes12 = times that already failed a click race this run; don't re-click them.
+      if (timeText && !exclude.has(timeText.toLowerCase())) candidates.push({ btn, time12: timeText });
     }
   } catch (err) {
     // Keep a mid-scan page death on the labeled, screenshotted grab-fail path instead of
@@ -519,7 +565,16 @@ async function grabViaDom(page: Page, date: string, time24: string, winStart24?:
   try { await pick.btn.click({ timeout: 5000 }); }
   catch { return { ok: false, reason: 'matched slot button click failed' }; }
   const seat = await clickSeatingAreaForTime(page, pick.time12);
-  return seat.ok ? { ok: true, time12: pick.time12 } : seat;
+  if (!seat.ok) return seat;
+
+  // The click can land on a stale-enabled button (owner-observed: "this time slot is no
+  // longer available", no navigation). Verify the hold started; a lost race is retryable.
+  const hold = await verifyHoldStarted(page);
+  if (hold === 'taken') {
+    console.log(`   🔁 ${pick.time12} was taken at click ("no longer available") — retrying with it excluded`);
+    return { ok: false, reason: `slot taken at click: ${pick.time12} no longer available`, slotTakenAtClick: true, failedTime12: pick.time12 };
+  }
+  return { ok: true, time12: pick.time12 };
 }
 
 /**
@@ -675,7 +730,15 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       }
     });
 
-    await Promise.allSettled(loops);
+    // Proceed to the grab the INSTANT a winner exists — awaiting all loops first left the
+    // detected slot un-grabbed for as long as a straggler's in-flight poll (typically
+    // ~0.5s, up to ~40s if a loser is stuck in the navigate fallback). Loser loops exit
+    // at their next lock.won check; their bodies are fully try/caught, so letting them
+    // settle in the background (browsers closed in the finally) is safe. With no winner,
+    // the wait runs to completion so `outcomes`/`seen` are complete for diagnosis.
+    let loopsDone = false;
+    void Promise.allSettled(loops).then(() => { loopsDone = true; });
+    while (!winner && !loopsDone) await sleep(50);
     const durationMs = () => Date.now() - startTime;
     const seen = buildSeen();
 
@@ -699,10 +762,22 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     // --- Phase 3: grab + purchase (or rehearse, if dryRun) ---
     const dryRun = cfg.dryRun ?? false;
     const screenshots: string[] = [];
-    const grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24, cfg.timeWindowStart24, cfg.timeWindowEnd24);
+    // A lost click race ("no longer available" on a stale-enabled button) is retryable:
+    // reload and grab the next surviving in-window time, excluding what already failed.
+    // Bounded by attempts AND a deadline — chasing retries past the drop's useful life
+    // just delays the diagnosis.
+    const excludedTimes: string[] = [];
+    const grabDeadline = Date.now() + 25000;
+    let grab: GrabResult = { ok: false, reason: 'grab not attempted' };
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24, cfg.timeWindowStart24, cfg.timeWindowEnd24, excludedTimes);
+      if (grab.ok || !grab.slotTakenAtClick || !grab.failedTime12 || Date.now() > grabDeadline) break;
+      excludedTimes.push(grab.failedTime12);
+    }
     if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
-      return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
+      const lostRaces = excludedTimes.length ? ` (lost click races on: ${excludedTimes.join(', ')})` : '';
+      return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}${lostRaces}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
     }
     // The grab may have fallen back to a different surviving time — report what was held.
     bookedTime = grab.time12 ?? winnerSlot.time12;

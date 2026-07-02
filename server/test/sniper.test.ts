@@ -14,6 +14,7 @@ import {
   clickSeatingAreaForTime,
   time12ToMin,
   pickFallbackTime12,
+  holdStateFromPage,
 } from '../src/sniper';
 
 // Compare only the date/time12/offerId of slots (ignore time24/priceCents) where those are the focus.
@@ -386,4 +387,22 @@ test('pickFallbackTime12 ignores unparseable labels and empty input', () => {
   assert.equal(pickFallbackTime12([], '19:00'), null);
   assert.equal(pickFallbackTime12(['Book', 'Notify'], '19:00'), null);
   assert.equal(pickFallbackTime12(['Book', '7:15 PM'], '19:00', '17:00', '20:00'), '7:15 PM');
+});
+
+// --- holdStateFromPage (post-click hold verification: the "button was enabled but the
+// slot was already taken" race the owner has hit in the UI) ---
+
+test('holdStateFromPage: checkout markers or leaving the search page = held', () => {
+  assert.equal(holdStateFromPage(true, false, true), 'held');
+  assert.equal(holdStateFromPage(false, false, false), 'held'); // navigated off search
+  // checkout marker wins even if stale "no longer available" text lingers somewhere
+  assert.equal(holdStateFromPage(true, true, true), 'held');
+});
+
+test('holdStateFromPage: "no longer available" on the search page = taken (retryable)', () => {
+  assert.equal(holdStateFromPage(false, true, true), 'taken');
+});
+
+test('holdStateFromPage: nothing conclusive yet = pending (keep polling)', () => {
+  assert.equal(holdStateFromPage(false, false, true), 'pending');
 });
