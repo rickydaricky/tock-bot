@@ -137,6 +137,7 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
       timeWindowEnd24: sniper.timeWindowEnd24 || undefined,
       maxPriceCents: sniper.maxPriceCents,
       fastPoll: sniper.fastPoll !== false,
+      apiGrab: sniper.apiGrab !== false,
     };
     const cfgError = validateSniperConfig(sniperCfg);
     if (cfgError) {
@@ -285,6 +286,8 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
     timeWindowStart24: sniper?.timeWindowStart24,
     timeWindowEnd24: sniper?.timeWindowEnd24,
     maxPriceCents: sniper?.maxPriceCents,
+    fastPoll: sniper?.fastPoll !== false,
+    apiGrab: sniper?.apiGrab !== false,
   };
   const cfgError = validateSniperConfig(cfg);
   if (cfgError) {
