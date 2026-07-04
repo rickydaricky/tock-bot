@@ -8,8 +8,9 @@ export interface NormalizedSlot {
   date: string;        // YYYY-MM-DD
   time24: string;      // 24h "HH:MM" (for window/closeness math)
   time12: string;      // e.g. "8:00 PM" (for the DOM grab, which matches displayed text)
-  offerId?: string;    // offering id from availability, if present
+  offerId?: string;    // experience id from availability — also the lock's experienceId
   priceCents?: number; // per-person price in cents, if known (for the cap)
+  seatingAreaId?: number; // first seating area id (multi-seating venues); absent = direct-book
 }
 
 /** Minutes-of-day for a 24h "HH:MM" string. */
@@ -128,6 +129,7 @@ export interface TockExperience {
   partySize?: number[];
   price?: { partyRangeConfigs?: Array<{ ticketPriceInformation?: { amountCents?: number } }> };
   ticketPriceInformation?: { amountCents?: number };
+  seatingArea?: Array<{ id?: number | string }>; // present on multi-seating venues (JouJou); [] direct-book (FHH)
 }
 export interface TockOfferings {
   openDate?: string[];   // bookable dates, "YYYY-MM-DD"
@@ -155,6 +157,12 @@ export function parseAvailability(offerings: unknown, partySize: number): Normal
   if (!dates.length || !times24.length || !bookable.length) return [];
   const offerId = String(bookable[0].id);
   const priceCents = experiencePriceCents(bookable[0]);
+  // First seating area id, if the venue is multi-seating (needed by the direct-API lock).
+  // A raw number, or {id}. Absent/[] for direct-book venues like FHH.
+  const rawSeat = bookable[0].seatingArea?.[0];
+  const seatingAreaId = rawSeat == null ? undefined
+    : Number(typeof rawSeat === 'object' ? (rawSeat as { id?: number | string }).id : rawSeat);
+  const seat = Number.isFinite(seatingAreaId as number) ? (seatingAreaId as number) : undefined;
   const out: NormalizedSlot[] = [];
   // ASSUMPTION (holds for prepaid uniform-service venues like Lazy Bear / FHH; unconfirmed
   // for variable-service restaurants): every openTime is valid for every openDate, so we
@@ -162,7 +170,9 @@ export function parseAvailability(offerings: unknown, partySize: number): Normal
   // time the grab can't click, and grabViaDom fails fast on a phantom.
   for (const date of dates) {
     for (const t of times24) {
-      out.push({ date: String(date), time24: String(t), time12: to12Hour(String(t)), offerId, priceCents });
+      const slot: NormalizedSlot = { date: String(date), time24: String(t), time12: to12Hour(String(t)), offerId, priceCents };
+      if (seat !== undefined) slot.seatingAreaId = seat;
+      out.push(slot);
     }
   }
   return out;
@@ -182,6 +192,8 @@ export interface SniperConfig {
                               // "Amount due" exceeds it. Omit for no cap.
   fastPoll?: boolean;         // use the in-page-fetch fast read path (default true). Set false
                               // to force the slower navigate path (A/B or if fast is throttled).
+  apiGrab?: boolean;          // grab via the direct-API lock (default true) — Cloudflare-proof,
+                              // no reload. Set false to force the legacy reload+click grab.
 }
 
 /** Validate a sniper config's money/time fields BEFORE warming any browser. Returns an
@@ -231,7 +243,19 @@ export interface SniperResult {
   seen?: SniperSeen;       // instrumentation: what availability the bot observed
 }
 
-interface Warm { browser: Browser; page: Page }
+interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string> }
+
+/** Attach a request listener that keeps the latest x-tock-* header set the APP puts on its
+ *  own API calls (x-tock-session/fingerprint are stable per session). We reuse these on the
+ *  direct-API lock instead of forging the anti-bot fingerprint. */
+function captureTockHeaders(page: Page, sink: Warm): void {
+  page.on('request', r => {
+    if (!/\/api\/(consumer|ticket)/.test(r.url())) return;
+    const h = r.headers();
+    if (!h['x-tock-session']) return;
+    sink.tockHeaders = Object.fromEntries(Object.entries(h).filter(([k]) => k.startsWith('x-tock-')));
+  });
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -433,8 +457,19 @@ async function verifyHoldStarted(page: Page): Promise<'held' | 'taken'> {
 }
 
 export type GrabResult =
-  | { ok: true; time12?: string }
+  | { ok: true; time12?: string; heldNoCheckout?: boolean } // heldNoCheckout: locked but checkout page not auto-reached (rescue manually)
   | { ok: false; reason: string; slotTakenAtClick?: boolean; failedTime12?: string };
+
+/** The date as Tock renders it on the checkout summary (e.g. "2026-07-11" → "July 11, 2026"),
+ *  so grabViaApi can confirm the held slot matches the intended date before any purchase. */
+export function checkoutDateString(date: string): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!m) return null;
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const mo = months[Number(m[2]) - 1];
+  if (!mo) return null;
+  return `${mo} ${Number(m[3])}, ${m[1]}`;
+}
 
 /** Walk up from a button to the nearest ancestor whose text contains a slot time, and
  *  return that time (e.g. "7:00 PM"). Stopping at the NEAREST time-bearing ancestor is
@@ -499,6 +534,94 @@ export async function clickSeatingAreaForTime(page: Page, want12: string): Promi
   } catch (err) {
     return { ok: false, reason: `seating chooser handling failed: ${errMsg(err)}` };
   }
+}
+
+/** Encode Tock's `PUT /api/ticket/group/lock` protobuf body (reverse-engineered 2026-07-03).
+ *  Outer envelope field 60051 wraps: f1=partySize, f2="YYYY-MM-DDTHH:MM", f3=experienceId,
+ *  f6=0, f13=seatingAreaId (omitted for direct-book venues). All values come from the poll's
+ *  offerings data. Verified byte-identical to a real click-generated lock. */
+export function encodeTockLock(partySize: number, dateTime: string, experienceId: number, seatingAreaId?: number): Buffer {
+  const w = (arr: number[], n: number) => { let v = Math.floor(n); while (v > 0x7f) { arr.push((v & 0x7f) | 0x80); v = Math.floor(v / 128); } arr.push(v & 0x7f); };
+  const field = (arr: number[], f: number, wire: number) => w(arr, f * 8 + wire);
+  const inner: number[] = [];
+  field(inner, 1, 0); w(inner, partySize);
+  field(inner, 2, 2); { const b = Buffer.from(dateTime, 'utf8'); w(inner, b.length); for (const x of b) inner.push(x); }
+  field(inner, 3, 0); w(inner, experienceId);
+  field(inner, 6, 0); w(inner, 0);
+  if (seatingAreaId != null && Number.isFinite(seatingAreaId)) { field(inner, 13, 0); w(inner, seatingAreaId); }
+  const outer: number[] = [];
+  field(outer, 60051, 2); w(outer, inner.length); for (const x of inner) outer.push(x);
+  return Buffer.from(outer);
+}
+
+/** Direct-API grab (Cloudflare-proof): hold the slot by PUTting the lock protobuf via an
+ *  in-page fetch that reuses the warm session's cf_clearance + captured x-tock-* headers —
+ *  NO document navigation, so it never draws the Turnstile that a reload does. On success
+ *  the slot is HELD (~10 min), so the checkout navigation afterward is unhurried and a
+ *  challenge there is retryable. Returns a retryable GrabResult on any non-200 so the
+ *  caller can fall back to the reload+click path (never worse than the old behavior). */
+async function grabViaApi(
+  page: Page, restaurant: string, date: string, time24: string, partySize: number,
+  experienceId: number, seatingAreaId: number | undefined, headers: Record<string, string>,
+): Promise<GrabResult> {
+  // Normalize the time to zero-padded 24h "HH:MM" — the lock datetime must match Tock's format
+  // exactly (a stray "9:00" would build a lock the server rejects).
+  const tm = /^(\d{1,2}):(\d{2})$/.exec(time24.trim());
+  const normTime = tm ? `${tm[1].padStart(2, '0')}:${tm[2]}` : time24.trim();
+  const dateTime = `${date}T${normTime}`;
+  const bodyB64 = encodeTockLock(partySize, dateTime, experienceId, seatingAreaId).toString('base64');
+  const lock = await page.evaluate(async ({ b64, hdrs }) => {
+    const bin = atob(b64); const body = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) body[i] = bin.charCodeAt(i);
+    try {
+      const r = await fetch('/api/ticket/group/lock', {
+        method: 'PUT', credentials: 'include',
+        headers: { 'content-type': 'application/octet-stream', ...hdrs, 'x-tock-stream-format': 'proto2' },
+        body,
+      });
+      const buf = new Uint8Array(await r.arrayBuffer());
+      return { status: r.status, len: buf.length, contentType: r.headers.get('content-type') || '' };
+    } catch (e) { return { status: 0, len: 0, contentType: '', err: String(e) }; }
+  }, { b64: bodyB64, hdrs: headers });
+
+  // A real lock is 200 + a non-trivial protobuf body. Reject an HTML interstitial or a
+  // suspiciously tiny/empty body dressed as 200 (Cloudflare / error envelope) — treating
+  // it as held would skip the reload+click fallback and silently lose the slot.
+  if (lock.status !== 200 || /html/i.test(lock.contentType) || lock.len < 40) {
+    return { ok: false, reason: `API lock not confirmed (HTTP ${lock.status}, ${lock.len}B, ${lock.contentType || 'no-ct'}${lock.err ? ', ' + lock.err : ''}) — falling back` };
+  }
+  console.log(`   🔒 API lock held ${date} ${to12Hour(time24)} (exp ${experienceId}${seatingAreaId != null ? `, seating ${seatingAreaId}` : ''}, ${lock.len}B)`);
+
+  // Slot is held — reach checkout so handlePurchaseFlow can drive add-ons → confirm. The
+  // confirm-purchase page loads the current lock when authenticated (redirects only if the
+  // session isn't logged in). A challenge here is retryable within the ~10-min hold — the
+  // RACE is already won by the lock. Try confirm-purchase, then the /checkout root.
+  const wantDate = checkoutDateString(date);
+  for (const path of ['/checkout/confirm-purchase', '/checkout']) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await page.goto(`https://www.exploretock.com/${restaurant}${path}`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await sleep(1200); // let the SPA settle / route
+      const state = await page.evaluate(() => ({
+        text: ((globalThis as any).document.body?.innerText || '').slice(0, 4000),
+        atCheckout: /\/checkout/.test((globalThis as any).location?.pathname || ''),
+      })).catch(() => ({ text: '', atCheckout: true }));
+      const challenged = /verify you are human|just a moment/i.test(state.text);
+      if (!challenged && state.atCheckout) {
+        // WRONG-SLOT GUARD: same-price slots make the $ cap blind to a wrong date/time, so
+        // confirm the checkout shows the intended date before letting the purchase proceed.
+        if (wantDate && !state.text.includes(wantDate)) {
+          console.log(`   🛑 checkout shows a DIFFERENT date than ${wantDate} — aborting purchase (held slot frozen for inspection)`);
+          return { ok: true, time12: to12Hour(time24), heldNoCheckout: true };
+        }
+        return { ok: true, time12: to12Hour(time24) };
+      }
+      if (challenged) { console.log(`   ⏳ checkout challenged (${path} #${attempt}) — held, retrying`); await sleep(2000); }
+      else break; // redirected off /checkout — try the next path
+    }
+  }
+  // Held but couldn't reach checkout — hold persists (~10 min). Signal so the caller freezes
+  // for manual completion instead of burning the purchase flow on a non-checkout page.
+  return { ok: true, time12: to12Hour(time24), heldNoCheckout: true };
 }
 
 /** Reload-on-hit DOM grab: the poller detected a slot via fetch, but the DOM still
@@ -634,9 +757,11 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         const cookies = await injectCookies(context);
         if (cookies === 0) throw new Error('No Tock cookies configured');
         const page = await context.newPage();
+        const w: Warm = { browser, page };
+        captureTockHeaders(page, w); // fills w.tockHeaders as the app makes its own API calls
         await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 });
-        warm[i] = { browser, page };
-        console.log(`   browser #${i + 1} warm`);
+        warm[i] = w;
+        console.log(`   browser #${i + 1} warm${w.tockHeaders ? ' (tock headers captured)' : ''}`);
       } catch (e) {
         await browser.close().catch(() => {}); // no leak on cookie/nav failure
         throw e;
@@ -762,14 +887,25 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     // --- Phase 3: grab + purchase (or rehearse, if dryRun) ---
     const dryRun = cfg.dryRun ?? false;
     const screenshots: string[] = [];
-    // A lost click race ("no longer available" on a stale-enabled button) is retryable:
-    // reload and grab the next surviving in-window time, excluding what already failed.
-    // Bounded by attempts AND a deadline — chasing retries past the drop's useful life
-    // just delays the diagnosis.
+    let grab: GrabResult = { ok: false, reason: 'grab not attempted' };
+
+    // PRIMARY grab: direct-API lock (Cloudflare-proof — no reload, so no Turnstile). Requires
+    // the captured x-tock headers and the experience id from the poll. Any failure falls
+    // through to the reload+click path below (never worse than the old behavior).
+    const expId = winnerSlot.offerId != null ? Number(winnerSlot.offerId) : NaN;
+    if (cfg.apiGrab !== false && winner.tockHeaders && Number.isFinite(expId)) {
+      grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders);
+      if (!grab.ok) console.log(`   ⚠️ API grab failed (${grab.reason}) — falling back to reload+click`);
+    } else if (cfg.apiGrab !== false) {
+      console.log(`   ⚠️ API grab unavailable (${!winner.tockHeaders ? 'no x-tock headers' : 'no experience id'}) — using reload+click`);
+    }
+
+    // FALLBACK grab: reload+click. A lost click race ("no longer available" on a stale-enabled
+    // button) is retryable — reload and grab the next surviving in-window time, excluding what
+    // already failed. Bounded by attempts AND a deadline.
     const excludedTimes: string[] = [];
     const grabDeadline = Date.now() + 25000;
-    let grab: GrabResult = { ok: false, reason: 'grab not attempted' };
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; !grab.ok && attempt <= 3; attempt++) {
       grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24, cfg.timeWindowStart24, cfg.timeWindowEnd24, excludedTimes);
       if (grab.ok || !grab.slotTakenAtClick || !grab.failedTime12 || Date.now() > grabDeadline) break;
       excludedTimes.push(grab.failedTime12);
@@ -781,6 +917,22 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     }
     // The grab may have fallen back to a different surviving time — report what was held.
     bookedTime = grab.time12 ?? winnerSlot.time12;
+
+    // The API grab held the slot but could NOT auto-reach a matching checkout (redirect,
+    // persistent challenge, or a wrong-date guard trip). Don't burn 30s driving a purchase
+    // flow on a non-checkout page — freeze the held slot so a human completes it inside the
+    // ~10-min window, with an unambiguous reason (distinct from a checkout that hung).
+    if (grab.ok && grab.heldNoCheckout) {
+      const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
+      const reason = `API lock HELD ${bookedDate} ${bookedTime} but checkout not auto-reached — open the frozen session and complete it manually (verify the date first)`;
+      if (dryRun) {
+        return { success: false, bookedDate, bookedTime, dryRun: true, error: `Dry run: ${reason}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
+      }
+      frozenBrowser = winner.browser;
+      const pausedSessionId = freezeSession({ handle: { browser: winner.browser, page: winner.page }, restaurant: req.restaurant, bookedDate, bookedTime, error: reason });
+      console.log(`\n⚠️ ${reason} — session frozen (${pausedSessionId})`);
+      return { success: false, bookedDate, bookedTime, error: reason, screenshots, pausedSessionId, durationMs: durationMs(), polls: pollStats(), seen };
+    }
 
     // handlePurchaseFlow with dryRun=true fills the checkout (add-ons/gratuity/CVC) and
     // stops BEFORE clicking purchase, capturing screenshots — a no-charge rehearsal.

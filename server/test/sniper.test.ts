@@ -15,6 +15,8 @@ import {
   time12ToMin,
   pickFallbackTime12,
   holdStateFromPage,
+  encodeTockLock,
+  checkoutDateString,
 } from '../src/sniper';
 
 // Compare only the date/time12/offerId of slots (ignore time24/priceCents) where those are the focus.
@@ -405,4 +407,51 @@ test('holdStateFromPage: "no longer available" on the search page = taken (retry
 
 test('holdStateFromPage: nothing conclusive yet = pending (keep polling)', () => {
   assert.equal(holdStateFromPage(false, false, true), 'pending');
+});
+
+// --- encodeTockLock: the reverse-engineered PUT /api/ticket/group/lock protobuf body ---
+// The reference b64 was captured live 2026-07-03 from a real JouJou click-generated lock
+// (spike-lock-poc); our constructed bytes must be byte-identical for the same slot.
+
+test('encodeTockLock is byte-identical to a real captured lock (multi-seating)', () => {
+  // JouJou: size 2, 2026-07-21 18:30, experience 583810, seating 40034 (Dining Room).
+  const b64 = encodeTockLock(2, '2026-07-21T18:30', 583810, 40034).toString('base64');
+  assert.equal(b64, 'mqkdHggCEhAyMDI2LTA3LTIxVDE4OjMwGILRIzAAaOK4Ag==');
+});
+
+test('encodeTockLock omits the seating field for direct-book venues (FHH-shape)', () => {
+  // No seatingAreaId → no f13. Decode both and confirm only the seating field differs.
+  const withSeat = encodeTockLock(2, '2026-07-11T19:00', 559289, 40034);
+  const noSeat = encodeTockLock(2, '2026-07-11T19:00', 559289);
+  assert.ok(noSeat.length < withSeat.length, 'direct-book lock is shorter (no seating field)');
+  // f13 tag = 13*8+0 = 104 = 0x68; present with seating, absent without.
+  assert.ok(withSeat.includes(0x68), 'seating variant contains the f13 tag');
+  assert.ok(!noSeat.includes(0x68), 'direct-book variant omits the f13 tag');
+  // The datetime string is present in both.
+  assert.ok(noSeat.toString('latin1').includes('2026-07-11T19:00'));
+});
+
+test('encodeTockLock varint-encodes large experience ids correctly', () => {
+  // Round-trip the f3 experience id through a minimal decoder to guard the varint math.
+  const buf = encodeTockLock(4, '2026-12-31T20:15', 1234567, 99999);
+  const b = [...buf];
+  // Walk to the f3 tag (24 = 3*8+0) and decode its varint.
+  let i = b.indexOf(24, 3);
+  assert.ok(i > -1, 'f3 tag present');
+  i++; let val = 0, shift = 0;
+  while (b[i] & 0x80) { val |= (b[i] & 0x7f) << shift; shift += 7; i++; }
+  val |= b[i] << shift;
+  assert.equal(val >>> 0, 1234567);
+});
+
+// --- checkoutDateString: wrong-slot guard renders the target date as Tock's checkout shows it ---
+test('checkoutDateString formats YYYY-MM-DD as Tock renders it (no leading zero on day)', () => {
+  assert.equal(checkoutDateString('2026-07-11'), 'July 11, 2026');
+  assert.equal(checkoutDateString('2026-07-05'), 'July 5, 2026');
+  assert.equal(checkoutDateString('2026-12-31'), 'December 31, 2026');
+});
+test('checkoutDateString returns null for malformed input (guard degrades safely)', () => {
+  assert.equal(checkoutDateString('7/11/2026'), null);
+  assert.equal(checkoutDateString('2026-13-01'), null);
+  assert.equal(checkoutDateString(''), null);
 });
