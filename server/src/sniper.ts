@@ -890,8 +890,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     let grab: GrabResult = { ok: false, reason: 'grab not attempted' };
 
     // PRIMARY grab: direct-API lock (Cloudflare-proof — no reload, so no Turnstile). Requires
-    // the captured x-tock headers and the experience id from the poll. Any failure falls
-    // through to the reload+click path below (never worse than the old behavior).
+    // the captured x-tock headers and the experience id from the poll.
     const expId = winnerSlot.offerId != null ? Number(winnerSlot.offerId) : NaN;
     if (cfg.apiGrab !== false && winner.tockHeaders && Number.isFinite(expId)) {
       grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders);
@@ -900,15 +899,31 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       console.log(`   ⚠️ API grab unavailable (${!winner.tockHeaders ? 'no x-tock headers' : 'no experience id'}) — using reload+click`);
     }
 
-    // FALLBACK grab: reload+click. A lost click race ("no longer available" on a stale-enabled
-    // button) is retryable — reload and grab the next surviving in-window time, excluding what
-    // already failed. Bounded by attempts AND a deadline.
+    // The API lock may HOLD the slot yet fail to auto-reach checkout (paid flows need the
+    // client-side Book click — a fresh /checkout load redirects). Remember that: the slot is
+    // already held, so the reload+click below is unhurried (a challenge on its reload is
+    // retryable), and if it can't reach checkout either we still freeze the held slot.
+    const apiHeld = grab.ok === true && grab.heldNoCheckout === true;
+    const apiHeldResult = apiHeld ? grab : null;
+
+    // reload+click grab: reaches checkout via the client-side Book click. Runs when the API
+    // grab didn't fully succeed (failed, or held-without-checkout). A lost click race is
+    // retryable — grab the next surviving in-window time, excluding what already failed.
     const excludedTimes: string[] = [];
     const grabDeadline = Date.now() + 25000;
-    for (let attempt = 1; !grab.ok && attempt <= 3; attempt++) {
-      grab = await grabViaDom(winner.page, bookedDate, winnerSlot.time24, cfg.timeWindowStart24, cfg.timeWindowEnd24, excludedTimes);
-      if (grab.ok || !grab.slotTakenAtClick || !grab.failedTime12 || Date.now() > grabDeadline) break;
-      excludedTimes.push(grab.failedTime12);
+    if (!grab.ok || apiHeld) {
+      let dom: GrabResult = { ok: false, reason: 'reload+click not attempted' };
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        dom = await grabViaDom(winner.page, bookedDate, winnerSlot.time24, cfg.timeWindowStart24, cfg.timeWindowEnd24, excludedTimes);
+        if (dom.ok || !dom.slotTakenAtClick || !dom.failedTime12 || Date.now() > grabDeadline) break;
+        excludedTimes.push(dom.failedTime12);
+      }
+      // Prefer a reload+click that actually reached checkout. Otherwise, if the API lock had
+      // held the slot, keep that held result (freeze for manual completion) rather than the
+      // reload's failure — the slot is genuinely secured.
+      if (dom.ok && !(dom as { heldNoCheckout?: boolean }).heldNoCheckout) grab = dom;
+      else if (apiHeldResult) grab = apiHeldResult;
+      else grab = dom;
     }
     if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
