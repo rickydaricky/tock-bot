@@ -243,16 +243,19 @@ export interface SniperResult {
   seen?: SniperSeen;       // instrumentation: what availability the bot observed
 }
 
-interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string> }
+interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string>; tockHeaderHits?: number }
 
 /** Attach a request listener that keeps the latest x-tock-* header set the APP puts on its
  *  own API calls (x-tock-session/fingerprint are stable per session). We reuse these on the
- *  direct-API lock instead of forging the anti-bot fingerprint. */
+ *  direct-API lock instead of forging the anti-bot fingerprint.
+ *  Capture from ANY same-origin request carrying x-tock-session — modal-UI restaurants
+ *  (n/naka, FHH) fire these on /api/graphql/* at load but may not fire /api/consumer/offerings
+ *  passively, so restricting to consumer/ticket missed them (observed live 2026-07-05). */
 function captureTockHeaders(page: Page, sink: Warm): void {
   page.on('request', r => {
-    if (!/\/api\/(consumer|ticket)/.test(r.url())) return;
     const h = r.headers();
-    if (!h['x-tock-session']) return;
+    if (!h['x-tock-session'] || !/exploretock\.com/.test(r.url())) return;
+    sink.tockHeaderHits = (sink.tockHeaderHits ?? 0) + 1;
     sink.tockHeaders = Object.fromEntries(Object.entries(h).filter(([k]) => k.startsWith('x-tock-')));
   });
 }
@@ -783,8 +786,12 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         const w: Warm = { browser, page };
         captureTockHeaders(page, w); // fills w.tockHeaders as the app makes its own API calls
         await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // The app's x-tock-header-bearing calls fire ~1-2s after domcontentloaded — settle
+        // until the listener has captured them so the direct-API grab has headers ready even
+        // if the drop window starts immediately.
+        for (let t = 0; t < 7000 && !w.tockHeaders; t += 250) await sleep(250);
         warm[i] = w;
-        console.log(`   browser #${i + 1} warm${w.tockHeaders ? ' (tock headers captured)' : ''}`);
+        console.log(`   browser #${i + 1} warm${w.tockHeaders ? ` (tock headers captured, ${w.tockHeaderHits} hits)` : ' (NO tock headers)'}`);
       } catch (e) {
         await browser.close().catch(() => {}); // no leak on cookie/nav failure
         throw e;
@@ -921,7 +928,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       apiDiag = grab.ok ? (grab.heldNoCheckout ? 'API held (no auto-checkout)' : 'API held + checkout') : `API: ${grab.reason}`;
       if (!grab.ok) console.log(`   ⚠️ API grab failed (${grab.reason}) — falling back to reload+click`);
     } else if (cfg.apiGrab !== false) {
-      apiDiag = `API skipped: ${!winner.tockHeaders ? 'no x-tock headers captured' : 'no experience id in offerings'}`;
+      apiDiag = `API skipped: ${!winner.tockHeaders ? `no x-tock headers (${winner.tockHeaderHits ?? 0} x-tock reqs seen)` : 'no experience id in offerings'}`;
       console.log(`   ⚠️ ${apiDiag} — using reload+click`);
     }
 
