@@ -818,17 +818,26 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         const page = await context.newPage();
         const w: Warm = { browser, page };
         captureTockHeaders(page, w); // fills w.tockHeaders as the app makes its own API calls
-        await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 });
-        // The app's x-tock-header-bearing calls fire ~1-2s after domcontentloaded — settle
-        // until the listener has captured them so the direct-API grab has headers ready even
-        // if the drop window starts immediately.
-        for (let t = 0; t < 5000 && !w.tockHeaders; t += 250) await sleep(250);
-        // Modal-UI restaurants (n/naka, FHH) fire NO x-tock request passively on the server —
-        // reconstruct the headers from page state so the API grab still works.
+        // The warm-up navigation intermittently draws a Cloudflare "Just a moment…" challenge
+        // on the Railway IP (confirmed FHH + n/naka 2026-07-05) — the app never boots, so no
+        // x-tock headers. It's INTERMITTENT (FHH's warm loaded fine on 2026-07-03), so retry
+        // the navigation until the app actually boots (window.store present). Warm-up is not
+        // time-critical (runs before the drop window), so a few retries are free.
+        let booted = false;
+        for (let attempt = 1; attempt <= 5 && !booted; attempt++) {
+          await page.goto(searchUrlFor(req, req.dates[0]), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+          for (let t = 0; t < 6000; t += 300) {
+            booted = await page.evaluate(() => !!(globalThis as any).store?.getState || !!(globalThis as any).sessionStorage?.getItem('tock_session')).catch(() => false);
+            if (booted || w.tockHeaders) { booted = true; break; }
+            await sleep(300);
+          }
+          if (!booted) { console.log(`   browser #${i + 1} warm attempt ${attempt}: Cloudflare challenge / app not booted — retrying`); await sleep(1500); }
+        }
+        // headers from request-capture if the app fired them, else reconstruct from page state.
         if (!w.tockHeaders) { w.tockHeaders = (await readTockHeadersFromPage(page)) ?? undefined; w.headerSource = w.tockHeaders ? 'page' : 'none'; }
         else { w.headerSource = 'request'; }
         warm[i] = w;
-        console.log(`   browser #${i + 1} warm (headers: ${w.headerSource})`);
+        console.log(`   browser #${i + 1} warm (booted=${booted}, headers: ${w.headerSource})`);
       } catch (e) {
         await browser.close().catch(() => {}); // no leak on cookie/nav failure
         throw e;
