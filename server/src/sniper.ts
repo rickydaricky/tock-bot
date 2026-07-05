@@ -947,8 +947,16 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
       const why = seen.anyTargetDate
         ? `requested date was bookable but no time matched (window ${cfg.timeWindowStart24 ?? 'any'}–${cfg.timeWindowEnd24 ?? 'any'}); times seen on target date: [${seen.targetDateTimes.join(', ') || 'none'}]${capNote}`
         : 'requested date never became bookable in the window';
+      // WARM-UP HEALTH probe: did the app actually load (headers/store) or is the warm page a
+      // Cloudflare challenge? Reveals for a sold-out restaurant (e.g. FHH) whether the
+      // reload-free API grab would even have headers at the real drop.
+      const warmProbe = live[0] ? await live[0].page.evaluate(() => {
+        const g: any = globalThis;
+        return { hdrs: undefined, ss: !!g.sessionStorage?.getItem('tock_session'), fp: !!g.localStorage?.getItem('fingerprint'), hasStore: !!g.store?.getState, title: (g.document?.title || '').slice(0, 24) };
+      }).catch(() => null) : null;
+      const warmDiag = warmProbe ? ` · [warm: src=${live[0].headerSource}, ss=${warmProbe.ss}, fp=${warmProbe.fp}, store=${warmProbe.hasStore}, title="${warmProbe.title}"]` : '';
       console.log(`\n❌ Sniper no match — ${why}`);
-      return { success: false, error: `No matching slot in window — ${why} · ${summarizeFailures(outcomes)}`, durationMs: durationMs(), polls: pollStats(), seen, screenshots: shot ? [shot] : undefined };
+      return { success: false, error: `No matching slot in window — ${why} · ${summarizeFailures(outcomes)}${warmDiag}`, durationMs: durationMs(), polls: pollStats(), seen, screenshots: shot ? [shot] : undefined };
     }
 
     // --- Phase 3: grab + purchase (or rehearse, if dryRun) ---
