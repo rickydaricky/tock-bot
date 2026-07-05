@@ -243,7 +243,7 @@ export interface SniperResult {
   seen?: SniperSeen;       // instrumentation: what availability the bot observed
 }
 
-interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string>; tockHeaderHits?: number; headerSource?: 'request' | 'page' | 'none' }
+interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string>; tockHeaderHits?: number; headerSource?: 'request' | 'page' | 'page-grab' | 'none' }
 
 /** Attach a request listener that keeps the latest x-tock-* header set the APP puts on its
  *  own API calls (x-tock-session/fingerprint are stable per session). We reuse these on the
@@ -959,13 +959,31 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     // PRIMARY grab: direct-API lock (Cloudflare-proof — no reload, so no Turnstile). Requires
     // the captured x-tock headers and the experience id from the poll.
     const expId = winnerSlot.offerId != null ? Number(winnerSlot.offerId) : NaN;
+    // Last-chance header read at GRAB time (the page has been alive far longer than at warm —
+    // the app has had time to init sessionStorage even on modal pages).
+    if (cfg.apiGrab !== false && !winner.tockHeaders) {
+      const late = await readTockHeadersFromPage(winner.page);
+      if (late) { winner.tockHeaders = late; winner.headerSource = 'page-grab'; }
+    }
     let apiDiag = 'API grab off'; // surfaced in the final error so history shows the API path
     if (cfg.apiGrab !== false && winner.tockHeaders && Number.isFinite(expId)) {
       grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders);
       apiDiag = `hdrs:${winner.headerSource}, ` + (grab.ok ? (grab.heldNoCheckout ? 'API held (no auto-checkout)' : 'API held + checkout') : `API: ${grab.reason}`);
       if (!grab.ok) console.log(`   ⚠️ API grab failed (${grab.reason}) — falling back to reload+click`);
     } else if (cfg.apiGrab !== false) {
-      apiDiag = `API skipped: ${!winner.tockHeaders ? `no x-tock headers (${winner.tockHeaderHits ?? 0} x-tock reqs seen)` : 'no experience id in offerings'}`;
+      // Probe WHY headers are missing so the failure is diagnosable from history.
+      const probe = await winner.page.evaluate(() => {
+        const g: any = globalThis;
+        return {
+          ss: !!g.sessionStorage?.getItem('tock_session'),
+          fp: !!g.localStorage?.getItem('fingerprint'),
+          url: g.location?.pathname,
+          challenged: /verify you are human|just a moment/i.test(g.document?.body?.innerText || ''),
+          hasStore: !!g.store?.getState,
+          title: (g.document?.title || '').slice(0, 28),
+        };
+      }).catch((e: unknown) => ({ err: String(e) }));
+      apiDiag = `API skipped: no headers (reqs:${winner.tockHeaderHits ?? 0}, probe:${JSON.stringify(probe)})`;
       console.log(`   ⚠️ ${apiDiag} — using reload+click`);
     }
 
