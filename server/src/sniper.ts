@@ -243,7 +243,7 @@ export interface SniperResult {
   seen?: SniperSeen;       // instrumentation: what availability the bot observed
 }
 
-interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string>; tockHeaderHits?: number }
+interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string>; tockHeaderHits?: number; headerSource?: 'request' | 'page' | 'none' }
 
 /** Attach a request listener that keeps the latest x-tock-* header set the APP puts on its
  *  own API calls (x-tock-session/fingerprint are stable per session). We reuse these on the
@@ -258,6 +258,39 @@ function captureTockHeaders(page: Page, sink: Warm): void {
     sink.tockHeaderHits = (sink.tockHeaderHits ?? 0) + 1;
     sink.tockHeaders = Object.fromEntries(Object.entries(h).filter(([k]) => k.startsWith('x-tock-')));
   });
+}
+
+/** Fallback header source: reconstruct the x-tock-* set directly from page state, for
+ *  modal-UI restaurants (n/naka, FHH) that fire NO x-tock request during passive warm-up on
+ *  the authenticated server (confirmed 2026-07-05: 0 x-tock reqs seen). session lives in
+ *  sessionStorage, fingerprint in localStorage, businessId/build/experiments in the embedded
+ *  state — all verified byte-equal to the real headers the app sends. Returns null if the
+ *  essential session/fingerprint aren't present yet. */
+async function readTockHeadersFromPage(page: Page): Promise<Record<string, string> | null> {
+  return page.evaluate(() => {
+    const g: any = globalThis;
+    const strip = (s: string | null) => (s || '').replace(/^"|"$/g, '');
+    const session = strip(g.sessionStorage?.getItem('tock_session'));
+    const fingerprint = strip(g.localStorage?.getItem('fingerprint'));
+    if (!session || !fingerprint) return null;
+    const html: string = g.document.documentElement.outerHTML;
+    const m = (re: RegExp) => (html.match(re) || [])[1];
+    const build = (html.match(/servingstack-[\w.-]+/) || [])[0] || '';
+    const bid = m(/"businessId"\s*:\s*"?(\d+)"?/) || m(/\\"businessId\\":\s*\\?"?(\d+)/) || '';
+    const gid = m(/"businessGroupId"\s*:\s*"?(\d+)"?/) || m(/\\"businessGroupId\\":\s*\\?"?(\d+)/) || '';
+    const exp = (html.match(/WidgetBusinessNeighborhood:[^"'\\]+/) || [])[0] || '';
+    const h: Record<string, string> = {
+      'x-tock-session': session,
+      'x-tock-fingerprint': fingerprint,
+      'x-tock-stream-format': 'proto2',
+      'x-tock-path': g.location.pathname,
+      'x-tock-scope': JSON.stringify({ businessId: bid ? Number(bid) : undefined, businessGroupId: gid || undefined, site: 'EXPLORETOCK' }),
+      'x-tock-metro-area-id': '10',
+    };
+    if (build) h['x-tock-build-number'] = build;
+    if (exp) h['x-tock-experimentvariantlist'] = exp;
+    return h;
+  }).catch(() => null);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -789,9 +822,13 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         // The app's x-tock-header-bearing calls fire ~1-2s after domcontentloaded — settle
         // until the listener has captured them so the direct-API grab has headers ready even
         // if the drop window starts immediately.
-        for (let t = 0; t < 7000 && !w.tockHeaders; t += 250) await sleep(250);
+        for (let t = 0; t < 5000 && !w.tockHeaders; t += 250) await sleep(250);
+        // Modal-UI restaurants (n/naka, FHH) fire NO x-tock request passively on the server —
+        // reconstruct the headers from page state so the API grab still works.
+        if (!w.tockHeaders) { w.tockHeaders = (await readTockHeadersFromPage(page)) ?? undefined; w.headerSource = w.tockHeaders ? 'page' : 'none'; }
+        else { w.headerSource = 'request'; }
         warm[i] = w;
-        console.log(`   browser #${i + 1} warm${w.tockHeaders ? ` (tock headers captured, ${w.tockHeaderHits} hits)` : ' (NO tock headers)'}`);
+        console.log(`   browser #${i + 1} warm (headers: ${w.headerSource})`);
       } catch (e) {
         await browser.close().catch(() => {}); // no leak on cookie/nav failure
         throw e;
@@ -925,7 +962,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     let apiDiag = 'API grab off'; // surfaced in the final error so history shows the API path
     if (cfg.apiGrab !== false && winner.tockHeaders && Number.isFinite(expId)) {
       grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders);
-      apiDiag = grab.ok ? (grab.heldNoCheckout ? 'API held (no auto-checkout)' : 'API held + checkout') : `API: ${grab.reason}`;
+      apiDiag = `hdrs:${winner.headerSource}, ` + (grab.ok ? (grab.heldNoCheckout ? 'API held (no auto-checkout)' : 'API held + checkout') : `API: ${grab.reason}`);
       if (!grab.ok) console.log(`   ⚠️ API grab failed (${grab.reason}) — falling back to reload+click`);
     } else if (cfg.apiGrab !== false) {
       apiDiag = `API skipped: ${!winner.tockHeaders ? `no x-tock headers (${winner.tockHeaderHits ?? 0} x-tock reqs seen)` : 'no experience id in offerings'}`;
