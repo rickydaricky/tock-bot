@@ -554,6 +554,25 @@ export function encodeTockLock(partySize: number, dateTime: string, experienceId
   return Buffer.from(outer);
 }
 
+/** Classify a `PUT /api/ticket/group/lock` response. The endpoint returns HTTP 200 for BOTH
+ *  a real hold and a conflict (the conflict body is a short human-readable error like
+ *  "someone else just selected this and it is no longer available" — confirmed live on
+ *  n/naka 2026-07-05, ~89 bytes; a real lock is a large protobuf, ~1200+ bytes, echoing the
+ *  reservation). Checking only the status/size would treat a conflict as a win and skip the
+ *  fallback. `text` is the response body's printable chars.
+ *   - 'blocked'  → not even a lock response (HTML interstitial / network error) → fall back
+ *   - 'conflict' → 200 but the slot was taken → retry another time / fall back
+ *   - 'held'     → a genuine lock */
+export function lockResponseVerdict(status: number, contentType: string, len: number, text: string): 'held' | 'conflict' | 'blocked' {
+  if (status !== 200 || /html/i.test(contentType || '')) return 'blocked';
+  // Human-readable failure phrases never appear in a genuine lock (which echoes the
+  // restaurant/date/time), so any of these means the hold did not take.
+  if (/no longer available|unfortunately|not available|already (taken|selected|booked|reserved|held)|sold\s*out|unable to|cannot be|invalid|expired|error/i.test(text || '')) return 'conflict';
+  // A real lock body is substantial; a stray tiny 200 with no error text is still suspect.
+  if (len < 150) return 'conflict';
+  return 'held';
+}
+
 /** Direct-API grab (Cloudflare-proof): hold the slot by PUTting the lock protobuf via an
  *  in-page fetch that reuses the warm session's cf_clearance + captured x-tock-* headers —
  *  NO document navigation, so it never draws the Turnstile that a reload does. On success
@@ -580,15 +599,19 @@ async function grabViaApi(
         body,
       });
       const buf = new Uint8Array(await r.arrayBuffer());
-      return { status: r.status, len: buf.length, contentType: r.headers.get('content-type') || '' };
-    } catch (e) { return { status: 0, len: 0, contentType: '', err: String(e) }; }
+      // Decode printable text from the protobuf body — a real lock echoes reservation
+      // details; a conflict returns a short human-readable error ("no longer available").
+      const text = new TextDecoder().decode(buf).replace(/[^\x20-\x7e]/g, ' ');
+      return { status: r.status, len: buf.length, contentType: r.headers.get('content-type') || '', text: text.slice(0, 400) };
+    } catch (e) { return { status: 0, len: 0, contentType: '', text: '', err: String(e) }; }
   }, { b64: bodyB64, hdrs: headers });
 
-  // A real lock is 200 + a non-trivial protobuf body. Reject an HTML interstitial or a
-  // suspiciously tiny/empty body dressed as 200 (Cloudflare / error envelope) — treating
-  // it as held would skip the reload+click fallback and silently lose the slot.
-  if (lock.status !== 200 || /html/i.test(lock.contentType) || lock.len < 40) {
-    return { ok: false, reason: `API lock not confirmed (HTTP ${lock.status}, ${lock.len}B, ${lock.contentType || 'no-ct'}${lock.err ? ', ' + lock.err : ''}) — falling back` };
+  // Reject anything that isn't a genuine lock so we correctly fall back / retry instead of
+  // treating a conflict as a win (the endpoint returns HTTP 200 with an ERROR body — e.g.
+  // "no longer available" — for a taken slot; confirmed live on n/naka 2026-07-05).
+  const verdict = lockResponseVerdict(lock.status, lock.contentType, lock.len, lock.text);
+  if (verdict !== 'held') {
+    return { ok: false, reason: `API lock not confirmed (${verdict}: HTTP ${lock.status}, ${lock.len}B${lock.err ? ', ' + lock.err : ''}${lock.text.trim() ? ', "' + lock.text.trim().slice(0, 60) + '"' : ''}) — falling back`, slotTakenAtClick: verdict === 'conflict', failedTime12: to12Hour(time24) };
   }
   console.log(`   🔒 API lock held ${date} ${to12Hour(time24)} (exp ${experienceId}${seatingAreaId != null ? `, seating ${seatingAreaId}` : ''}, ${lock.len}B)`);
 
@@ -892,11 +915,14 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     // PRIMARY grab: direct-API lock (Cloudflare-proof — no reload, so no Turnstile). Requires
     // the captured x-tock headers and the experience id from the poll.
     const expId = winnerSlot.offerId != null ? Number(winnerSlot.offerId) : NaN;
+    let apiDiag = 'API grab off'; // surfaced in the final error so history shows the API path
     if (cfg.apiGrab !== false && winner.tockHeaders && Number.isFinite(expId)) {
       grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders);
+      apiDiag = grab.ok ? (grab.heldNoCheckout ? 'API held (no auto-checkout)' : 'API held + checkout') : `API: ${grab.reason}`;
       if (!grab.ok) console.log(`   ⚠️ API grab failed (${grab.reason}) — falling back to reload+click`);
     } else if (cfg.apiGrab !== false) {
-      console.log(`   ⚠️ API grab unavailable (${!winner.tockHeaders ? 'no x-tock headers' : 'no experience id'}) — using reload+click`);
+      apiDiag = `API skipped: ${!winner.tockHeaders ? 'no x-tock headers captured' : 'no experience id in offerings'}`;
+      console.log(`   ⚠️ ${apiDiag} — using reload+click`);
     }
 
     // The API lock may HOLD the slot yet fail to auto-reach checkout (paid flows need the
@@ -928,7 +954,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     if (!grab.ok) {
       const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
       const lostRaces = excludedTimes.length ? ` (lost click races on: ${excludedTimes.join(', ')})` : '';
-      return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}${lostRaces}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
+      return { success: false, bookedDate, bookedTime: winnerSlot.time12, dryRun, error: `Grab failed: ${grab.reason}${lostRaces} · [${apiDiag}]`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
     }
     // The grab may have fallen back to a different surviving time — report what was held.
     bookedTime = grab.time12 ?? winnerSlot.time12;

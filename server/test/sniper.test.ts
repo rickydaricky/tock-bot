@@ -17,6 +17,7 @@ import {
   holdStateFromPage,
   encodeTockLock,
   checkoutDateString,
+  lockResponseVerdict,
 } from '../src/sniper';
 
 // Compare only the date/time12/offerId of slots (ignore time24/priceCents) where those are the focus.
@@ -454,4 +455,24 @@ test('checkoutDateString returns null for malformed input (guard degrades safely
   assert.equal(checkoutDateString('7/11/2026'), null);
   assert.equal(checkoutDateString('2026-13-01'), null);
   assert.equal(checkoutDateString(''), null);
+});
+
+// --- lockResponseVerdict: the lock endpoint returns HTTP 200 for BOTH held and conflict ---
+test('lockResponseVerdict: a large protobuf body with no error text = held', () => {
+  // A real lock echoes reservation details (restaurant/date/time), ~1200+ bytes.
+  const real = 'JouJou Dinner Reservation 2026-07-21T18:30 ' + 'x'.repeat(1200);
+  assert.equal(lockResponseVerdict(200, 'application/octet-stream', 1227, real), 'held');
+});
+test('lockResponseVerdict: HTTP 200 with a "no longer available" body = conflict (the n/naka bug)', () => {
+  assert.equal(lockResponseVerdict(200, 'application/octet-stream', 89, 'W  M Unfortunately, someone else just selected this and it is no longer available. ('), 'conflict');
+});
+test('lockResponseVerdict: other conflict phrasings and a tiny 200 = conflict', () => {
+  assert.equal(lockResponseVerdict(200, 'application/octet-stream', 60, 'this time is already taken'), 'conflict');
+  assert.equal(lockResponseVerdict(200, 'application/octet-stream', 40, 'sold out'), 'conflict');
+  assert.equal(lockResponseVerdict(200, 'application/octet-stream', 30, ''), 'conflict'); // tiny, no marker → still suspect
+});
+test('lockResponseVerdict: non-200 or HTML interstitial = blocked', () => {
+  assert.equal(lockResponseVerdict(403, 'text/html', 5000, 'verify you are human'), 'blocked');
+  assert.equal(lockResponseVerdict(200, 'text/html', 5000, 'just a moment'), 'blocked');
+  assert.equal(lockResponseVerdict(0, '', 0, ''), 'blocked');
 });
