@@ -23,6 +23,7 @@
  */
 import { chromium, Browser, Page, BrowserContext, Frame } from 'playwright';
 import { injectCookies } from './cookies';
+import type { Platform } from './cookies';
 import { fillStripePayment, fillStripeBilling, PaymentDetails, getPayment } from './stripe';
 
 /**
@@ -59,6 +60,7 @@ export interface BookingRequest {
   time: string;        // HH:MM 24-hour
   autoPurchase?: boolean;
   dryRun?: boolean;
+  platform?: Platform;
 }
 
 /**
