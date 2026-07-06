@@ -243,36 +243,42 @@ async function handleAlarmTrigger(alarmName: string) {
  * Uses a `chrome.tabs.onUpdated` listener rather than awaiting `chrome.tabs.reload`, because reload
  * resolves when the command is accepted, not when the page has actually finished loading. Notes:
  *  - `completed` flag + explicit listener removal prevent double-resolve and listener leaks.
- *  - Hard 5s timeout rejects so a hung navigation can't stall the whole booking run.
- *  - A 150ms buffer after 'complete' gives the page's scripts a moment to initialize before the
+ *  - **Soft timeout, never reject.** If the page does not report 'complete' within `timeoutMs`
+ *    (a slow load or a Cloudflare interstitial that stalls the reload), we RESOLVE and let the
+ *    caller proceed instead of throwing. The downstream content-script `fill()` polls the DOM for
+ *    up to 30s, so "try anyway" is strictly better than aborting an otherwise-winnable snipe on a
+ *    slow reload. The old behavior — reject after a hard 5s — turned a slow drop into a total miss.
+ *  - The window defaults to 15s (was 5s) so a legitimately slow-but-completing reload finishes and
+ *    resolves on its real 'complete' event, rather than being cut off early.
+ *  - A 150ms buffer after resolving gives the page's scripts a moment to initialize before the
  *    content script is messaged (empirically avoids racing Tock's client-side hydration).
  */
-async function waitForTabReload(tabId: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    console.log(`⏳ [DEBUG] waitForTabReload: Setting up listener for tab ${tabId}`);
+async function waitForTabReload(tabId: number, timeoutMs = 15000): Promise<void> {
+  return new Promise((resolve) => {
+    console.log(`⏳ [DEBUG] waitForTabReload: Setting up listener for tab ${tabId} (timeout ${timeoutMs}ms)`);
 
     let completed = false;
+    const finish = (reason: string) => {
+      if (completed) return;
+      completed = true;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      console.log(`✅ [DEBUG] waitForTabReload: resolving (${reason}) for tab ${tabId}`);
+      // Add a small buffer delay for stability
+      setTimeout(() => resolve(), 150);
+    };
+
     const timeout = setTimeout(() => {
-      if (!completed) {
-        completed = true;
-        chrome.tabs.onUpdated.removeListener(listener);
-        console.error(`❌ [DEBUG] waitForTabReload: Timeout after 5s`);
-        reject(new Error('Tab reload timeout after 5 seconds'));
-      }
-    }, 5000); // 5 second timeout
+      // Soft timeout — proceed rather than abort. A slow/challenged reload is often still usable,
+      // and the content-script fill() has its own polling; never fail the whole snipe here.
+      console.warn(`⚠️ [DEBUG] waitForTabReload: ${timeoutMs}ms elapsed without 'complete' — proceeding anyway`);
+      finish('timeout');
+    }, timeoutMs);
 
     const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
       console.log(`📡 [DEBUG] Tab update event: tab ${updatedTabId}, status: ${changeInfo.status}`);
-
       if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        if (!completed) {
-          completed = true;
-          clearTimeout(timeout);
-          chrome.tabs.onUpdated.removeListener(listener);
-          console.log(`✅ [DEBUG] waitForTabReload: Tab ${tabId} completed loading`);
-          // Add a small buffer delay for stability
-          setTimeout(() => resolve(), 150);
-        }
+        finish('complete');
       }
     };
 
