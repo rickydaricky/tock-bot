@@ -636,14 +636,17 @@ export class OpenTableFormFiller {
 }
 
 /** Parse an explicit UPFRONT charge in cents from booking-page text, or null if there's only a
- *  conditional no-show/cancellation fee (which is not an upfront charge). Fail-closed: any $ amount
- *  tied to charge/total/deposit/prepay/due counts; "no-show"/"cancellation" conditional lines do not. */
+ *  conditional no-show/cancellation fee (which is not an upfront charge). Fail-closed: a $ amount on
+ *  any line that reads like a real charge (broad keyword set below) counts; "no-show"/"cancellation"
+ *  conditional lines do not. The keyword set is deliberately wide so an off-label charge ("Payment",
+ *  "Cost", "You pay", …) can't slip past — the residual gap is truly novel phrasing on a card-on-file
+ *  prepaid restaurant, which should be verified manually before enabling auto-purchase there. */
 export function parseOtUpfrontChargeCents(text: string): number | null {
   const lines = (text || '').split('\n');
   let max: number | null = null;
   for (const line of lines) {
     if (/no.?show|cancellation/i.test(line)) continue; // conditional fee, not an upfront charge
-    if (!/charge|total|deposit|prepay|amount due|due now|pay now/i.test(line)) continue;
+    if (!/charge|charged|total|subtotal|deposit|prepay|prepaid|amount due|due now|pay now|payment|you pay|cost|price|per person|per guest|billed|non-?refundable|ticket/i.test(line)) continue;
     const m = line.match(/\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)/);
     if (m) {
       const cents = Math.round(parseFloat(m[1].replace(/,/g, '')) * 100);
@@ -663,8 +666,8 @@ export async function completeOpenTableBooking(flag: OtBookingFlag): Promise<boo
   if (!btn) { console.error('OT: complete-reservation button not found'); return false; }
 
   // FAIL-CLOSED: a card-entry (Stripe) form means no card on file / prepaid — v1 does not fill it.
-  const stripe = document.querySelector('iframe[src*="stripe" i], iframe[title*="card" i], iframe[title*="secure card" i]');
-  if (stripe) { console.warn('OT: card-entry form present — aborting (fail-closed). Complete manually / add a card on file.'); return false; }
+  const cardForm = document.querySelector('iframe[src*="stripe" i], iframe[src*="braintree" i], iframe[src*="adyen" i], iframe[title*="card" i], iframe[title*="payment" i], iframe[name*="payment" i], iframe[title*="secure" i]');
+  if (cardForm) { console.warn('OT: card-entry form present — aborting (fail-closed). Complete manually / add a card on file.'); return false; }
 
   // FAIL-CLOSED: an explicit upfront charge over the cap (or with no cap set) aborts.
   const upfront = parseOtUpfrontChargeCents(document.body.innerText || '');
