@@ -29,10 +29,11 @@
  */
 import cron from 'node-cron';
 import { EventEmitter } from 'events';
-import { runBooking, BookingRequest } from './booker';
-import { BlitzConfig, runBlitz, AttemptOutcome } from './blitz';
+import { BookingRequest } from './booker';
+import { BlitzConfig, AttemptOutcome } from './blitz';
 import { runSniper, SniperConfig, SniperResult, SniperSeen } from './sniper';
 import { notifyResult } from './notify';
+import { getBookingEngine } from './engines';
 
 /**
  * Process-wide bus for run outcomes. `executeBooking` emits 'booking-result' with the
@@ -169,7 +170,8 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       result = sniperResult;
       sniperMeta = { polls: sniperResult.polls, seen: sniperResult.seen, durationMs: sniperResult.durationMs };
     } else if (booking.blitz && booking.blitz.attempts > 1) {
-      const blitzResult = await runBlitz(booking, booking.blitz, booking.runAt);
+      const engine = getBookingEngine(booking.platform);
+      const blitzResult = await engine.runBlitz(booking, booking.blitz, booking.runAt);
       result = blitzResult.result;
       blitzMeta = {
         winningAttempt: blitzResult.winningAttempt,
@@ -179,7 +181,8 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
         attempts: blitzResult.attempts,
       };
     } else {
-      result = await runBooking(booking);
+      const engine = getBookingEngine(booking.platform);
+      result = await engine.runBooking(booking);
     }
 
     const entry: BookingHistoryEntry = {

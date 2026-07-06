@@ -23,9 +23,9 @@
 import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
-import { runBooking, BookingRequest } from './booker';
+import { BookingRequest } from './booker';
 import { getBookingEngine } from './engines';
-import { runBlitz, BlitzConfig } from './blitz';
+import { BlitzConfig } from './blitz';
 import { runSniper, SniperConfig, validateSniperConfig } from './sniper';
 import { listSessions, sessionScreenshot, applyAction } from './sessions';
 import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
@@ -181,6 +181,10 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid runAt datetime' });
   }
 
+  if (rest.platform === 'opentable' && sniper) {
+    return res.status(400).json({ success: false, error: 'OpenTable does not support sniper scheduling yet' });
+  }
+
   // cron is only needed for recurring schedules (no runAt).
   // When runAt is set, the scheduler uses setTimeout for precise timing.
   let cronExpr = rest.cron;
@@ -260,7 +264,8 @@ app.post('/api/blitz', requireAuth, async (req, res) => {
     staggerMs: blitz.staggerMs || 1000,
   };
   try {
-    const result = await runBlitz(bookingReq, config);
+    const engine = getBookingEngine(bookingReq.platform);
+    const result = await engine.runBlitz(bookingReq, config);
     const entry = {
       id: crypto.randomUUID(),
       restaurant: bookingReq.restaurant,
@@ -379,6 +384,9 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
   const { sniper, ...bk } = req.body;
   if (!bk.restaurant || !bk.dates?.length || !bk.time || !bk.partySize) {
     return res.status(400).json({ success: false, error: 'Missing required fields: restaurant, dates, time, partySize' });
+  }
+  if (bk.platform === 'opentable') {
+    return res.status(400).json({ success: false, error: 'Sniper mode is Tock-only for now (OpenTable sniper is Phase 2). Use /api/book or /api/blitz.' });
   }
   const cfg: SniperConfig = {
     pool: Math.min(Math.max(sniper?.pool ?? 5, 1), 6),
