@@ -1,6 +1,49 @@
+/**
+ * form-filler.ts — Tock checkout form-filler content script.
+ *
+ * Single responsibility: drive a Tock reservation from search-form fill through
+ * slot booking and (optionally) auto-purchase, entirely by simulating user input
+ * against Tock's live DOM. This is the browser-extension half of the project (the
+ * Node/Playwright sniper server is the other); it runs inside the page as a content
+ * script and has no privileged access — every interaction is a `.click()`, a
+ * dispatched change event, or a coordinate handed to the local automation server.
+ *
+ * Pipeline (roughly the order methods fire):
+ *   1. `fill()` — party size / date / time into the search form, then submit.
+ *      If already on the search results URL, skips straight to booking.
+ *   2. `waitForAndClickBookButton()` / `findBookButton()` — race to click the
+ *      time-slot "Book" button as soon as it renders (MutationObserver + aggressive
+ *      polling), matching the user's preferred time (exact, else nearest).
+ *   3. `handlePurchaseFlow()` — walks the add-ons interstitials to the purchase page.
+ *   4. `handlePurchaseConfirmation()` — the payoff: checks consent boxes, and because
+ *      card/billing live in cross-origin Stripe iframes the content script cannot
+ *      touch, hands their viewport coordinates + card details to the local
+ *      AppleScript+cliclick server (localhost:3847) which types them via OS input.
+ *
+ * A large fraction of this file is defensive DOM heuristics: Tock ships multiple
+ * calendar/date-cell shapes and re-renders slots dynamically, so many methods try a
+ * cascade of selectors (strict → loose) and verify against the visible date-button
+ * text rather than trusting a single query. Those quirks are reverse-engineered and
+ * annotated inline where they bite.
+ *
+ * Key export: `TockFormFiller` (class).
+ */
 import { FormElements, FormFillerOptions, TockPreferences } from '../types';
 import { isTockSearchUrl } from '../utils/url-builder';
 
+/**
+ * Orchestrates a single Tock reservation attempt against the live page DOM.
+ *
+ * One instance drives one booking: construct it with the user's `preferences`
+ * (party size, date, time, and — when auto-purchase is on — card/billing details),
+ * then call `fill()`. Public surface the caller (content-script entry point) uses:
+ * `fill()`, `tryMultipleDates()`, and `handlePurchaseFlow()`.
+ *
+ * State is intentionally minimal and per-attempt: `attempts`/`maxAttempts` are the
+ * shared retry budget reused across the poll loops, and `dateButtonRef` is cached so
+ * date-selection code can read back the button's visible label to *verify* a click
+ * actually changed the selected date (Tock's calendars can silently no-op).
+ */
 export class TockFormFiller {
   private preferences: TockPreferences;
   private waitForForm: boolean;
@@ -9,6 +52,10 @@ export class TockFormFiller {
   private maxAttempts: number = 10;
   private dateButtonRef: HTMLElement | null = null; // Reference to the date button
 
+  /**
+   * `waitForForm` and `autoSubmit` default to true: absent an explicit opt-out we
+   * assume a fully hands-off run (poll for the form, then submit and book).
+   */
   constructor(options: FormFillerOptions) {
     this.preferences = options.preferences;
     this.waitForForm = options.waitForForm ?? true;
@@ -24,7 +71,13 @@ export class TockFormFiller {
   }
 
   /**
-   * Ensure the Tock calendar dropdown is open
+   * Ensure the Tock calendar dropdown is open, clicking the date button to open it
+   * if needed.
+   *
+   * Gotcha: `.ConsumerCalendar` stays in the DOM even when the dropdown is closed,
+   * so mere existence is not "open". We treat it as open only when it's both
+   * CSS-visible (display/visibility/opacity) *and* has non-zero layout size — either
+   * check alone gives false positives.
    */
   private async ensureCalendarIsOpen(): Promise<void> {
     // Get the root container (modal if present, otherwise document)
@@ -108,8 +161,14 @@ export class TockFormFiller {
   }
 
   /**
-   * Get all available dates from the Tock calendar
-   * Returns array of date strings in YYYY-MM-DD format
+   * Get all available dates from the Tock calendar as YYYY-MM-DD strings.
+   *
+   * Tock's day cells carry the ISO date in `aria-label`. We probe a cascade of
+   * selectors from strictest (available, in-month, not disabled/sold) to loosest
+   * (any button whose aria-label mentions a "202x" year) and take the first that
+   * matches anything — the strict classes aren't always present, but when they are
+   * they filter out greyed-out/sold days. Results are de-duped because two month
+   * panes render side by side and share boundary dates.
    */
   private async getAvailableDatesFromCalendar(): Promise<string[]> {
     const availableDates: string[] = [];
@@ -198,7 +257,14 @@ export class TockFormFiller {
   }
 
   /**
-   * Try multiple dates in sequence, filtering to only available dates
+   * Public entry point for a multi-date search: given a prioritized list of desired
+   * YYYY-MM-DD dates, book the first one that yields a slot.
+   *
+   * Desired dates are intersected with what the calendar actually offers (order of
+   * `desiredDates` preserved) so we never click dead cells. For each candidate we
+   * click the date, look for a matching book button, and on the first hit click it —
+   * kicking off the async purchase flow when auto-purchase is enabled — and return
+   * true. Returns false only if every desired-and-available date is exhausted.
    */
   public async tryMultipleDates(desiredDates: string[]): Promise<boolean> {
     console.log(`🎯 Starting multi-date search`);
@@ -278,7 +344,16 @@ export class TockFormFiller {
   }
 
   /**
-   * Fill the Tock reservation form with the provided preferences
+   * Primary public entry point: fill and submit the Tock reservation form.
+   *
+   * Branches on where we start:
+   *  - Already on a search-results URL → the form was pre-filled by the URL, so skip
+   *    straight to `waitForAndClickBookButton()` (this is the fast path the sniper
+   *    relies on — no form manipulation, minimal latency to the click).
+   *  - On a restaurant page → find/fill the form (waiting for it to mount when
+   *    `waitForForm`), then submit.
+   * Returns true if the flow reached a successful book/submit, false on any failure
+   * to find the form or (in the search-page path) the book button.
    */
   public async fill(): Promise<boolean> {
     try {
@@ -586,7 +661,15 @@ export class TockFormFiller {
   }
 
   /**
-   * Helper method to find a book button for the user's preferred time slot
+   * Find the "Book" button for the user's preferred time slot (or the nearest time).
+   *
+   * The button itself carries no time; the time label lives in a sibling/ancestor,
+   * so for each `booking-card-button` we walk up to 5 ancestors looking for a
+   * "5:00 PM"-style string and parse it to minutes-since-midnight. We prefer an exact
+   * match to the preferred time, and otherwise fall back to the slot with the
+   * smallest absolute minute difference. Before returning, the chosen button is
+   * verified visible and scrolled into view so the later `.click()` lands. Returns
+   * null when no timed slots are present yet (caller keeps polling).
    */
   private async findBookButton(): Promise<HTMLElement | null> {
     // Convert preference time to 12-hour format for matching
@@ -782,7 +865,16 @@ export class TockFormFiller {
   }
 
   /**
-   * Set the date by clicking the date button and selecting the date
+   * Set the date by opening the calendar and clicking the target day.
+   *
+   * Two things worth knowing:
+   *  - ISO `YYYY-MM-DD` input is parsed field-by-field into a *local* Date at noon,
+   *    not via `new Date(str)` (which parses ISO as UTC and can shift the day back
+   *    one for negative-offset timezones). Noon keeps the day stable under DST math.
+   *  - Selection is best-effort with escalating retries: try `findAndClickDate`,
+   *    retry after a delay, then close/reopen the picker and fall back to Tock-
+   *    specific handling and finally a raw `<input type=date>` if one exists. The
+   *    redundancy exists because Tock's calendar occasionally swallows the first click.
    */
   private async setDate(dateButton: HTMLElement, targetDate: string): Promise<void> {
     // Parse the target date string, ensuring it's in the correct format
@@ -1137,7 +1229,16 @@ export class TockFormFiller {
   }
 
   /**
-   * Special handling for Tock calendar
+   * Tock-specific date clicker: four strategies tried in descending precision.
+   *
+   *   1. Exact `button[aria-label="YYYY-MM-DD"]` (Tock's canonical day cell).
+   *   2. `.ConsumerCalendar-day` cells filtered to in-month + available.
+   *   3. `[data-testid="consumer-calendar-day"]` cells with matching day text.
+   *   4. Brute force: any visible element on the page whose text equals the day.
+   *
+   * Every strategy clicks then *verifies* by re-reading `dateButtonRef`'s label for
+   * the day number before declaring success — a click that doesn't move the selection
+   * (disabled/out-of-month cell) is treated as a miss so the next strategy runs.
    */
   private async handleTockCalendar(calendar: HTMLElement, day: number, month: number, year: number): Promise<boolean> {
     try {
@@ -1273,7 +1374,15 @@ export class TockFormFiller {
   }
 
   /**
-   * Navigate to the correct month in the calendar
+   * Page the calendar to `targetMonth`/`targetYear` by clicking prev/next.
+   *
+   * Reads the currently displayed month/year from the header (trying several header
+   * shapes and both long and short month names), computes the signed month delta, and
+   * clicks the corresponding arrow that many times. Header text and nav buttons are
+   * located heuristically (aria-label/title/class, then geometric left-vs-right
+   * position as a last resort) because the calendar markup isn't stable. After the
+   * final click it re-reads the header and, if still short of target, nudges up to 3
+   * more months to absorb off-by-one drift. `targetMonth` is 0-indexed (JS months).
    */
   private async navigateToCorrectMonth(calendar: HTMLElement, targetMonth: number, targetYear: number): Promise<boolean> {
     // Get current displayed month/year from calendar header
@@ -1483,7 +1592,13 @@ export class TockFormFiller {
   }
 
   /**
-   * Set the time in the time select dropdown
+   * Select the target time in the `<select>` dropdown, dispatching a `change` event
+   * so React notices the programmatic selection.
+   *
+   * The preference is 24-hour ("17:00") but options render 12-hour ("5:00 PM"), so we
+   * format and look for an exact option-text match first; failing that we parse every
+   * option into minutes-since-midnight and pick the closest, matching the same
+   * nearest-time tolerance `findBookButton` uses for slots.
    */
   private async setTime(timeSelect: HTMLSelectElement, targetTime: string): Promise<void> {
     // Format the time to match what's in the dropdown
@@ -1550,8 +1665,14 @@ export class TockFormFiller {
   }
 
   /**
-   * Handle the purchase flow after clicking the book button
-   * Detects add-ons page or purchase confirmation and handles accordingly
+   * Public: drive from the just-clicked book button to a completed purchase.
+   *
+   * Tock may interpose zero or more add-ons/supplement interstitials before the
+   * payment page, in two shapes (inline "confirm" button vs a "View Order" modal), so
+   * this is a poll loop (up to 30s): whenever an add-ons page appears we dismiss it
+   * and `continue` looping; when the purchase button appears we hand off to
+   * `handlePurchaseConfirmation()`. Returns false on timeout or if an interstitial
+   * handler fails.
    */
   public async handlePurchaseFlow(): Promise<boolean> {
     console.log('🛒 Starting auto-purchase flow...');
@@ -1677,9 +1798,24 @@ export class TockFormFiller {
   }
 
   /**
-   * Handle the purchase confirmation page
-   * Detects Stripe Payment Element (new) or Braintree (legacy)
-   * Sends card details to the local automation server for typing
+   * The payoff step: fill and submit the payment page.
+   *
+   * Why this is convoluted: card and billing fields live inside *cross-origin* Stripe
+   * iframes (Payment Element = card/expiry/CVC in one iframe; Address Element =
+   * name/address in a second), which a content script legally cannot read or type
+   * into. So instead of injecting values we compute each iframe's viewport rectangle
+   * and POST those coordinates + the card/billing details to the local automation
+   * server (localhost:3847 /trigger-cvc), which uses OS-level AppleScript+cliclick to
+   * click and keystroke into the real fields. Legacy Braintree (single CVC iframe) is
+   * detected as a fallback and flagged via `isStripe:false`.
+   *
+   * Coordinate quirk: for Stripe we aim ~30px below the iframe top (the card-number
+   * row) rather than its center, since the payment iframe stacks card/expiry/CVC.
+   *
+   * After triggering we wait a fixed ~8s for the server to finish typing, then click
+   * the purchase button. An Enter-key listener is also armed as a manual fallback so a
+   * human can submit if the server never responds. Returns true once setup/handoff is
+   * done (not a guarantee the charge succeeded).
    */
   private async handlePurchaseConfirmation(): Promise<boolean> {
     try {
@@ -1838,7 +1974,13 @@ export class TockFormFiller {
   }
 
   /**
-   * Check all consent checkboxes on the purchase confirmation page
+   * Tick the required consent checkboxes (terms-of-service, marketing opt-in) so the
+   * purchase button enables.
+   *
+   * Only real `type="checkbox"` inputs are clicked — the selectors also match label
+   * headings, and clicking those would toggle nothing or scroll focus. Missing boxes
+   * are treated as optional (not every event has both), and already-checked ones are
+   * left alone to avoid un-checking.
    */
   private async checkPurchaseCheckboxes(): Promise<void> {
     console.log('☑️ Checking consent checkboxes...');

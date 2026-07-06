@@ -1,7 +1,37 @@
+/**
+ * blitz.ts — "blitz mode" booker: fire several independent booking attempts in
+ * parallel, staggered in time across the moment a restaurant's reservations
+ * "drop", to maximize the chance of grabbing a slot in a heavily contested drop.
+ *
+ * Role in the system: an alternative to the single-shot `booker.ts` flow and the
+ * poll-based `sniper.ts` engine. Where the sniper races a single warm browser,
+ * blitz throws N fully independent browsers (each with its own fingerprint and
+ * Tock session cookies) at the same drop, offset by a few hundred/thousand ms so
+ * that if the drop lands slightly early or late, at least one attempt reloads at
+ * the right instant. The first attempt to book aborts the rest.
+ *
+ * Design invariants:
+ * - Every browser is warmed (launched + navigated to the search page) BEFORE the
+ *   drop, so the critical action at drop time is a cheap `page.reload()` rather
+ *   than a cold navigation.
+ * - Single-winner: a shared AbortSignal short-circuits the losing attempts the
+ *   moment one succeeds, so we never double-book.
+ * - Per-attempt outcomes are tracked and grouped so the caller can see WHY each
+ *   attempt failed (not just that the blitz as a whole did).
+ *
+ * Key exports:
+ * - {@link runBlitz} — orchestrator: warm N browsers, stagger reloads around the
+ *   drop, run the booking flow on each, return the winner or a grouped failure.
+ * - {@link BlitzConfig}, {@link BlitzResult}, {@link AttemptOutcome} — I/O types.
+ * - {@link summarizeFailures} — collapse per-attempt errors into a one-line summary.
+ * - {@link getFingerprint} — deterministic UA/viewport per attempt index.
+ * - {@link safeShot} — best-effort screenshot for failure diagnosis.
+ */
 import { chromium, Browser, Page } from 'playwright';
 import { BookingRequest, BookingResult, STEALTH_ARGS, randomDelay, to12Hour, handlePurchaseFlow } from './booker';
 import { injectCookies } from './cookies';
 
+/** Caller-tunable blitz parameters. `attempts` is clamped to 1-5 in {@link runBlitz}. */
 export interface BlitzConfig {
   attempts: number;    // 1-5
   staggerMs: number;   // ms between each attempt, e.g. 1000
@@ -16,6 +46,13 @@ export interface AttemptOutcome {
   bookedTime?: string;
 }
 
+/**
+ * Aggregate result of a blitz run. `result` mirrors the winning attempt's
+ * BookingResult on success, or a synthesized failure (grouped error + up to a
+ * few failure screenshots) when every attempt loses. `totalAttempted` counts
+ * only attempts that actually reloaded; `totalAborted` counts ones skipped or
+ * short-circuited by the single-winner abort.
+ */
 export interface BlitzResult {
   success: boolean;
   winningAttempt?: number;   // 1-indexed
@@ -42,6 +79,9 @@ export function summarizeFailures(outcomes: AttemptOutcome[]): string {
 }
 
 // -- Fingerprint pool for anti-detection --
+// N parallel browsers all booking the same drop from the same IP is an obvious
+// bot signal to Tock. Giving each attempt a distinct UA + viewport makes them
+// look like N different real devices instead of one script fanned out.
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -59,6 +99,12 @@ const VIEWPORTS = [
   { width: 1280, height: 800 },
 ];
 
+/**
+ * Deterministically map an attempt index to a UA + viewport pair. Modulo-wraps
+ * so attempt counts beyond the pool size still get a fingerprint (attempts may
+ * then repeat a fingerprint, which is acceptable — the pools have >= 5 entries,
+ * matching the max of 5 attempts, so in practice each attempt is unique).
+ */
 export function getFingerprint(index: number) {
   return {
     userAgent: USER_AGENTS[index % USER_AGENTS.length],
@@ -66,6 +112,7 @@ export function getFingerprint(index: number) {
   };
 }
 
+/** Promise-based delay. Used to align each attempt to its stagger offset. */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -79,6 +126,7 @@ export async function safeShot(page: Page): Promise<string | null> {
   }
 }
 
+/** A pre-launched browser already navigated to the search page, ready to reload at drop time. */
 interface WarmBrowser {
   browser: Browser;
   page: Page;
@@ -149,6 +197,9 @@ export async function runBlitz(
         console.log(`   Browser #${i + 1} navigating to warm up...`);
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
+        // Write into warmBrowsers by index (not push) so slot i stays aligned
+        // with offsets[i]/getFingerprint(i); failed launches leave a hole
+        // (undefined) that the attempt phase treats as "skipped".
         const wb: WarmBrowser = { browser, page };
         warmBrowsers[i] = wb;
         console.log(`   Browser #${i + 1} ready`);
@@ -156,6 +207,8 @@ export async function runBlitz(
       })
     );
 
+    // Warmups are best-effort: proceed as long as at least one browser is ready.
+    // Only a total wipeout (every launch rejected) is a hard failure.
     const launchFailures = launchResults.filter(r => r.status === 'rejected');
     if (launchFailures.length === n) {
       const err = (launchFailures[0] as PromiseRejectedResult).reason;
@@ -172,7 +225,11 @@ export async function runBlitz(
     }
     console.log(`✅ ${n - launchFailures.length} browsers warmed up`);
 
-    // Phase 2: Wait until drop time, then stagger reload + book attempts
+    // Phase 2: Wait until drop time, then stagger reload + book attempts.
+    // minOffset is the (negative) offset of the earliest attempt, so adding it to
+    // the drop time makes the global wait end when the FIRST attempt should fire
+    // — i.e. slightly before the drop. Each attempt then adds its normalizedOffset
+    // (earliest = 0) on top, reconstructing the intended spread around the drop.
     if (runAt) {
       const targetTime = new Date(runAt).getTime() + minOffset;
       const waitMs = targetTime - Date.now();
@@ -199,7 +256,9 @@ export async function runBlitz(
       }
 
       try {
-        // Wait for this attempt's stagger offset + small jitter
+        // Wait for this attempt's stagger offset + small jitter. The 0-100ms
+        // jitter breaks up perfectly-uniform timing (another bot tell) and keeps
+        // attempts from hammering Tock at the exact same millisecond.
         const jitter = Math.floor(Math.random() * 100);
         const delay = normalizedOffsets[i] + jitter;
         if (delay > 0) await sleep(delay);
@@ -228,6 +287,10 @@ export async function runBlitz(
         // Now run the booking logic on the refreshed page
         const result = await runBookingFromPage(wb.page, req, signal);
 
+        // Single-winner claim. This block has no `await`, so it runs atomically
+        // relative to other attempts — the first to enter it flips `signal.aborted`
+        // via abort(), and any attempt that resolves in the same tick then sees the
+        // aborted signal and records itself as 'aborted' instead of double-booking.
         if (result.success && !signal.aborted) {
           console.log(`\n🏆 Attempt #${attemptNum} SUCCEEDED — aborting others`);
           winningAttempt = attemptNum;
@@ -325,7 +388,10 @@ async function runBookingFromPage(
 
     if (signal?.aborted) return { success: false, error: 'Aborted', screenshots };
 
-    // Read available dates
+    // Read available dates from Tock's calendar. Availability is encoded purely
+    // in CSS classes: a day is bookable only if it's `is-available` and in the
+    // current month, and NOT `is-disabled` or `is-sold` — the aria-label carries
+    // the human-readable date string we match req.dates against.
     const availableDates = await page.$$eval(
       '.ConsumerCalendar-day.is-available.is-in-month:not(.is-disabled):not(.is-sold)',
       els => els.map(el => el.getAttribute('aria-label')).filter(Boolean) as string[]
@@ -360,6 +426,9 @@ async function runBookingFromPage(
       let matchedButton = null;
       let matchedTimeText = '';
 
+      // Tock's booking button has no time attribute of its own — the time label
+      // lives on a nearby ancestor. Walk up to 6 parent levels looking for the
+      // first "H:MM AM/PM" text to associate a slot time with each button.
       for (const button of bookButtons) {
         const timeText = await button.evaluate((el: any) => {
           let node = el;
@@ -375,12 +444,15 @@ async function runBookingFromPage(
 
         if (!timeText) continue;
 
+        // Exact match on the requested time wins immediately.
         if (timeText.toLowerCase() === preferredTime12.toLowerCase()) {
           matchedButton = button;
           matchedTimeText = timeText;
           break;
         }
 
+        // Otherwise remember the FIRST slot seen as a fallback — grabbing any
+        // slot for a hot drop beats grabbing none, and slots go fast.
         if (!matchedButton) {
           matchedButton = button;
           matchedTimeText = timeText;

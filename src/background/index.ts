@@ -1,3 +1,29 @@
+/**
+ * Extension service worker (MV3 background script) for the Tock Reservation Form Filler.
+ *
+ * Single responsibility: own all persistent, popup-independent state and coordination for
+ * scheduled auto-booking. The popup is ephemeral (closes constantly), so the drop-timing
+ * countdown, cross-frame message relaying, and tab orchestration must live here.
+ *
+ * What it does:
+ *  - Scheduling: converts a user-configured "drop time" into a `chrome.alarms` timer that fires
+ *    `leadTimeMs` early, then at fire time reloads the target tab and tells the content script to
+ *    grab a slot. Persists the timer to storage so it survives the service worker being torn down.
+ *  - Alarm recovery: MV3 service workers are killed aggressively and can lose in-memory state, so
+ *    `onStartup` re-hydrates and recreates any still-future alarm from persisted `ActiveTimer`.
+ *  - Message routing: relays cross-origin `CLICK_RESERVE_BUTTON` from the main page into all frames
+ *    (iframes), and services SCHEDULE_TIMER / CANCEL_TIMER / GET_TIMER_STATUS / FILL_FORM requests
+ *    from the popup.
+ *  - Platform dispatch: Tock and Resy get a navigate-to-search-URL-then-refresh strategy; other
+ *    platforms (OpenTable) fall back to the generic single-date form-fill message.
+ *
+ * Key entry points (all module-scoped — a service worker has no ES exports):
+ *  - `scheduleTimer`, `cancelTimer`, `getTimerStatus` — timer lifecycle.
+ *  - `handleAlarmTrigger` — the drop-time execution path.
+ *  - `attemptFormFill` / `attemptManualFormFill` — scheduled (with refresh) vs. user-initiated fills.
+ *  - `buildDesiredDatesList` — expands preferences into the ordered date list content scripts try.
+ *  - The `chrome.runtime.onMessage` listener — popup/content-script command router.
+ */
 // This is the background script for the Tock Reservation Form Filler extension
 import { Message, TockPreferences, ActiveTimer } from '../types';
 import { DEFAULT_PREFERENCES, saveActiveTimer, loadActiveTimer, clearActiveTimer, loadPreferences } from '../utils/storage';
@@ -8,8 +34,17 @@ import { buildTockSearchUrl, buildTockSearchUrlWithDate, buildResySearchUrl, bui
 console.log('Tock Form Filler Background Script Loaded');
 
 /**
- * Build the complete list of desired dates to try
- * Returns array of date strings in YYYY-MM-DD format
+ * Build the ordered list of dates the content script should try, in YYYY-MM-DD format.
+ *
+ * Ordering is load-bearing: `preferences.date` (the primary date) is always index 0, and callers
+ * (`attemptFormFill` / `attemptManualFormFill`) navigate to the search URL for `desiredDates[0]`.
+ *
+ * Precedence of the extra dates:
+ *  1. Calendar-selected `selectedDates` win outright — if the user hand-picked dates, the auto-scan
+ *     range is ignored entirely (they're mutually exclusive, not additive).
+ *  2. Otherwise, if `useFirstAvailableAfter` is on, scan ±`maxDaysToScan` (default 7) days around the
+ *     primary date. The offset==0 case is skipped because the primary date is already index 0.
+ * Duplicates are de-duped so the primary date is never retried redundantly.
  */
 function buildDesiredDatesList(preferences: TockPreferences): string[] {
   const desiredDates: string[] = [];
@@ -54,9 +89,14 @@ function buildDesiredDatesList(preferences: TockPreferences): string[] {
   return desiredDates;
 }
 
+/**
+ * Prefix for every scheduled-search alarm name. The `onAlarm` listener filters on this prefix so
+ * that unrelated alarms (from Chrome or other extension features) are ignored; concrete alarm names
+ * append a `Date.now()` timestamp for uniqueness (see `scheduleTimer`).
+ */
 const ALARM_NAME_PREFIX = 'tock-auto-search';
 
-// Listen for installation
+// On first install, seed storage with DEFAULT_PREFERENCES so the popup has a valid baseline config.
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
     console.log('Extension installed');
@@ -69,7 +109,14 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
-// Restore active timer on startup (e.g., after browser restart)
+/**
+ * Alarm recovery on browser/service-worker startup.
+ *
+ * `chrome.alarms` normally persist, but a browser restart (or a lost worker) can leave a still-
+ * 'scheduled' `ActiveTimer` in storage whose backing alarm no longer exists. Here we reconcile:
+ * if the persisted timer has no live alarm, recreate it when the fire time is still in the future,
+ * otherwise treat it as expired and clear it so the popup doesn't show a stale countdown.
+ */
 chrome.runtime.onStartup.addListener(async () => {
   console.log('Extension startup - checking for active timers');
   const activeTimer = await loadActiveTimer();
@@ -96,7 +143,7 @@ chrome.runtime.onStartup.addListener(async () => {
   }
 });
 
-// Listen for alarms
+// Alarm fired: only our scheduled-search alarms (matching ALARM_NAME_PREFIX) trigger a booking run.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   console.log(`🔔 [DEBUG] Alarm listener triggered for: ${alarm.name}`);
   if (alarm.name.startsWith(ALARM_NAME_PREFIX)) {
@@ -108,7 +155,16 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 });
 
-// Handle alarm trigger - execute the form filling
+/**
+ * Drop-time execution path: run once when a scheduled alarm fires.
+ *
+ * Guards against a stale/mismatched alarm (the persisted timer must name this exact alarm), then
+ * drives the timer through running → completed/failed while persisting each transition so the popup
+ * reflects live state even though this worker may be killed between events. `alarmFireTime` is
+ * threaded into `preferences` and logged at each stage purely to measure end-to-end latency from
+ * alarm fire to slot grab (every ms matters at a competitive drop). The whole body is wrapped so an
+ * exception can never leave the timer stuck in 'running'.
+ */
 async function handleAlarmTrigger(alarmName: string) {
   const alarmFireTime = Date.now();
   console.log(`⏰ [TIMING] Alarm fired at: ${new Date(alarmFireTime).toISOString()}`);
@@ -181,7 +237,16 @@ async function handleAlarmTrigger(alarmName: string) {
   }
 }
 
-// Wait for a tab to finish reloading
+/**
+ * Resolve once the given tab reaches `status === 'complete'` after a reload/navigation.
+ *
+ * Uses a `chrome.tabs.onUpdated` listener rather than awaiting `chrome.tabs.reload`, because reload
+ * resolves when the command is accepted, not when the page has actually finished loading. Notes:
+ *  - `completed` flag + explicit listener removal prevent double-resolve and listener leaks.
+ *  - Hard 5s timeout rejects so a hung navigation can't stall the whole booking run.
+ *  - A 150ms buffer after 'complete' gives the page's scripts a moment to initialize before the
+ *    content script is messaged (empirically avoids racing Tock's client-side hydration).
+ */
 async function waitForTabReload(tabId: number): Promise<void> {
   return new Promise((resolve, reject) => {
     console.log(`⏳ [DEBUG] waitForTabReload: Setting up listener for tab ${tabId}`);
@@ -216,8 +281,16 @@ async function waitForTabReload(tabId: number): Promise<void> {
   });
 }
 
-// Attempt to fill the form manually (for user-initiated fills)
-// Similar to attemptFormFill but WITHOUT the refresh step
+/**
+ * User-initiated "fill now" path (the popup's manual button).
+ *
+ * Mirrors `attemptFormFill` but deliberately omits the reload/retry loop: the user is present and
+ * acting now, so we navigate straight to the freshly-built search URL for the primary date and hand
+ * the full `desiredDates` list to the content script to try. Tock and Resy each build a
+ * platform-specific dated search URL; anything else falls back to the generic single-date
+ * `sendAutoFillFormMessage`. Errors are swallowed into `{ success: false }` so a bad tab/URL can't
+ * throw into the message handler.
+ */
 async function attemptManualFormFill(tabId: number, preferences: TockPreferences, desiredDates: string[]): Promise<{ success: boolean }> {
   try {
     // Get the tab to check its URL
@@ -312,8 +385,18 @@ async function attemptManualFormFill(tabId: number, preferences: TockPreferences
   }
 }
 
-// Attempt to fill the form on a specific tab with multiple dates (for scheduled automatic fills)
-// Includes a refresh to get fresh data from the server at drop time
+/**
+ * Scheduled (alarm-driven) fill path — the critical drop-time attempt.
+ *
+ * Key difference from the manual path: it *reloads* the tab first. `scheduleTimer` already parked
+ * the tab on the search URL, so at the drop we don't navigate; we reload to force fresh availability
+ * from the server (a stale cached page would show sold-out slots). When `autoRefreshOnNoSlots` is
+ * set, it loops up to `maxRefreshRetries` (default 3) with *no* delay — immediate re-reloads to race
+ * slots that appear a beat late. Returns as soon as the content script reports success. Tock and
+ * Resy share this reload-then-message strategy; other platforms fall back to the generic single-date
+ * message. Reload/wait/message failures re-throw inside the loop and are caught at the outer try so
+ * the caller records a clean failure rather than a hang.
+ */
 async function attemptFormFill(tabId: number, preferences: TockPreferences, desiredDates: string[]): Promise<{ success: boolean }> {
   try {
     // Get the tab to check its URL
@@ -485,7 +568,19 @@ async function attemptFormFill(tabId: number, preferences: TockPreferences, desi
   }
 }
 
-// Schedule a new timer
+/**
+ * Create (and persist) the timer that fires at drop time.
+ *
+ * Fires `leadTimeMs` (default 200ms) *before* `dropTime` to absorb alarm/scheduling jitter and the
+ * reload latency, so the slot-grab lands right at the drop rather than after it. Throws if drop time
+ * is missing or the computed fire time is already in the past. Any prior timer is cancelled first so
+ * there is only ever one active alarm.
+ *
+ * Side effect that's easy to miss: for Tock/Resy it immediately navigates the tab to the search URL
+ * so the page is "warm" and only needs a cheap reload at fire time (see `attemptFormFill`). If the
+ * search URL can't be built we leave the tab as-is and rely on the content script's form-filling
+ * fallback. OpenTable intentionally gets no pre-navigation.
+ */
 async function scheduleTimer(preferences: TockPreferences, tabId: number): Promise<ActiveTimer> {
   // Clear any existing timer
   await cancelTimer();
@@ -559,7 +654,11 @@ async function scheduleTimer(preferences: TockPreferences, tabId: number): Promi
   return timer;
 }
 
-// Cancel the active timer
+/**
+ * Cancel the active timer: clear the backing `chrome.alarms` entry and remove the persisted timer.
+ * Marks the timer 'cancelled' before clearing so any listener observing storage sees the terminal
+ * state. No-op if there is no active timer.
+ */
 async function cancelTimer(): Promise<void> {
   const activeTimer = await loadActiveTimer();
 
@@ -578,12 +677,23 @@ async function cancelTimer(): Promise<void> {
   }
 }
 
-// Get current timer status
+/** Return the persisted active timer (or null) so the popup can render its countdown/status. */
 async function getTimerStatus(): Promise<ActiveTimer | null> {
   return await loadActiveTimer();
 }
 
-// Listen for messages from popup
+/**
+ * Central command router for popup and content-script messages.
+ *
+ * Every branch that does async work returns `true` to keep the message channel open until
+ * `sendResponse` fires — omitting it would drop the reply and hang the caller.
+ *
+ * Handled messages:
+ *  - CLICK_RESERVE_BUTTON: re-broadcasts to *all* frames of the sender's tab so the reserve click
+ *    reaches the cross-origin reservation iframe (the main-page content script can't reach into it).
+ *  - CANCEL_TIMER / GET_TIMER_STATUS / SCHEDULE_TIMER: timer lifecycle proxied to the helpers above.
+ *  - FILL_FORM: manual "fill now" — expands the date list and runs the no-refresh fill path.
+ */
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
   console.log('Background received message:', message);
 

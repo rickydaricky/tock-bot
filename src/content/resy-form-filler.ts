@@ -1,10 +1,49 @@
+/**
+ * resy-form-filler.ts — Resy (resy.com) checkout automation content script.
+ *
+ * Responsibility: given a set of booking preferences, drive Resy's Angular
+ * venue page to grab an available time slot and advance into the reservation
+ * flow — pick the slot closest to the preferred time, then click "Reserve Now".
+ * If the current date has no availability, optionally walk a list of fallback
+ * dates via the calendar until one has open slots.
+ *
+ * Role in the system: the Resy sibling of `form-filler.ts` (Tock) and
+ * `opentable-form-filler.ts` (OpenTable). It is instantiated by the content
+ * script entrypoint for resy.com pages; the floating-timer / background worker
+ * decides *when* to fire, this class decides *what* to click.
+ *
+ * Resy-specific gotchas encoded here (reverse-engineered, empirical):
+ *  - The venue page renders via Angular, so slots/calendar appear asynchronously
+ *    after load. Every "find X" routine waits on a MutationObserver rather than
+ *    assuming the DOM is ready.
+ *  - The time-slot list ALWAYS contains a "Notify" button even when there is no
+ *    real availability; it must be excluded (`ReservationButtonList__notify-button`)
+ *    or we'd mistake "notify me" for a bookable slot.
+ *  - The final "Reserve Now" button lives inside the cross-origin
+ *    widgets.resy.com iframe, so this (top-frame) script cannot click it
+ *    directly — it delegates via a CLICK_RESERVE_BUTTON runtime message handled
+ *    by the content script injected into that iframe.
+ *  - All DOM hooks are Resy's `data-test-id` / class attributes, which are the
+ *    stable-ish handles Resy ships; selectors are the load-bearing part of this
+ *    file and break when Resy reskins.
+ *
+ * Key export: `ResyFormFiller` (class) — `fillForm()` is the main entrypoint,
+ * `tryMultipleDates()` the public fallback-date search.
+ */
 import { FormFillerOptions, TockPreferences } from '../types';
 
+/**
+ * Drives the Resy venue page to select a time slot and open the reservation
+ * modal. Stateless between runs aside from the injected `preferences` and the
+ * `waitForForm` / `autoSubmit` behaviour flags captured at construction.
+ */
 export class ResyFormFiller {
   private preferences: TockPreferences;
   private waitForForm: boolean;
+  /** When false, stop after confirming availability instead of clicking through the slot + Reserve button. */
   private autoSubmit: boolean;
 
+  /** Both behaviour flags default to true (wait for the form, then auto-submit) when the caller omits them. */
   constructor(options: FormFillerOptions) {
     this.preferences = options.preferences;
     this.waitForForm = options.waitForForm ?? true;
@@ -12,7 +51,18 @@ export class ResyFormFiller {
   }
 
   /**
-   * Main entry point for filling the Resy reservation form
+   * Main entry point for filling the Resy reservation form.
+   *
+   * Flow: wait for the slot container → verify it holds real slot buttons (not
+   * just the Notify button) → if empty, fall back to `tryMultipleDates` when
+   * `desiredDates` were supplied → otherwise click the closest slot and then the
+   * Reserve button.
+   *
+   * Return semantics are deliberately loose: `true` means "we got at least as
+   * far as confirming availability" — note it returns `true` even when
+   * `autoSubmit` is off or the Reserve click never lands, because reaching the
+   * slot list is treated as success for the caller's retry logic. Only hard
+   * failures (no slots + no fallback dates, or a thrown error) return `false`.
    */
   public async fillForm(desiredDates?: string[]): Promise<boolean> {
     try {
@@ -34,7 +84,10 @@ export class ResyFormFiller {
         return false;
       }
 
-      // Check if actual time slot buttons are present (not just the Notify button)
+      // The container renders even when a date is fully booked — in that case it
+      // holds only the "Notify" button. Excluding that button is what
+      // distinguishes real availability from "notify me", so a non-empty result
+      // here is the actual "slots exist" signal.
       const container = document.querySelector('[data-test-id="reservation-button-test-list"]');
       const timeButtons = container?.querySelectorAll('button:not([data-testid="ReservationButtonList__notify-button"])');
 
@@ -81,7 +134,12 @@ export class ResyFormFiller {
   }
 
   /**
-   * Wait for time slots container to appear
+   * Resolve `true` once the time-slot list container exists in the DOM, or
+   * `false` after `timeout` ms. Because Resy hydrates the page via Angular, the
+   * container may not exist at call time; we check once synchronously and
+   * otherwise watch for it with a MutationObserver. Note this only proves the
+   * *container* mounted — callers still have to inspect it for real slot buttons
+   * (see the Notify-button exclusion in `fillForm`).
    */
   private async waitForTimeSlots(timeout = 10000): Promise<boolean> {
     return new Promise((resolve) => {
@@ -117,7 +175,16 @@ export class ResyFormFiller {
   }
 
   /**
-   * Click a time slot that matches or is closest to the preferred time
+   * Click the slot whose time is nearest the preferred time.
+   *
+   * "Nearest" = minimum absolute difference in minutes-since-midnight between
+   * `preferences.time` and each button's parsed time; an exact match short-
+   * circuits the scan. There is no earlier/later bias — a slot 15 min before is
+   * chosen over one 20 min after. Buttons whose text has no HH:MM AM/PM token
+   * are skipped (this also naturally ignores the "Notify" button).
+   *
+   * Like `waitForTimeSlots`, retries via MutationObserver until a slot is found
+   * or `timeout` elapses, to cope with slots streaming in asynchronously.
    */
   private async clickTimeSlot(timeout = 10000): Promise<boolean> {
     console.log(`Looking for time slots matching preferred time: ${this.preferences.time}`);
@@ -210,7 +277,18 @@ export class ResyFormFiller {
   }
 
   /**
-   * Try multiple dates from the desired dates list
+   * Fallback path when the current date has no availability: walk the calendar
+   * and try each requested date until one yields bookable slots.
+   *
+   * Steps: open the calendar once to read which dates Resy marks available,
+   * intersect that with `desiredDates` (skipping ones Resy shows as unavailable
+   * to avoid wasted clicks), then for each surviving date reopen the calendar,
+   * click the date, wait for the slot list to re-render, and — on the first date
+   * with real slots — click the slot and Reserve button. Returns on the first
+   * successful reservation; `false` if none of the dates pan out.
+   *
+   * `desiredDates` are YYYY-MM-DD strings matched against calendar cells parsed
+   * by `parseResyDateLabel`.
    */
   public async tryMultipleDates(desiredDates: string[]): Promise<boolean> {
     console.log('Starting multi-date search for Resy');
@@ -296,7 +374,10 @@ export class ResyFormFiller {
   }
 
   /**
-   * Open the calendar by clicking the date dropdown button
+   * Click the date-selector dropdown and confirm the calendar container
+   * rendered. Returns `false` if either the trigger button or the resulting
+   * `.VenuePage__Calendar-Container` is absent. The 500ms wait covers the
+   * dropdown's open animation before we probe for the container.
    */
   private async openCalendar(): Promise<boolean> {
     const dateButton = document.querySelector('[data-test-id="dropdown-group-date-selector"]') as HTMLElement;
@@ -314,7 +395,8 @@ export class ResyFormFiller {
   }
 
   /**
-   * Close the calendar
+   * Dismiss the calendar via its close button if present. Best-effort: a missing
+   * button is a silent no-op (the calendar may already be closed).
    */
   private async closeCalendar(): Promise<void> {
     const closeButton = document.querySelector('[data-test-id="day-picker-close"]') as HTMLElement;
@@ -325,7 +407,11 @@ export class ResyFormFiller {
   }
 
   /**
-   * Get available dates from the Resy calendar
+   * Read the currently-open calendar and return the bookable dates as
+   * YYYY-MM-DD strings. Only cells carrying the `.ResyCalendar-day--available`
+   * class are considered; each date is recovered from the cell's `aria-label`
+   * (e.g. "Tuesday, November 11, 2025.") via `parseResyDateLabel`. Assumes the
+   * calendar is already open (caller must `openCalendar` first).
    */
   private async getAvailableDatesFromCalendar(): Promise<string[]> {
     const availableDates: string[] = [];
@@ -350,7 +436,10 @@ export class ResyFormFiller {
   }
 
   /**
-   * Click a specific date in the calendar
+   * Click the available calendar cell matching `date` (YYYY-MM-DD). Scans the
+   * available cells, comparing each parsed `aria-label` against the target;
+   * returns `false` if no available cell matches (e.g. the date exists but is
+   * sold out, so it lacks the `--available` class). Assumes the calendar is open.
    */
   private async clickCalendarDate(date: string): Promise<boolean> {
     // Find the button with matching date
@@ -373,7 +462,23 @@ export class ResyFormFiller {
   }
 
   /**
-   * Wait for and click the Reserve Now button
+   * Wait for and click the final "Reserve Now" button, retrying until success
+   * or `timeout`.
+   *
+   * The button almost always lives inside the cross-origin widgets.resy.com
+   * iframe, which this top-frame script cannot reach into. So the strategy is:
+   *  1. Cheaply check the main page first (rare, but covers non-iframe layouts).
+   *  2. Otherwise send a `CLICK_RESERVE_BUTTON` runtime message; the content
+   *     script injected into the widgets.resy.com iframe performs the actual
+   *     click and replies `{ success }`. On a not-yet-ready reply or a
+   *     `chrome.runtime.lastError` (iframe listener not mounted yet) we retry
+   *     after 500ms.
+   *
+   * A MutationObserver on the top document also re-drives the attempt whenever
+   * the modal/iframe host mutates. The `resolved` guard ensures we settle the
+   * promise exactly once across the observer, the async message callbacks, the
+   * retry timers, and the final timeout — otherwise late callbacks could
+   * resolve a promise the timeout already rejected.
    */
   private async clickReserveButton(timeout = 15000): Promise<boolean> {
     console.log('=== Starting clickReserveButton ===');
@@ -398,7 +503,9 @@ export class ResyFormFiller {
 
         console.log(`[${elapsed}ms] Attempting to click Reserve button...`);
 
-        // First, check if button exists in main page (unlikely, but check anyway)
+        // First, check if button exists in main page (unlikely, but check anyway).
+        // `offsetParent !== null` is a cheap visibility test — it excludes a
+        // button that's present but display:none / detached, which we must not click.
         const buttonInMain = document.querySelector('[data-test-id="order_summary_page-button-book"]') as HTMLElement;
         if (buttonInMain && buttonInMain.offsetParent !== null) {
           console.log('Found Reserve button in main page, clicking...');
@@ -466,9 +573,15 @@ export class ResyFormFiller {
   }
 
   /**
-   * Parse Resy date label to YYYY-MM-DD format
-   * Input: "Tuesday, November 11, 2025."
-   * Output: "2025-11-11"
+   * Parse a Resy calendar `aria-label` into a YYYY-MM-DD string.
+   * Input: "Tuesday, November 11, 2025." → Output: "2025-11-11".
+   *
+   * Strips the leading weekday and trailing period, then lets the native `Date`
+   * parser handle "November 11, 2025". Building the result from local
+   * getFullYear/getMonth/getDate (rather than toISOString) keeps it in the
+   * browser's local timezone, matching how the desired-date strings are
+   * expressed and avoiding a UTC off-by-one day. Returns `null` on unparseable
+   * input so callers can skip bad cells.
    */
   private parseResyDateLabel(label: string): string | null {
     try {
@@ -494,7 +607,8 @@ export class ResyFormFiller {
   }
 
   /**
-   * Parse time in HH:MM format to minutes since midnight
+   * Parse a 24-hour "HH:MM" preference string to minutes-since-midnight, the
+   * common unit `clickTimeSlot` uses to compare against slot times.
    */
   private parseTimeToMinutes(time: string): number {
     const [hours, minutes] = time.split(':').map(Number);
@@ -502,7 +616,10 @@ export class ResyFormFiller {
   }
 
   /**
-   * Parse 12-hour time (e.g., "5:30 PM") to minutes since midnight
+   * Parse a 12-hour slot label (e.g. "5:30 PM") to minutes-since-midnight,
+   * applying the AM/PM 24-hour conversion (12 AM → 0, 12 PM → 12). Returns 0 on
+   * an unparseable string — a benign fallback since such buttons are filtered
+   * out upstream by the regex match in `clickTimeSlot`.
    */
   private parse12HourTimeToMinutes(time: string): number {
     const match = time.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
@@ -524,9 +641,7 @@ export class ResyFormFiller {
     return hours * 60 + minutes;
   }
 
-  /**
-   * Utility wait function
-   */
+  /** Promise-based sleep used to pace UI interactions (dropdown/animation/reload settling). */
   private wait(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
