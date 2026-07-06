@@ -1010,14 +1010,16 @@ html, body {
     <div id="opentable-cookies-status"></div>
 
     <div class="card" style="margin-top:12px">
-      <div class="card-title" style="margin-bottom:8px">Push OpenTable Cookies</div>
+      <div class="card-title" style="margin-bottom:8px">Manual Sync</div>
       <div class="card-meta" style="margin-bottom:12px">
-        Run this snippet in DevTools on opentable.com to push your session cookies:
+        Alternatively, copy cookies from DevTools on opentable.com:
       </div>
       <div style="position:relative">
         <pre id="ot-bookmarklet-code" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;font-family:var(--font-mono);font-size:11px;color:var(--accent);overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5"></pre>
         <button onclick="copyOtBookmarklet()" style="position:absolute;top:8px;right:8px;background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-secondary);padding:4px 10px;font-family:var(--font-mono);font-size:11px;cursor:pointer" id="ot-copy-btn">copy</button>
       </div>
+      <button class="btn btn-secondary" style="margin-top:8px" onclick="pasteOpenTableCookies()">Paste from Clipboard</button>
+      <div id="ot-paste-result"></div>
     </div>
   </div>
 </div>
@@ -1796,10 +1798,8 @@ function generateBookmarkletCode() {
   const el = document.getElementById('bookmarklet-code');
   if (el) el.textContent = code;
 
-  // OpenTable bookmarklet — POSTs directly to the server so user doesn't need to paste
-  const serverUrl = window.location.origin;
-  const authKey = getAuthCookie() || '';
-  const otCode = `fetch("${serverUrl}/api/cookies/push?key=${authKey}&platform=opentable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cookies:document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".opentable.com",path:"/"};})})}).then(r=>r.json()).then(d=>alert("Pushed "+d.count+" OpenTable cookies!")).catch(e=>alert("Failed: "+e))`;
+  // OpenTable bookmarklet — copy-only (mirrors Tock pattern; no secret in URL)
+  const otCode = `copy(JSON.stringify(document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".opentable.com",path:"/"}})));alert("Copied "+document.cookie.split("; ").length+" cookies to clipboard!")`;
   const otEl = document.getElementById('ot-bookmarklet-code');
   if (otEl) otEl.textContent = otCode;
 }
@@ -1829,6 +1829,21 @@ async function pasteCookies() {
     const cookies = JSON.parse(text);
     if (!Array.isArray(cookies)) throw new Error('not an array');
     const res = await api('/api/cookies', { method: 'POST', body: JSON.stringify({ cookies }) });
+    resultDiv.innerHTML = `<div class="result success" style="margin-top:8px">synced ${res.count} cookies</div>`;
+    loadSettings();
+    loadStatus();
+  } catch (e) {
+    resultDiv.innerHTML = `<div class="result error" style="margin-top:8px">failed: ${e.message}</div>`;
+  }
+}
+
+async function pasteOpenTableCookies() {
+  const resultDiv = document.getElementById('ot-paste-result');
+  try {
+    const text = await navigator.clipboard.readText();
+    const cookies = JSON.parse(text);
+    if (!Array.isArray(cookies)) throw new Error('not an array');
+    const res = await api('/api/cookies?platform=opentable', { method: 'POST', body: JSON.stringify({ cookies }) });
     resultDiv.innerHTML = `<div class="result success" style="margin-top:8px">synced ${res.count} cookies</div>`;
     loadSettings();
     loadStatus();
