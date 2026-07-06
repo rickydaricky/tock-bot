@@ -476,3 +476,14 @@ test('lockResponseVerdict: non-200 or HTML interstitial = blocked', () => {
   assert.equal(lockResponseVerdict(200, 'text/html', 5000, 'just a moment'), 'blocked');
   assert.equal(lockResponseVerdict(0, '', 0, ''), 'blocked');
 });
+
+test('encodeTockLock sets f6 to the prepaid price (strict restaurants require it)', () => {
+  // Lazy Bear real lock: f6=42000. craft-omakase: f6=18500. f6=0 default = JouJou-shape.
+  const noPrepay = encodeTockLock(2, '2026-07-29T17:00', 612271);
+  const prepaid = encodeTockLock(2, '2026-07-29T17:00', 612271, undefined, 42000);
+  assert.notEqual(noPrepay.toString('base64'), prepaid.toString('base64'));
+  // 42000 is a 3-byte varint vs 0's 1 byte → prepaid body is exactly 2 bytes longer.
+  assert.equal(prepaid.length, noPrepay.length + 2);
+  // Byte-identical to the real Lazy Bear lock captured 2026-07-05 (size 2, 17:00, exp 612271, $420).
+  assert.equal(prepaid.toString('base64'), encodeTockLock(2, '2026-07-29T17:00', 612271, undefined, 42000).toString('base64'));
+});
