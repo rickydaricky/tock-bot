@@ -574,16 +574,18 @@ export async function clickSeatingAreaForTime(page: Page, want12: string): Promi
 
 /** Encode Tock's `PUT /api/ticket/group/lock` protobuf body (reverse-engineered 2026-07-03).
  *  Outer envelope field 60051 wraps: f1=partySize, f2="YYYY-MM-DDTHH:MM", f3=experienceId,
- *  f6=0, f13=seatingAreaId (omitted for direct-book venues). All values come from the poll's
- *  offerings data. Verified byte-identical to a real click-generated lock. */
-export function encodeTockLock(partySize: number, dateTime: string, experienceId: number, seatingAreaId?: number): Buffer {
+ *  f6=per-person prepaid price in cents, f13=seatingAreaId (omitted for direct-book venues).
+ *  f6 is the ticket price the app sends (Lazy Bear 42000, craft-omakase 18500) — STRICT
+ *  restaurants (omakase, and prepaid tasting menus like FHH) reject a wrong/zero price with a
+ *  200 "no longer available"; lenient ones accept it. Verified vs real click-generated locks. */
+export function encodeTockLock(partySize: number, dateTime: string, experienceId: number, seatingAreaId?: number, prepaidCents = 0): Buffer {
   const w = (arr: number[], n: number) => { let v = Math.floor(n); while (v > 0x7f) { arr.push((v & 0x7f) | 0x80); v = Math.floor(v / 128); } arr.push(v & 0x7f); };
   const field = (arr: number[], f: number, wire: number) => w(arr, f * 8 + wire);
   const inner: number[] = [];
   field(inner, 1, 0); w(inner, partySize);
   field(inner, 2, 2); { const b = Buffer.from(dateTime, 'utf8'); w(inner, b.length); for (const x of b) inner.push(x); }
   field(inner, 3, 0); w(inner, experienceId);
-  field(inner, 6, 0); w(inner, 0);
+  field(inner, 6, 0); w(inner, Math.max(0, Math.floor(prepaidCents)));
   if (seatingAreaId != null && Number.isFinite(seatingAreaId)) { field(inner, 13, 0); w(inner, seatingAreaId); }
   const outer: number[] = [];
   field(outer, 60051, 2); w(outer, inner.length); for (const x of inner) outer.push(x);
@@ -618,13 +620,14 @@ export function lockResponseVerdict(status: number, contentType: string, len: nu
 async function grabViaApi(
   page: Page, restaurant: string, date: string, time24: string, partySize: number,
   experienceId: number, seatingAreaId: number | undefined, headers: Record<string, string>,
+  prepaidCents = 0,
 ): Promise<GrabResult> {
   // Normalize the time to zero-padded 24h "HH:MM" — the lock datetime must match Tock's format
   // exactly (a stray "9:00" would build a lock the server rejects).
   const tm = /^(\d{1,2}):(\d{2})$/.exec(time24.trim());
   const normTime = tm ? `${tm[1].padStart(2, '0')}:${tm[2]}` : time24.trim();
   const dateTime = `${date}T${normTime}`;
-  const bodyB64 = encodeTockLock(partySize, dateTime, experienceId, seatingAreaId).toString('base64');
+  const bodyB64 = encodeTockLock(partySize, dateTime, experienceId, seatingAreaId, prepaidCents).toString('base64');
   const lock = await page.evaluate(async ({ b64, hdrs }) => {
     const bin = atob(b64); const body = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) body[i] = bin.charCodeAt(i);
@@ -984,7 +987,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     }
     let apiDiag = 'API grab off'; // surfaced in the final error so history shows the API path
     if (cfg.apiGrab !== false && winner.tockHeaders && Number.isFinite(expId)) {
-      grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders);
+      grab = await grabViaApi(winner.page, req.restaurant, bookedDate, winnerSlot.time24, req.partySize, expId, winnerSlot.seatingAreaId, winner.tockHeaders, winnerSlot.priceCents ?? 0);
       apiDiag = `hdrs:${winner.headerSource}, ` + (grab.ok ? (grab.heldNoCheckout ? 'API held (no auto-checkout)' : 'API held + checkout') : `API: ${grab.reason}`);
       if (!grab.ok) console.log(`   ⚠️ API grab failed (${grab.reason}) — falling back to reload+click`);
     } else if (cfg.apiGrab !== false) {
