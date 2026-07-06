@@ -28,7 +28,7 @@ import { getBookingEngine } from './engines';
 import { BlitzConfig } from './blitz';
 import { runSniper, SniperConfig, validateSniperConfig } from './sniper';
 import { listSessions, sessionScreenshot, applyAction } from './sessions';
-import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
+import { loadCookiesFromEnv, updateCookies, getCookies, Platform } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, deleteHistoryEntry, clearHistory, ScheduledBooking, schedulerEvents, BookingHistoryEntry } from './scheduler';
 import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
 import { notifyResult } from './notify';
@@ -104,6 +104,10 @@ app.get('/health', (_req, res) => {
     cookiesLoaded: cookies.length > 0,
     cookieCount: cookies.length,
     paymentConfigured: !!payment?.cardNumber,
+    cookieCounts: {
+      tock: getCookies('tock').length,
+      opentable: getCookies('opentable').length,
+    },
   });
 });
 
@@ -460,20 +464,22 @@ app.post('/api/sessions/:id/action', requireAuth, async (req, res) => {
 // These routes keep that cookie jar fresh from several sources (dashboard, bookmarklet,
 // auto-login), since a stale session is the most common cause of booking failure.
 
-/** Report how many Tock session cookies are currently loaded (drives the UI status pill). */
-app.get('/api/cookies/status', requireAuth, (_req, res) => {
-  const cookies = getCookies();
-  res.json({ count: cookies.length, loaded: cookies.length > 0 });
+/** Report how many session cookies are currently loaded for the given platform (drives the UI status pill). */
+app.get('/api/cookies/status', requireAuth, (req, res) => {
+  const platform = (req.query.platform as Platform) || 'tock';
+  const cookies = getCookies(platform);
+  res.json({ platform, count: cookies.length, loaded: cookies.length > 0 });
 });
 
-/** Replace the in-memory Tock cookie jar with a client-supplied array. */
+/** Replace the in-memory cookie jar for the given platform with a client-supplied array. */
 app.post('/api/cookies', requireAuth, (req, res) => {
+  const platform = (req.query.platform as Platform) || 'tock';
   const { cookies } = req.body;
   if (!Array.isArray(cookies)) {
     res.status(400).json({ error: 'Body must contain a "cookies" array' });
     return;
   }
-  updateCookies(cookies);
+  updateCookies(cookies, platform);
   res.json({ success: true, count: cookies.length });
 });
 
@@ -506,14 +512,15 @@ app.post('/api/cookies/push', (req, res) => {
     return;
   }
 
+  const platform = (req.query.platform as Platform) || 'tock';
   const { cookies } = req.body;
   if (!Array.isArray(cookies)) {
     res.status(400).json({ error: 'Body must contain a "cookies" array' });
     return;
   }
 
-  updateCookies(cookies);
-  console.log(`🍪 Bookmarklet pushed ${cookies.length} cookies`);
+  updateCookies(cookies, platform);
+  console.log(`🍪 Bookmarklet pushed ${cookies.length} ${platform} cookies`);
   res.json({ success: true, count: cookies.length });
 });
 

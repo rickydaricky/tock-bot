@@ -770,6 +770,13 @@ html, body {
         <input type="time" id="book-time" value="17:00">
       </div>
     </div>
+    <div class="field">
+      <label>Platform</label>
+      <select id="platform">
+        <option value="tock">Tock</option>
+        <option value="opentable">OpenTable</option>
+      </select>
+    </div>
     <div class="toggle-row">
       <input type="checkbox" id="book-autopurchase" checked>
       <span>Auto-purchase</span>
@@ -901,6 +908,13 @@ html, body {
         </div>
       </div>
     </div>
+    <div class="field" style="margin-top:16px">
+      <label>Platform</label>
+      <select id="sched-platform">
+        <option value="tock">Tock</option>
+        <option value="opentable">OpenTable</option>
+      </select>
+    </div>
     <button class="btn btn-primary" onclick="addSchedule()">Add Schedule</button>
   </div>
 
@@ -990,6 +1004,20 @@ html, body {
       </div>
       <button class="btn btn-secondary" style="margin-top:8px" onclick="pasteCookies()">Paste from Clipboard</button>
       <div id="paste-result"></div>
+    </div>
+
+    <div class="section-title" style="margin-top:20px">OpenTable Session</div>
+    <div id="opentable-cookies-status"></div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="card-title" style="margin-bottom:8px">Push OpenTable Cookies</div>
+      <div class="card-meta" style="margin-bottom:12px">
+        Run this snippet in DevTools on opentable.com to push your session cookies:
+      </div>
+      <div style="position:relative">
+        <pre id="ot-bookmarklet-code" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;font-family:var(--font-mono);font-size:11px;color:var(--accent);overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5"></pre>
+        <button onclick="copyOtBookmarklet()" style="position:absolute;top:8px;right:8px;background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-secondary);padding:4px 10px;font-family:var(--font-mono);font-size:11px;cursor:pointer" id="ot-copy-btn">copy</button>
+      </div>
     </div>
   </div>
 </div>
@@ -1314,10 +1342,11 @@ async function doBook() {
   btn.innerHTML = '<span class="spinner"></span>booking...';
   resultDiv.innerHTML = '';
 
+  const platform = document.getElementById('platform').value;
   try {
     const data = await api('/api/book', {
       method: 'POST',
-      body: JSON.stringify({ restaurant, dates, partySize, time, autoPurchase, dryRun })
+      body: JSON.stringify({ restaurant, dates, partySize, time, autoPurchase, dryRun, platform })
     });
 
     if (data.success) {
@@ -1434,9 +1463,10 @@ async function addSchedule() {
     if (isNaN(sniper.windowEndMs)) sniper.windowEndMs = 30000;
   }
 
+  const platform = document.getElementById('sched-platform').value;
   const resp = await api('/api/scheduled', {
     method: 'POST',
-    body: JSON.stringify({ restaurant, dates, partySize, time, runAt, label, autoPurchase: true, blitz, sniper })
+    body: JSON.stringify({ restaurant, dates, partySize, time, runAt, label, autoPurchase: true, platform, blitz, sniper })
   });
 
   if (!resp.success) {
@@ -1625,8 +1655,10 @@ async function loadSettings() {
   // Status
   try {
     const health = await api('/health');
+    const counts = health.cookieCounts || { tock: health.cookieCount || 0, opentable: 0 };
     document.getElementById('settings-status').innerHTML = `
-      <div class="status-row"><span class="label">cookies</span> ${health.cookiesLoaded ? `<span style="color:var(--success)">${health.cookieCount} loaded</span>` : '<span style="color:var(--error)">not set</span>'}</div>
+      <div class="status-row"><span class="label">tock cookies</span> ${counts.tock > 0 ? `<span style="color:var(--success)">${counts.tock} loaded</span>` : '<span style="color:var(--error)">not set</span>'}</div>
+      <div class="status-row"><span class="label">opentable cookies</span> ${counts.opentable > 0 ? `<span style="color:var(--success)">${counts.opentable} loaded</span>` : '<span style="color:var(--text-muted)">not set</span>'}</div>
       <div class="status-row"><span class="label">payment</span> ${health.paymentConfigured ? '<span style="color:var(--success)">configured</span>' : '<span style="color:var(--error)">not set</span>'}</div>
     `;
   } catch {
@@ -1645,11 +1677,19 @@ async function loadSettings() {
     }
   } catch {}
 
-  // Cookies
+  // Cookies (Tock)
   try {
     const cookies = await api('/api/cookies/status');
     document.getElementById('cookies-status').innerHTML = `
       <div class="masked">${cookies.loaded ? cookies.count + ' cookies loaded' : 'no cookies set'}</div>
+    `;
+  } catch {}
+
+  // Cookies (OpenTable)
+  try {
+    const otCookies = await api('/api/cookies/status?platform=opentable');
+    document.getElementById('opentable-cookies-status').innerHTML = `
+      <div class="masked">${otCookies.loaded ? otCookies.count + ' cookies loaded' : 'no cookies set'}</div>
     `;
   } catch {}
 
@@ -1755,12 +1795,28 @@ function generateBookmarkletCode() {
   const code = `copy(JSON.stringify(document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".exploretock.com",path:"/"}})));alert("Copied "+document.cookie.split("; ").length+" cookies to clipboard!")`;
   const el = document.getElementById('bookmarklet-code');
   if (el) el.textContent = code;
+
+  // OpenTable bookmarklet — POSTs directly to the server so user doesn't need to paste
+  const serverUrl = window.location.origin;
+  const authKey = getAuthCookie() || '';
+  const otCode = `fetch("${serverUrl}/api/cookies/push?key=${authKey}&platform=opentable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cookies:document.cookie.split("; ").map(c=>{const [n,...v]=c.split("=");return{name:n,value:v.join("="),domain:".opentable.com",path:"/"};})})}).then(r=>r.json()).then(d=>alert("Pushed "+d.count+" OpenTable cookies!")).catch(e=>alert("Failed: "+e))`;
+  const otEl = document.getElementById('ot-bookmarklet-code');
+  if (otEl) otEl.textContent = otCode;
 }
 
 function copyBookmarklet() {
   const code = document.getElementById('bookmarklet-code').textContent;
   navigator.clipboard.writeText(code).then(() => {
     const btn = document.getElementById('copy-btn');
+    btn.textContent = 'copied!';
+    setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+  });
+}
+
+function copyOtBookmarklet() {
+  const code = document.getElementById('ot-bookmarklet-code').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    const btn = document.getElementById('ot-copy-btn');
     btn.textContent = 'copied!';
     setTimeout(() => { btn.textContent = 'copy'; }, 1500);
   });
