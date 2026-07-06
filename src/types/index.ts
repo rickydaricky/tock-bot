@@ -68,6 +68,7 @@ export interface TockPreferences {
   billingCity?: string; // City
   billingState?: string; // State (2-letter code e.g. CA)
   billingZip?: string; // ZIP code
+  maxPriceCents?: number; // OpenTable fail-closed cap on any upfront charge
 }
 
 /**

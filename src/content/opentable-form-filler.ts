@@ -27,6 +27,7 @@
  * Key export: {@link OpenTableFormFiller}.
  */
 import { FormFillerOptions, TockPreferences } from '../types';
+import { setOtBookingFlag, clearOtBookingFlag, OtBookingFlag } from '../utils/storage';
 
 /**
  * Fills and (optionally) submits OpenTable's on-page reservation picker.
@@ -94,12 +95,19 @@ export class OpenTableFormFiller {
 
       // If autoSubmit is true, wait for and click a time slot
       if (this.autoSubmit) {
+        // Arm cross-page completion ONLY when the user opted into auto-purchase. Without this flag the
+        // /booking/details page does nothing automatically (user completes by hand — the safe default).
+        if (this.preferences.autoPurchaseEnabled) {
+          await setOtBookingFlag({ until: Date.now() + 120000, maxPriceCents: this.preferences.maxPriceCents });
+          console.log('OT: armed auto-complete for the booking-details page (autoPurchase on)');
+        }
         console.log('Auto-submit enabled, waiting for time slots...');
         const slotClicked = await this.waitForAndClickTimeSlot();
         if (slotClicked) {
           console.log('Successfully clicked a time slot!');
         } else {
           console.log('Could not find or click a time slot.');
+          await clearOtBookingFlag(); // nothing to complete; don't leave the flag armed
         }
       }
 
@@ -480,77 +488,50 @@ export class OpenTableFormFiller {
    * slot is intentional so callers can keep polling while results are still streaming in.
    */
   private findMatchingTimeSlot(preferredTime: string): HTMLElement | null {
-    // Look for time slot list items
-    const timeSlots = document.querySelectorAll('[data-testid^="time-slot-"]');
+    // Candidate slots come from two DOM shapes OpenTable uses across restaurants:
+    //  (a) [data-testid^="time-slot-"] with an inner [role="button"] (e.g. Nopa)
+    //  (b) <a aria-label="Reserve table at {r} at {H:MM AM/PM} on {date}, ..."> (e.g. House of Prime Rib)
+    const candidates: { el: HTMLElement; timeText: string }[] = [];
 
-    if (timeSlots.length === 0) {
-      // No results rendered yet — signal "keep waiting" rather than "no availability".
-      return null;
+    document.querySelectorAll('[data-testid^="time-slot-"]').forEach((slot) => {
+      const button = slot.querySelector('[role="button"]') as HTMLElement | null;
+      if (!button) return;
+      const m = (button.textContent || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+      if (m) candidates.push({ el: button, timeText: `${m[1]}:${m[2]} ${m[3].toUpperCase()}` });
+    });
+
+    document.querySelectorAll('a[aria-label^="Reserve table at" i]').forEach((a) => {
+      const label = a.getAttribute('aria-label') || '';
+      // "...at 9:30 PM on July 16..." — take the time after " at " and before " on ".
+      const m = label.match(/\bat\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b/i);
+      if (m) candidates.push({ el: a as HTMLElement, timeText: `${m[1]}:${m[2]} ${m[3].toUpperCase()}` });
+    });
+
+    if (candidates.length === 0) return null; // none rendered yet — keep polling
+
+    const [h, min] = preferredTime.split(':').map(Number);
+    const period = h >= 12 ? 'PM' : 'AM';
+    const targetText = `${h % 12 || 12}:${String(min).padStart(2, '0')} ${period}`;
+    const targetMinutes = h * 60 + min;
+
+    const toMinutes = (t: string): number => {
+      const m = t.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+      if (!m) return NaN;
+      let hh = parseInt(m[1], 10); const mm = parseInt(m[2], 10); const p = m[3].toUpperCase();
+      if (p === 'PM' && hh !== 12) hh += 12;
+      if (p === 'AM' && hh === 12) hh = 0;
+      return hh * 60 + mm;
+    };
+
+    const exact = candidates.find((c) => c.timeText === targetText);
+    if (exact) { console.log(`OT: exact slot match ${exact.timeText}`); return exact.el; }
+
+    let best: { el: HTMLElement; diff: number; timeText: string } | null = null;
+    for (const c of candidates) {
+      const diff = Math.abs(toMinutes(c.timeText) - targetMinutes);
+      if (!best || diff < best.diff) best = { el: c.el, diff, timeText: c.timeText };
     }
-
-    console.log(`Found ${timeSlots.length} time slot(s)`);
-
-    // Convert preferred time to 12-hour format for matching
-    const [hours, minutes] = preferredTime.split(':').map(Number);
-    const period = hours >= 12 ? 'PM' : 'AM';
-    const hours12 = hours % 12 || 12;
-    const targetTime = `${hours12}:${minutes.toString().padStart(2, '0')} ${period}`;
-    const targetMinutes = hours * 60 + minutes;
-
-    console.log(`Looking for time slot matching: ${targetTime} (from ${preferredTime})`);
-
-    let bestMatch: { button: HTMLElement; diff: number; timeText: string } | null = null;
-
-    // Iterate through all time slots to find best match
-    for (const slot of Array.from(timeSlots)) {
-      const button = slot.querySelector('[role="button"]') as HTMLElement;
-      if (!button) continue;
-
-      const buttonText = button.textContent?.trim() || '';
-      const ariaLabel = button.getAttribute('aria-label') || '';
-
-      // Extract time from button text (e.g., "5:30 PM*" -> "5:30 PM")
-      const timeMatch = buttonText.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-      if (!timeMatch) {
-        console.warn(`Could not parse time from button text: "${buttonText}"`);
-        continue;
-      }
-
-      const slotTime = `${timeMatch[1]}:${timeMatch[2]} ${timeMatch[3].toUpperCase()}`;
-
-      // Check for exact match
-      if (slotTime === targetTime) {
-        console.log(`Found exact time match: ${slotTime}`);
-        console.log(`  Button text: "${buttonText}", aria-label: "${ariaLabel}"`);
-        return button;
-      }
-
-      // Calculate time difference for closest match
-      let slotHours = parseInt(timeMatch[1]);
-      const slotMinutes = parseInt(timeMatch[2]);
-      const slotPeriod = timeMatch[3].toUpperCase();
-
-      // Convert to 24-hour for comparison
-      if (slotPeriod === 'PM' && slotHours !== 12) slotHours += 12;
-      if (slotPeriod === 'AM' && slotHours === 12) slotHours = 0;
-
-      const slotTotalMinutes = slotHours * 60 + slotMinutes;
-      const diff = Math.abs(slotTotalMinutes - targetMinutes);
-
-      if (!bestMatch || diff < bestMatch.diff) {
-        bestMatch = { button, diff, timeText: slotTime };
-      }
-    }
-
-    if (bestMatch) {
-      const buttonText = bestMatch.button.textContent?.trim();
-      const ariaLabel = bestMatch.button.getAttribute('aria-label');
-      console.log(`No exact match found. Closest time slot: ${bestMatch.timeText} (${bestMatch.diff} minutes difference)`);
-      console.log(`  Button text: "${buttonText}", aria-label: "${ariaLabel}"`);
-      return bestMatch.button;
-    }
-
-    console.warn('No suitable time slot found');
+    if (best) { console.log(`OT: closest slot ${best.timeText} (${best.diff}m off ${targetText})`); return best.el; }
     return null;
   }
 
@@ -652,4 +633,52 @@ export class OpenTableFormFiller {
       }, 10000);
     });
   }
+}
+
+/** Parse an explicit UPFRONT charge in cents from booking-page text, or null if there's only a
+ *  conditional no-show/cancellation fee (which is not an upfront charge). Fail-closed: a $ amount on
+ *  any line that reads like a real charge (broad keyword set below) counts; "no-show"/"cancellation"
+ *  conditional lines do not. The keyword set is deliberately wide so an off-label charge ("Payment",
+ *  "Cost", "You pay", …) can't slip past — the residual gap is truly novel phrasing on a card-on-file
+ *  prepaid restaurant, which should be verified manually before enabling auto-purchase there. */
+export function parseOtUpfrontChargeCents(text: string): number | null {
+  const lines = (text || '').split('\n');
+  let max: number | null = null;
+  for (const line of lines) {
+    if (/no.?show|cancellation/i.test(line)) continue; // conditional fee, not an upfront charge
+    if (!/charge|charged|total|subtotal|deposit|prepay|prepaid|amount due|due now|pay now|payment|you pay|cost|price|per person|per guest|billed|non-?refundable|ticket/i.test(line)) continue;
+    const m = line.match(/\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)/);
+    if (m) {
+      const cents = Math.round(parseFloat(m[1].replace(/,/g, '')) * 100);
+      if (max === null || cents > max) max = cents;
+    }
+  }
+  return max;
+}
+
+/** Complete an in-progress OpenTable booking on the /booking/details page. Fail-closed. */
+export async function completeOpenTableBooking(flag: OtBookingFlag): Promise<boolean> {
+  console.log('OT: completeOpenTableBooking on', location.href);
+  // Wait up to 30s for the confirm button (page may still be hydrating).
+  const findBtn = () => document.querySelector('[data-testid="complete-reservation-button"], #complete-reservation') as HTMLElement | null;
+  let btn = findBtn();
+  for (let i = 0; !btn && i < 60; i++) { await new Promise((r) => setTimeout(r, 500)); btn = findBtn(); }
+  if (!btn) { console.error('OT: complete-reservation button not found'); return false; }
+
+  // FAIL-CLOSED: a card-entry (Stripe) form means no card on file / prepaid — v1 does not fill it.
+  const cardForm = document.querySelector('iframe[src*="stripe" i], iframe[src*="braintree" i], iframe[src*="adyen" i], iframe[title*="card" i], iframe[title*="payment" i], iframe[name*="payment" i], iframe[title*="secure" i]');
+  if (cardForm) { console.warn('OT: card-entry form present — aborting (fail-closed). Complete manually / add a card on file.'); return false; }
+
+  // FAIL-CLOSED: an explicit upfront charge over the cap (or with no cap set) aborts.
+  const upfront = parseOtUpfrontChargeCents(document.body.innerText || '');
+  if (upfront != null && (flag.maxPriceCents == null || upfront > flag.maxPriceCents)) {
+    console.warn(`OT: upfront charge $${(upfront / 100).toFixed(2)} exceeds cap (${flag.maxPriceCents == null ? 'none set' : '$' + (flag.maxPriceCents / 100).toFixed(2)}) — aborting (fail-closed).`);
+    return false;
+  }
+
+  console.log('OT: clicking Complete reservation…');
+  btn.click(); // invisible reCAPTCHA executes + submits in the real logged-in browser
+  await new Promise((r) => setTimeout(r, 5000));
+  console.log('OT: Complete reservation clicked.');
+  return true;
 }

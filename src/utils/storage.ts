@@ -132,6 +132,20 @@ export const clearActiveTimer = async (): Promise<void> => {
   return saveActiveTimer(null);
 };
 
+/** Signals the /booking/details content script to auto-complete an in-progress OpenTable auto-book. */
+export interface OtBookingFlag { until: number; maxPriceCents?: number; }
+
+export async function setOtBookingFlag(flag: OtBookingFlag): Promise<void> {
+  await chrome.storage.local.set({ otBooking: flag });
+}
+export async function getOtBookingFlag(): Promise<OtBookingFlag | null> {
+  const { otBooking } = await chrome.storage.local.get('otBooking');
+  return (otBooking as OtBookingFlag) ?? null;
+}
+export async function clearOtBookingFlag(): Promise<void> {
+  await chrome.storage.local.remove('otBooking');
+}
+
 /** Shape for the remote booking server config (URL + API key). */
 export interface ServerConfig { url: string; key: string; }
 
