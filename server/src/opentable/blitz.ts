@@ -65,32 +65,37 @@ export async function runOpenTableBlitz(
       Array.from({ length: n }, async (_, i) => {
         const fp = getFingerprint(i);
         const browser = await chromium.launch({ headless: true, channel: 'chromium', args: STEALTH_ARGS });
-        const context = await browser.newContext({
-          viewport: fp.viewport,
-          userAgent: fp.userAgent,
-          locale: 'en-US',
-          timezoneId: 'America/Los_Angeles',
-        });
-
-        const cookieCount = await injectCookies(context, 'opentable');
-        if (cookieCount === 0) {
-          await browser.close();
-          throw new Error('No OpenTable cookies configured');
-        }
-
-        // Warm navigation — establishes Akamai/session clearance so the booking attempt
-        // doesn't hit a bot-challenge on its first request. The page is closed after
-        // warmup; runOpenTableBookingWithContext will open its own page in the same context.
-        const warmUrl = buildOpenTableSearchUrl(req.restaurant, req.dates[0], req.time, req.partySize);
-        const page = await context.newPage();
         try {
-          await page.goto(warmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        } finally {
-          await page.close();
-        }
+          const context = await browser.newContext({
+            viewport: fp.viewport,
+            userAgent: fp.userAgent,
+            locale: 'en-US',
+            timezoneId: 'America/Los_Angeles',
+          });
 
-        console.log(`   [OT] Context #${i + 1} warmed (${cookieCount} cookies)`);
-        warmContexts[i] = { browser, context };
+          const cookieCount = await injectCookies(context, 'opentable');
+          if (cookieCount === 0) {
+            await browser.close();
+            throw new Error('No OpenTable cookies configured');
+          }
+
+          // Warm navigation — establishes Akamai/session clearance so the booking attempt
+          // doesn't hit a bot-challenge on its first request. The page is closed after
+          // warmup; runOpenTableBookingWithContext will open its own page in the same context.
+          const warmUrl = buildOpenTableSearchUrl(req.restaurant, req.dates[0], req.time, req.partySize);
+          const page = await context.newPage();
+          try {
+            await page.goto(warmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          } finally {
+            await page.close();
+          }
+
+          console.log(`   [OT] Context #${i + 1} warmed (${cookieCount} cookies)`);
+          warmContexts[i] = { browser, context };
+        } catch (err) {
+          await browser.close().catch(() => {});
+          throw err;
+        }
       })
     );
 
