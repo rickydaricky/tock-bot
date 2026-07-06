@@ -684,7 +684,7 @@ const App: React.FC = () => {
         )}
       </div>
 
-      <OpenTableSession />
+      <OpenTableSession defaultOpen={platform === 'opentable'} />
 
       {status && (
         <div className="mt-4 p-2 text-center text-sm font-medium rounded-md bg-blue-50 text-blue-700">
