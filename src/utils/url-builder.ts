@@ -270,3 +270,46 @@ export function isResyVenueUrl(url: string): boolean {
     return false;
   }
 }
+
+/**
+ * True if `url` belongs to any OpenTable TLD variant (opentable.com,
+ * opentable.co.uk, etc.). Checks only the hostname so any path/subpath matches;
+ * returns `false` on any unparseable input.
+ */
+export function isOpenTableUrl(url: string): boolean {
+  try { return /(^|\.)opentable\.[a-z.]+$/i.test(new URL(url).hostname); } catch { return false; }
+}
+
+/**
+ * Extract the restaurant slug from an OpenTable `/r/<slug>` URL path.
+ * Returns an empty string if the slug cannot be found (so callers always get a string).
+ */
+function openTableSlug(baseUrl: string): string {
+  const m = baseUrl.match(/opentable\.[a-z.]+\/r\/([^/?#]+)/i);
+  return m ? m[1] : '';
+}
+
+/**
+ * Builds an OpenTable restaurant availability URL for a specific date.
+ *
+ * The venue slug is extracted from the `/r/<slug>` segment of `baseUrl`. The
+ * `datetime` param combines `date` (YYYY-MM-DD) and `prefs.time` (HH:MM) in ISO
+ * format, percent-encoded so the colon survives as `%3A`. `covers` carries the
+ * party size.
+ *
+ * Example: https://www.opentable.com/r/nopa-san-francisco1?datetime=2026-07-19T19%3A00&covers=2
+ */
+export function buildOpenTableSearchUrlWithDate(baseUrl: string, prefs: { partySize: number; time: string }, date: string): string {
+  const slug = openTableSlug(baseUrl);
+  const datetime = encodeURIComponent(`${date}T${prefs.time}`);
+  return `https://www.opentable.com/r/${slug}?datetime=${datetime}&covers=${prefs.partySize}`;
+}
+
+/**
+ * Same as {@link buildOpenTableSearchUrlWithDate} but uses `prefs.date` as the
+ * date. Convenience wrapper for the single-date / pre-navigation case where no
+ * override date is needed.
+ */
+export function buildOpenTableSearchUrl(baseUrl: string, prefs: { partySize: number; time: string; date: string }): string {
+  return buildOpenTableSearchUrlWithDate(baseUrl, prefs, prefs.date);
+}

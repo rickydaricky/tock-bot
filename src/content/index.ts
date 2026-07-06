@@ -152,9 +152,27 @@ if (window.location.hostname === 'widgets.resy.com') {
             console.error('Error filling Resy form:', error);
             sendResponse({ success: false, error: error.message });
           });
+      } else if (currentPlatform === 'opentable') {
+        console.log(`🎯 [DEBUG] OpenTable multi-date mode: trying ${datesToTry.length} dates`);
+        (async () => {
+          for (const date of datesToTry) {
+            const datePrefs = { ...preferences, date };
+            const filler = new OpenTableFormFiller({
+              preferences: datePrefs,
+              waitForForm: true,
+              autoSubmit: true,
+            });
+            const success = await filler.fill();
+            if (success) {
+              sendResponse({ success: true });
+              return;
+            }
+          }
+          sendResponse({ success: false });
+        })();
       } else {
-        console.error('Multi-date mode only supported for Tock and Resy');
-        sendResponse({ success: false, error: 'Multi-date mode only supported for Tock and Resy' });
+        console.error('Multi-date mode only supported for Tock, Resy, and OpenTable');
+        sendResponse({ success: false, error: 'Multi-date mode only supported for Tock, Resy, and OpenTable' });
       }
     } else {
       // Single-date mode (original behavior): fill for the one date encoded in the
