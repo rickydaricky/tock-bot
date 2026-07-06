@@ -18,6 +18,36 @@
  * Usage:
  *   node cvc-server.js              # Start server on port 3847
  *   node cvc-server.js --port 3847  # Custom port
+ *
+ * Role in the system:
+ *   This is the OS-level "hands" of the auto-purchase flow. The Chrome
+ *   extension content script (src/content/form-filler.ts) cannot reach into
+ *   Stripe's cross-origin iframes to set field values, so it computes each
+ *   iframe's on-screen geometry and POSTs it here; this server replays real
+ *   mouse clicks (cliclick) and keystrokes (System Events) at those pixels to
+ *   drive the payment form exactly as a human would. It is the only component
+ *   that can defeat the cross-origin boundary, at the cost of being macOS-only
+ *   and requiring the target browser window to be frontmost and unmoved.
+ *
+ * Key exports (module-internal — this file is run, not imported):
+ *   - readConfig()               Load fallback card config from disk.
+ *   - buildStripeFillerScript()  Emit AppleScript to fill the Stripe Payment
+ *                                Element (+ optional Address Element).
+ *   - buildBraintreeFillerScript() Emit AppleScript for the legacy Braintree
+ *                                CVC-only field.
+ *   - runCardAutomation()        Merge request + config, build, and exec the
+ *                                AppleScript.
+ *   - HTTP server                POST/GET /trigger-cvc and GET /health.
+ *
+ * Coordinate model (the load-bearing invariant of this file):
+ *   All coordinates travel as CSS pixels relative to the browser's *viewport*
+ *   top-left. To convert to absolute screen pixels for cliclick we add:
+ *     screenX = window.x (AppleScript `bounds`) + viewportX
+ *     screenY = window.y + chromeOffset + viewportY
+ *   `chromeOffset` is the height of the browser's title bar + toolbar + tab
+ *   strip (the "chrome") — the gap between the OS window's top edge and the
+ *   web viewport's top edge. It is an empirical per-browser constant living in
+ *   tock-cvc-config.json; if the toolbar layout changes, clicks land high/low.
  */
 
 const http = require('http');
@@ -25,13 +55,30 @@ const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+// Default port 3847 is hard-coded into the extension's content script, so
+// changing it here means the extension can no longer reach the server.
 const PORT = process.argv.includes('--port')
   ? parseInt(process.argv[process.argv.indexOf('--port') + 1])
   : 3847;
 
 const SCRIPT_DIR = __dirname;
+// Fallback card config lives next to this script so the server is self-contained.
 const CONFIG_PATH = path.join(SCRIPT_DIR, 'tock-cvc-config.json');
 
+/**
+ * Load the on-disk fallback card config (used when the extension does not send
+ * card details in the request body).
+ *
+ * Notes:
+ *   - `cvc` is treated as unset if it still holds the 'YOUR_CVC_HERE'
+ *     placeholder shipped in the template, so a half-configured file reads as
+ *     "no CVC" rather than typing the literal placeholder into Stripe.
+ *   - `browser` is the AppleScript application name to `activate`/target
+ *     (e.g. "Google Chrome", "Chromium"); `chromeOffset` is the browser-chrome
+ *     pixel height described in the file header. Both default sanely so the
+ *     server still boots with a missing/corrupt config.
+ * @returns {{cardNumber: string|null, cardExpiry: string|null, cvc: string|null, browser: string, chromeOffset: number}}
+ */
 function readConfig() {
   try {
     const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -61,6 +108,15 @@ function readConfig() {
  *   Card number: 0% - 52%   → click at 25%
  *   Expiry:      52% - 78%  → click at 65%
  *   CVC:         78% - 100% → click at 89%
+ * These percentages are empirical for Tock's Stripe layout; they only need to
+ * land somewhere inside each field, not at its exact center.
+ *
+ * @param {object} config Merged card/billing details (see runCardAutomation).
+ * @param {object} coords Viewport geometry from the content script. Requires
+ *   x (iframe horizontal center), y (iframe top + 30), and iframeWidth for the
+ *   payment iframe; optionally billingIframeX/Y/Width for the Address Element.
+ * @returns {{script: string}|{error: string}} AppleScript source, or an error
+ *   describing what's missing (card details or coords) — callers must branch.
  */
 function buildStripeFillerScript(config, coords) {
   const { cardNumber, cardExpiry, cvc, browser, chromeOffset } = config;
@@ -146,7 +202,9 @@ function buildStripeFillerScript(config, coords) {
     delay 0.3
   `;
 
-  // Append billing address filling if we have billing data and coords
+  // Billing (Stripe Address Element) lives in a SECOND iframe and is optional:
+  // only fill it when both a name and that iframe's coords are present. When
+  // absent, the card-only script above still completes successfully.
   const hasBilling = config.billingName && coords.billingIframeY;
   if (hasBilling) {
     // Click into the "Full name" field at the top of the billing iframe
@@ -156,7 +214,10 @@ function buildStripeFillerScript(config, coords) {
 
     console.log(`  Billing name click: (${billingClickX}, ${billingClickY})`);
 
-    // Escape special AppleScript characters in address strings
+    // These values get interpolated into double-quoted AppleScript string
+    // literals below, so strip any " or \ that would break out of the literal
+    // (and, worse, allow arbitrary AppleScript injection). Stripping rather
+    // than escaping is safe here: real addresses don't contain these chars.
     const escapedName = (config.billingName || '').replace(/["\\]/g, '');
     const escapedAddress = (config.billingAddress || '').replace(/["\\]/g, '');
     const escapedCity = (config.billingCity || '').replace(/["\\]/g, '');
@@ -225,7 +286,20 @@ function buildStripeFillerScript(config, coords) {
 }
 
 /**
- * Build AppleScript for legacy Braintree CVC-only fill.
+ * Build AppleScript for the legacy Braintree flow, which only needs the CVC
+ * re-typed (card number/expiry come from a saved card). Kept for Tock pages
+ * that haven't migrated to the Stripe Payment Element.
+ *
+ * Coordinate handling differs from Stripe: if the content script supplied
+ * exact iframe coords we use them, otherwise we fall back to a blind guess at
+ * 55% width / 52% height of the browser window — the empirical location of the
+ * CVC box on Tock's legacy checkout. The fallback lets it work even when the
+ * extension can't measure the iframe.
+ *
+ * @param {object} config Must contain cvc, browser, chromeOffset.
+ * @param {object} [coords] Optional { x, y } viewport coords of the CVC field.
+ * @returns {{script: string}|{error: string}} AppleScript source, or an error
+ *   if no CVC is configured.
  */
 function buildBraintreeFillerScript(config, coords) {
   const { cvc, browser, chromeOffset } = config;
@@ -268,11 +342,25 @@ function buildBraintreeFillerScript(config, coords) {
   return { script };
 }
 
+/**
+ * Orchestrate one card-fill: merge inputs, pick the provider builder, and exec
+ * the resulting AppleScript.
+ *
+ * The request body doubles as both the card-detail source AND the coordinate
+ * payload — `requestData` is passed straight through as `coords` to the builder.
+ * `requestData.isStripe` selects the Stripe vs Braintree builder.
+ *
+ * @param {object|null} requestData Parsed POST body: card/billing fields,
+ *   iframe coords, and the isStripe flag. Null falls back entirely to config.
+ * @param {(err: Error|null, result?: string) => void} callback Node-style cb.
+ */
 function runCardAutomation(requestData, callback) {
   const fileConfig = readConfig();
   const isStripe = requestData && requestData.isStripe;
 
-  // Merge: request body (from extension) takes priority over config file
+  // Merge: request body (from extension) takes priority over config file.
+  // Billing fields come ONLY from the request (never the on-disk fallback),
+  // since the config file is card-only.
   const config = {
     cardNumber: (requestData && requestData.cardNumber) || fileConfig.cardNumber,
     cardExpiry: (requestData && requestData.cardExpiry) || fileConfig.cardExpiry,
@@ -299,6 +387,10 @@ function runCardAutomation(requestData, callback) {
     return;
   }
 
+  // The script is passed to `osascript -e '<script>'` inside single quotes, so
+  // any single quote in the script must be escaped using the classic shell
+  // idiom '"'"' (close-quote, quoted-quote, reopen-quote). 2>&1 folds
+  // AppleScript's stderr (its `log` output) into stdout for logging below.
   const escapedScript = result.script.replace(/'/g, "'\"'\"'");
   console.log('Executing AppleScript...');
 
@@ -314,7 +406,14 @@ function runCardAutomation(requestData, callback) {
   });
 }
 
-// Create HTTP server
+// HTTP server. Two routes:
+//   /trigger-cvc (GET|POST) — run the card automation; POST body carries card
+//     details + iframe coords, GET is a bare trigger that relies on config only.
+//   /health (GET)           — readiness probe reporting whether a card/CVC is
+//     configured, used by the extension to decide if the server is usable.
+// Bound to 127.0.0.1 only (see listen below); CORS is wide-open because the
+// only caller is the extension content script running on tock.com, and the
+// listener is unreachable off-box regardless of Origin.
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -333,6 +432,8 @@ const server = http.createServer((req, res) => {
     req.on('data', chunk => { body += chunk.toString(); });
 
     req.on('end', () => {
+      // Tolerate a missing/invalid body: a bare GET trigger has no JSON, and we
+      // still want to attempt a config-only fill rather than 400 the caller.
       let requestData = null;
       if (body) {
         try { requestData = JSON.parse(body); } catch (e) { /* ignore */ }
@@ -368,6 +469,8 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// Listen on loopback only — this server drives real clicks/keystrokes on the
+// local machine, so it must never be reachable from the network.
 server.listen(PORT, '127.0.0.1', () => {
   const config = readConfig();
   const cardOk = !!(config.cardNumber && config.cardExpiry && config.cvc);
@@ -387,6 +490,7 @@ Press Ctrl+C to stop.
 `);
 });
 
+// Clean Ctrl+C shutdown so the loopback port is released for the next run.
 process.on('SIGINT', () => {
   console.log('\nShutting down server...');
   server.close();

@@ -1,20 +1,71 @@
+/**
+ * OpenTable checkout form-filler content script.
+ *
+ * Single responsibility: given a set of reservation preferences (party size, date,
+ * time), drive OpenTable's restaurant-profile date/time/party-size picker in the DOM
+ * and — when auto-submit is on — click the matching availability time slot to advance
+ * toward checkout.
+ *
+ * Role in the system: this is the OpenTable-specific sibling of `form-filler.ts` (Tock)
+ * and `resy-form-filler.ts` (Resy). Because OpenTable renders its own on-page widgets
+ * (no cross-origin Stripe iframe at this stage), everything here works by directly
+ * mutating native `<select>` elements and clicking calendar/slot buttons, then
+ * dispatching synthetic `input`/`change` events so React re-renders. Unlike the Tock
+ * path, no AppleScript/cliclick server is needed to fill these fields.
+ *
+ * Key OpenTable DOM facts this relies on (reverse-engineered, brittle by nature):
+ *  - The party-size and time pickers are real `<select>` elements hidden behind
+ *    styled overlays, addressable by fixed ids (`#restaurantProfileDtpPartySizePicker`,
+ *    `#restaurantProfileDtpTimePicker`). We set `.value`/`.selectedIndex` on the hidden
+ *    select rather than clicking the overlay.
+ *  - The date picker is a react-day-picker calendar; days are addressed by their
+ *    human `aria-label` (e.g. "Friday, November 21"), which is the most stable handle.
+ *  - Availability appears as `[data-testid^="time-slot-"]` items containing a
+ *    `[role="button"]`; OpenTable shows these automatically once date/time/party are
+ *    set — there is no explicit "search" button to click.
+ *
+ * Key export: {@link OpenTableFormFiller}.
+ */
 import { FormFillerOptions, TockPreferences } from '../types';
 
+/**
+ * Fills and (optionally) submits OpenTable's on-page reservation picker.
+ *
+ * Construct with the user's {@link FormFillerOptions} and call {@link fill}. The class
+ * is single-use per page: it holds mutable `attempts` state shared across the DOM-poll
+ * loops, so create a fresh instance rather than re-running `fill()` on the same object.
+ */
 export class OpenTableFormFiller {
   private preferences: TockPreferences;
   private waitForForm: boolean;
   private autoSubmit: boolean;
+  /**
+   * Shared retry counter, reused (and reset) by both `waitForFormElements()` and
+   * `waitForAndClickTimeSlot()`. It is intentionally an instance field so those polling
+   * loops don't each thread a counter through their recursive setTimeout callbacks.
+   */
   private attempts: number = 0;
+  /** Cap on poll iterations for both the form-ready wait and the time-slot wait. */
   private maxAttempts: number = 10;
 
   constructor(options: FormFillerOptions) {
     this.preferences = options.preferences;
+    // Default both behaviours on: callers usually want to wait for the widget to hydrate
+    // and to auto-click a slot. Pass `false` explicitly to only populate fields.
     this.waitForForm = options.waitForForm ?? true;
     this.autoSubmit = options.autoSubmit ?? true;
   }
 
   /**
-   * Fill the OpenTable reservation form with the provided preferences
+   * Orchestrates the full fill: wait for the widget (optional) → set party size → set
+   * date → set time → optionally click the best-matching availability slot.
+   *
+   * Ordering matters: party size and date must be committed before time slots are
+   * meaningful, since OpenTable recomputes availability from those inputs. Returns
+   * `true` if the form was filled without throwing (note: a `true` here does NOT
+   * guarantee a slot was clicked — that outcome is logged separately). Any thrown
+   * error is caught and surfaced as `false` so a broken selector never crashes the
+   * host page.
    */
   public async fill(): Promise<boolean> {
     try {
@@ -60,7 +111,12 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Wait for form elements to be available in the DOM
+   * Poll (up to `maxAttempts` × 500ms) until both the party-size and day pickers exist.
+   *
+   * OpenTable's profile page is a React SPA that hydrates asynchronously, so the pickers
+   * are not present at content-script injection time. We gate on the two `data-testid`
+   * anchors that wrap the real inputs; once both are in the DOM the widget is considered
+   * interactive. Resolves `false` (rather than rejecting) if the widget never appears.
    */
   private async waitForFormElements(): Promise<boolean> {
     return new Promise((resolve) => {
@@ -84,7 +140,12 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Fill party size dropdown
+   * Set the party-size `<select>` to the preferred size and notify React.
+   *
+   * We mutate the real (visually hidden) native select rather than clicking the styled
+   * overlay, then dispatch both `input` and `change` — React's controlled-select
+   * bindings listen for these and won't observe a programmatic `.value` assignment on
+   * their own. The 300ms settle lets the re-render land before the next field is set.
    */
   private async fillPartySize(): Promise<void> {
     // Use the actual select element (hidden behind the overlay)
@@ -108,7 +169,12 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Fill date picker
+   * Open the react-day-picker calendar, navigate to the target month, and click the day.
+   *
+   * `preferences.date` is a "YYYY-MM-DD" string. It is parsed into a local-timezone
+   * `Date` via explicit year/month/day args (NOT `new Date("YYYY-MM-DD")`, which parses
+   * as UTC midnight and can render as the previous day in western timezones) — this is
+   * the off-by-one guard called out below.
    */
   private async fillDate(): Promise<void> {
     console.log(`Setting date to ${this.preferences.date}`);
@@ -144,10 +210,19 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Navigate calendar to the target month
+   * Step the calendar's prev/next-month buttons until the header shows the target month.
+   *
+   * The currently displayed month is read from the `aria-live` header text (e.g.
+   * "November 2025") and parsed via `new Date(headerText + ' 1')` to get a comparable
+   * month/year. Direction is chosen by comparing first-of-month `Date` objects, so it
+   * works across year boundaries. Bails out early if a nav button is missing/disabled
+   * (target is outside OpenTable's bookable window) or after `maxMonthNavAttempts` to
+   * avoid an infinite loop if the header never advances.
    */
   private async navigateToMonth(targetMonth: number, targetYear: number): Promise<void> {
     let attempts = 0;
+    // 12 = one full year of forward/back clicks; OpenTable never books further out, so
+    // exceeding this means the target is unreachable and we should stop rather than spin.
     const maxMonthNavAttempts = 12; // Don't navigate more than 12 months
 
     while (attempts < maxMonthNavAttempts) {
@@ -200,7 +275,14 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Click the date in the calendar
+   * Click the day cell for the target date within the currently displayed month.
+   *
+   * Primary strategy: match on the day button's `aria-label`, reconstructed here as
+   * `"<Weekday>, <Month> <Day>"` (e.g. "Friday, November 21") — the exact format
+   * react-day-picker emits, and the most collision-proof handle (bare day numbers
+   * repeat across adjacent months shown in the same grid). Falls back to matching the
+   * button's text content against the day number, scoped to non-disabled `.rdp-day`
+   * cells, only if the aria-label lookup misses.
    */
   private async clickDateInCalendar(targetDay: number, targetMonth: number, targetYear: number): Promise<void> {
     // OpenTable uses react-day-picker with aria-labels
@@ -244,7 +326,14 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Fill time picker (if available)
+   * Locate the time-picker `<select>` and delegate value-setting to `setTimeValue`.
+   *
+   * The stable id `#restaurantProfileDtpTimePicker` is tried first (mirrors the
+   * party-size picker id). Not every restaurant profile renders a standalone time
+   * select — when it's absent we log every `<select>` on the page for debugging, then
+   * fall back to a heuristic attribute match (`aria-label`/`data-test` containing
+   * "time"). If neither resolves, we return quietly; the availability slots may still
+   * appear from date + party size alone.
    */
   private async fillTime(): Promise<void> {
     console.log(`Setting time to ${this.preferences.time}`);
@@ -280,12 +369,22 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Set the time value in the time picker select element
+   * Select the option in `timeSelect` that matches (or is closest to) the preferred time.
+   *
+   * Matching is two-tier because option label formatting varies by restaurant:
+   *  1. Exact match against several string renderings of the preferred time — 12-hour
+   *     with and without the space ("5:30 PM" / "5:30PM") plus the raw 24-hour string —
+   *     checked against both option `.text` and `.value`.
+   *  2. If nothing matches exactly, parse each option's "H:MM AM/PM" label into minutes
+   *     and pick the option with the smallest absolute difference, so a requested 5:30
+   *     still books a nearby 5:15/5:45 rather than failing.
+   * After choosing, dispatch `input` + `change` so React updates and recomputes slots.
    */
   private async setTimeValue(timeSelect: HTMLSelectElement): Promise<void> {
     // Convert 24-hour time (17:30) to 12-hour format for matching
     const [hours, minutes] = this.preferences.time.split(':').map(Number);
     const period = hours >= 12 ? 'PM' : 'AM';
+    // `hours % 12 || 12` maps 0→12 and 12→12 so midnight/noon render correctly in 12h.
     const hours12 = hours % 12 || 12;
     const time12Hour = `${hours12}:${minutes.toString().padStart(2, '0')} ${period}`;
     const time12HourAlt = `${hours12}:${minutes.toString().padStart(2, '0')}${period}`; // No space variant
@@ -316,6 +415,7 @@ export class OpenTableFormFiller {
     // If no exact match, find closest time
     if (matchedIndex === -1) {
       console.warn(`No exact match found for ${time12Hour}, finding closest time...`);
+      // Compare in absolute minutes-since-midnight so proximity is direction-agnostic.
       const targetMinutes = hours * 60 + minutes;
       let closestDiff = Infinity;
 
@@ -368,13 +468,23 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Find and return the clickable button element for the time slot that best matches the preferred time
+   * Scan the rendered availability slots and return the clickable button closest to the
+   * preferred time, or `null` if no slots exist yet.
+   *
+   * This reads the *availability results* (`[data-testid^="time-slot-"]`), which is a
+   * different surface from the time `<select>` filled by `setTimeValue` — those are the
+   * requested time; these are what OpenTable actually offers. Each slot's inner
+   * `[role="button"]` label is parsed via a "H:MM AM/PM" regex (tolerating trailing
+   * markers like the "*" on "5:30 PM*"). An exact time returns immediately; otherwise
+   * the smallest minutes-difference slot is returned. Returning `null` vs a far-off
+   * slot is intentional so callers can keep polling while results are still streaming in.
    */
   private findMatchingTimeSlot(preferredTime: string): HTMLElement | null {
     // Look for time slot list items
     const timeSlots = document.querySelectorAll('[data-testid^="time-slot-"]');
 
     if (timeSlots.length === 0) {
+      // No results rendered yet — signal "keep waiting" rather than "no availability".
       return null;
     }
 
@@ -445,7 +555,19 @@ export class OpenTableFormFiller {
   }
 
   /**
-   * Wait for time slot buttons to appear and click one
+   * Wait for availability slots to render, then click the best match — resolves `true`
+   * once a slot is clicked, `false` if none appears before the limits are hit.
+   *
+   * Uses a belt-and-suspenders approach because OpenTable adds slots asynchronously and
+   * inconsistently: a `MutationObserver` on `document.body` catches slots the instant
+   * they're inserted, while a 500ms polling loop (capped at `maxAttempts`) covers cases
+   * where the mutation fires before the button is fully ready. A hard timeout backstops
+   * both. All three paths funnel through `resolveOnce`, which guarantees the promise
+   * settles exactly once and tears down the observer + timeout so no stray click or
+   * leaked observer fires after resolution.
+   *
+   * Note: `this.attempts` is reset to 0 here because it is shared with
+   * `waitForFormElements` and would otherwise start near/at the cap.
    */
   private async waitForAndClickTimeSlot(): Promise<boolean> {
     console.log('Waiting for time slots to appear...');
@@ -457,7 +579,8 @@ export class OpenTableFormFiller {
       // Store timeout ID so we can clear it later
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-      // Helper to resolve only once
+      // Single settle point: disconnects the observer and clears the timeout so the
+      // three racing producers (observer, poll loop, timeout) can never double-resolve.
       const resolveOnce = (value: boolean) => {
         if (!resolved) {
           resolved = true;
@@ -518,7 +641,9 @@ export class OpenTableFormFiller {
 
       checkForTimeSlots();
 
-      // Set a maximum timeout of 30 seconds
+      // Hard backstop: if neither the observer nor the poll loop has resolved, give up.
+      // NOTE: the actual delay is 10000ms (10s) — the "30 seconds" wording here and in
+      // the log message below is stale; the effective cap is 10 seconds.
       timeoutId = setTimeout(() => {
         if (!resolved) {
           console.log('Timeout reached waiting for time slots (30 seconds)');

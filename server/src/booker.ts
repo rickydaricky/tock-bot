@@ -1,8 +1,40 @@
+/**
+ * booker.ts — single-shot Tock booking + the shared Stripe/checkout purchase flow.
+ *
+ * Responsibility: given a {@link BookingRequest} (restaurant slug, candidate dates,
+ * party size, time), drive one Playwright page from the search calendar through slot
+ * selection and, if enabled, all the way through Tock's checkout to a completed purchase.
+ *
+ * Role in the system: this is the "single-shot" booker used directly by {@link runBooking}
+ * and by the higher-frequency engines that reuse a warm browser context — the sniper
+ * (sniper.ts) and blitz mode (blitz.ts) both call {@link runBookingWithContext} /
+ * {@link handlePurchaseFlow} rather than re-implementing checkout. The checkout stage is
+ * the shared, fail-closed critical path: it fills payment (saved-card CVC-only or a full
+ * new-card Stripe form via stripe.ts), then enforces a grand-total price cap before it
+ * will ever click "Purchase".
+ *
+ * Key exports:
+ *  - {@link BookingRequest} / {@link BookingResult} — the input/output contract.
+ *  - {@link runBooking} — launch a browser, inject cookies, book, close (self-contained).
+ *  - {@link runBookingWithContext} — book on a caller-supplied warm context (+ AbortSignal).
+ *  - {@link handlePurchaseFlow} — the checkout state-machine (add-ons → confirm → purchase).
+ *  - {@link parseAmountDueCents} — pure, unit-tested parser for the price-cap guard.
+ *  - {@link STEALTH_ARGS}, {@link randomDelay}, {@link to12Hour} — shared launch/timing/format helpers.
+ */
 import { chromium, Browser, Page, BrowserContext, Frame } from 'playwright';
 import { injectCookies } from './cookies';
 import { fillStripePayment, fillStripeBilling, PaymentDetails, getPayment } from './stripe';
 
-/** Find a frame containing a CVC/CVV input field */
+/**
+ * Find the (cross-origin) frame that hosts a CVC/CVV input for saved-card checkout.
+ *
+ * In saved-card mode Tock only asks for the security code, but that field can live in
+ * either a Stripe iframe (name="cvc") or a Braintree hosted-field iframe (name="cvv"),
+ * so we probe every frame for any of the known selectors rather than assume one vendor.
+ * Returns the first matching frame, or null (caller then falls back to a same-page input).
+ * Per-frame errors are swallowed: cross-origin frames can throw on access and must not
+ * abort the scan.
+ */
 async function findCvcFrame(page: Page): Promise<Frame | null> {
   for (const frame of page.frames()) {
     try {
@@ -13,6 +45,13 @@ async function findCvcFrame(page: Page): Promise<Frame | null> {
   return null;
 }
 
+/**
+ * A single booking attempt's inputs.
+ * `dates` is a priority-ordered candidate list — the booker tries them in order and takes
+ * the first one that actually has availability, so callers pass fallbacks, not just one date.
+ * `autoPurchase` defaults to ON at the call sites (only `=== false` skips checkout);
+ * `dryRun` walks the whole flow and captures screenshots but never clicks Purchase.
+ */
 export interface BookingRequest {
   restaurant: string;
   dates: string[];     // YYYY-MM-DD in priority order
@@ -22,6 +61,12 @@ export interface BookingRequest {
   dryRun?: boolean;
 }
 
+/**
+ * Outcome of a booking attempt. `bookedDate`/`bookedTime` may be set even when
+ * `success` is false — a slot was grabbed but the later purchase stage failed — so
+ * callers can distinguish "nothing booked" from "held but not paid".
+ * `screenshots` are base64 PNGs, populated on the dry-run path (and on failures for triage).
+ */
 export interface BookingResult {
   success: boolean;
   bookedDate?: string;
@@ -30,6 +75,14 @@ export interface BookingResult {
   screenshots?: string[]; // base64 screenshots if dryRun
 }
 
+/**
+ * Chromium launch flags shared by every browser we start.
+ * `--disable-blink-features=AutomationControlled` is the anti-detection flag — it stops
+ * Chrome from advertising itself as automated (paired with the `navigator.webdriver`
+ * override in {@link runBookingWithContext}). The `--no-sandbox` / `--disable-setuid-sandbox`
+ * / `--disable-dev-shm-usage` trio is required to run headless Chromium in the Railway
+ * container (no user namespaces, tiny /dev/shm).
+ */
 export const STEALTH_ARGS = [
   '--disable-blink-features=AutomationControlled',
   '--no-sandbox',
@@ -37,6 +90,7 @@ export const STEALTH_ARGS = [
   '--disable-dev-shm-usage',
 ];
 
+/** Random human-ish pause (ms) inserted between actions to look less scripted to Tock. */
 export function randomDelay(min = 200, max = 500): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -132,7 +186,10 @@ export async function runBookingWithContext(
       let matchedTimeText = '';
 
       for (const button of bookButtons) {
-        // Walk up the DOM to find the time text
+        // The book button itself has no time label — the "5:00 PM" text lives on an
+        // ancestor card. Walk up to 6 parents looking for the first h:mm AM/PM string;
+        // 6 is empirically enough to escape the button's inner wrappers without
+        // bleeding into a sibling slot's time.
         const timeText = await button.evaluate((el: any) => {
           let node = el;
           for (let i = 0; i < 6; i++) {
@@ -153,7 +210,9 @@ export async function runBookingWithContext(
           break;
         }
 
-        // Track closest match as fallback
+        // Fallback: if no slot matches the requested time exactly, keep the FIRST slot
+        // we saw (earliest offered, not nearest-by-clock) so the date isn't abandoned
+        // over a few minutes' difference. An exact match above wins and breaks the loop.
         if (!matchedButton) {
           matchedButton = button;
           matchedTimeText = timeText;
@@ -252,6 +311,26 @@ async function readAmountDueCents(page: Page): Promise<number | null> {
   }
 }
 
+/**
+ * Drive Tock's post-slot checkout as a polling state-machine until the purchase page
+ * appears, then hand off to {@link handlePurchaseConfirmation}.
+ *
+ * Tock inserts a variable number of interstitials after a slot is grabbed (add-ons /
+ * supplement pages, a "View Order" modal) with no fixed order or count, so instead of a
+ * linear script we loop for up to `maxWait` (30s), detecting whichever page is currently
+ * showing by its testid and advancing it, until either the purchase button shows up or we
+ * time out.
+ *
+ * Failure contract: a timeout, or a *reasoned* abort inside confirmation (price cap hit,
+ * amount-due unreadable), THROWS with a short summary of the accumulated `problems`.
+ * That matters because callers (sniper/scheduler) catch and persist the thrown message
+ * into booking history, so an operator can diagnose a failed checkout from the dashboard
+ * within the ~10-min hold window — not only from ephemeral Railway stdout.
+ *
+ * @param maxPriceCents optional grand-total cap in cents; forwarded to the fail-closed guard.
+ * @returns true if the purchase completed (or dry-run reached the button); throws on
+ *          timeout/abort rather than returning false when there's a diagnosable reason.
+ */
 export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshots: string[], maxPriceCents?: number): Promise<boolean> {
   console.log('🛒 Starting purchase flow...');
   await page.waitForTimeout(1000);
@@ -311,6 +390,29 @@ export async function handlePurchaseFlow(page: Page, dryRun: boolean, screenshot
   throw new Error(`Timeout waiting for purchase page${detail}`);
 }
 
+/**
+ * Fill and finalize Tock's purchase-confirmation page.
+ *
+ * Ordered steps: (1) force "No gratuity" if a gratuity picker is present; (2) tick the
+ * marketing/consent checkboxes Tock requires to enable the button; (3) fill payment —
+ * auto-detecting saved-card mode (CVC-only, in a Stripe *or* Braintree iframe, or a plain
+ * page input) vs. new-card mode (full Stripe Payment + Address elements via stripe.ts);
+ * (4) enforce the price cap; (5) click Purchase (unless dry-run).
+ *
+ * Saved-card detection is deliberately belt-and-suspenders: it checks for the known
+ * testids AND for the on-page copy ("Select credit card" / "confirm your credit card
+ * security code"), because Tock has shipped the saved-card UI without a stable testid.
+ *
+ * Price cap is the authoritative, fail-closed overspend guard: when `maxPriceCents` is
+ * set we read the real grand-total "Amount due" and abort if it exceeds the cap OR if the
+ * total can't be read at all (never buy blind). Aborts push a reason into `problems` so
+ * {@link handlePurchaseFlow} can throw it into history.
+ *
+ * @returns true on a completed purchase (or a dry-run that reached the button); false on
+ *          an abort (missing/failed payment, cap exceeded, unreadable total). Note: in
+ *          dry-run with no payment configured it returns `dryRun` (true) — a dry run is
+ *          allowed to "pass" without card details since it never actually charges.
+ */
 async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screenshots: string[], maxPriceCents?: number, problems?: string[]): Promise<boolean> {
   // Gratuity — select "No gratuity" if present
   const gratuityBtn = await page.$('[data-testid="gratuity-button-zero"]');
@@ -443,6 +545,8 @@ async function handlePurchaseConfirmation(page: Page, dryRun: boolean, screensho
   return true;
 }
 
+/** Capture the current viewport (not full page) as a base64 PNG for the dry-run /
+ *  failure screenshot trail returned in {@link BookingResult.screenshots}. */
 async function takeScreenshot(page: Page): Promise<string> {
   const buffer = await page.screenshot({ fullPage: false });
   return buffer.toString('base64');

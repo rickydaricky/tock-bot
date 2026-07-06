@@ -1,9 +1,51 @@
+/**
+ * sniper.ts — THE core reservation SNIPER engine.
+ *
+ * Responsibility: win a competitive Tock reservation "drop". Warm a small headless browser
+ * pool on the search page, densely poll the page's embedded availability ($REDUX_STATE →
+ * calendar.offerings) across the drop window, and — the instant a matching slot appears
+ * (EXACT date, closest in-window time, price-capped) — let a single poll loop win an atomic
+ * lock and GRAB the slot, then auto-purchase (or rehearse, under dryRun). Every run records
+ * what it actually saw so a miss is diagnosable, and a held-but-uncompleted slot is frozen
+ * for manual recovery rather than lost.
+ *
+ * Grab has two paths, tried in order:
+ *   1. Direct-API lock (primary, Cloudflare-proof): PUT /api/ticket/group/lock with a
+ *      reverse-engineered protobuf body (encodeTockLock), issued via an in-page fetch that
+ *      reuses the warm session's cf_clearance + captured/reconstructed x-tock-* headers.
+ *      No document navigation ⇒ it never draws the Turnstile challenge a reload would.
+ *   2. Hybrid reload+click (fallback): reload the search page and click the ENABLED Book
+ *      button for the matched time (reaches checkout via the client-side flow that paid
+ *      experiences require; also handles multi-seating chooser + wrong-slot guards).
+ *
+ * Load-bearing invariants / reverse-engineered facts:
+ *   - Fail-closed price cap: a real (non-dry) run REQUIRES maxPriceCents. The soft detection
+ *     filter can let unknown-price slots through; the AUTHORITATIVE overspend guard is at
+ *     purchase time against the actual "Amount due" (handlePurchaseFlow).
+ *   - Single-winner lock: exactly one loop grabs/charges even with many overlapping loops.
+ *   - The lock PUT returns HTTP 200 for BOTH a real hold AND a conflict — the body must be
+ *     classified (lockResponseVerdict: a hold echoes reservation details ~1200B+; a conflict
+ *     is a short "no longer available" ~89B), or a taken slot reads as a win.
+ *   - There is NO JSON availability endpoint: the only slot source is the JS-literal
+ *     $REDUX_STATE embedded in the search HTML (extractOfferingsFromHtml surgically parses it).
+ *   - x-tock-* headers are reused, not forged: captured from the app's own requests, else
+ *     reconstructed byte-equal from page state (readTockHeadersFromPage) for modal-UI venues.
+ *
+ * Key exports: runSniper (the engine); SniperConfig / SniperResult / NormalizedSlot /
+ * GrabResult (the contracts); and the pure, unit-tested helpers — parseAvailability,
+ * extractOfferingsFromHtml, pickBestSlot, encodeTockLock, lockResponseVerdict,
+ * computeWindowOffsets, SingleWinnerLock, validateSniperConfig.
+ */
 import { chromium, Browser, Page } from 'playwright';
 import { BookingRequest, STEALTH_ARGS, to12Hour, handlePurchaseFlow } from './booker';
 import { injectCookies } from './cookies';
 import { getFingerprint, summarizeFailures, safeShot, AttemptOutcome } from './blitz';
 import { freezeSession } from './sessions';
 
+/** One bookable slot, normalized from Tock's raw availability into the single shape the
+ *  sniper matches, grabs, and price-caps against. Both time formats are carried on purpose:
+ *  time24 for window/closeness arithmetic, time12 because that's the literal text the DOM
+ *  grab clicks. offerId/seatingAreaId/priceCents feed the direct-API lock and the cap. */
 export interface NormalizedSlot {
   date: string;        // YYYY-MM-DD
   time24: string;      // 24h "HH:MM" (for window/closeness math)
@@ -57,6 +99,9 @@ export function pickSlot(slots: NormalizedSlot[], date: string, time24: string):
   return slots.find(s => s.date === date && s.time12.toLowerCase() === want) ?? null;
 }
 
+/** Optional constraints for pickBestSlot: an acceptable seating-time window plus a total
+ *  price cap (per-person `priceCents` × `partySize`). All fields absent = accept any slot on
+ *  the requested date. Kept separate from SniperConfig so the picker stays pure/testable. */
 export interface PickOpts {
   windowStart24?: string;  // earliest acceptable time, 24h (default: no lower bound)
   windowEnd24?: string;    // latest acceptable time, 24h (default: no upper bound)
@@ -131,6 +176,9 @@ export interface TockExperience {
   ticketPriceInformation?: { amountCents?: number };
   seatingArea?: Array<{ id?: number | string }>; // present on multi-seating venues (JouJou); [] direct-book (FHH)
 }
+/** Tock's `calendar.offerings` object: parallel arrays of every bookable date and time for
+ *  the venue, plus the experiences. parseAvailability cross-products dates × times, gated by
+ *  an AVAILABLE experience for the party size, into concrete NormalizedSlots. */
 export interface TockOfferings {
   openDate?: string[];   // bookable dates, "YYYY-MM-DD"
   openTime?: string[];   // bookable times, 24h "HH:MM"
@@ -178,6 +226,11 @@ export function parseAvailability(offerings: unknown, partySize: number): Normal
   return out;
 }
 
+/** All runtime knobs for one sniper run: pool size + poll cadence + drop-window bounds, the
+ *  match constraints (time window, price cap), and the two read/grab path toggles (fastPoll,
+ *  apiGrab). Passed straight through by BOTH entry points — the /api/sniper route and the
+ *  scheduler's raw passthrough — so it MUST be run through validateSniperConfig before any
+ *  browser is warmed (a malformed cap must never silently disable the overspend guard). */
 export interface SniperConfig {
   pool: number;            // browsers, clamped 1..6
   pollIntervalMs: number;  // per-loop poll cadence
@@ -228,6 +281,10 @@ export interface SniperSeen {
   priceCentsSeen?: number;    // a per-person price observed (for sanity vs the cap)
 }
 
+/** Outcome of a sniper run: success + what was booked, or a diagnosable failure. Always
+ *  carries poll accounting and the `seen` instrumentation (so a miss is never a black box);
+ *  `pausedSessionId` is set only when a slot was HELD but not completed and the winning
+ *  browser was frozen for manual recovery (slot survives ~10 min). */
 export interface SniperResult {
   success: boolean;
   bookedDate?: string;
@@ -243,6 +300,12 @@ export interface SniperResult {
   seen?: SniperSeen;       // instrumentation: what availability the bot observed
 }
 
+/** A warmed pool member: a live browser + page already past Cloudflare on the exploretock.com
+ *  origin (so an in-page fetch carries session cookies + cf_clearance), plus the x-tock-*
+ *  header set the direct-API lock needs. `headerSource` records HOW those headers were obtained
+ *  ('request' = captured from the app's own calls, 'page'/'page-grab' = reconstructed from page
+ *  state, 'none' = never got them) — surfaced verbatim in failure diagnostics. `tockHeaderHits`
+ *  counts x-tock-bearing requests seen (0 ⇒ modal-UI venue that fired none passively). */
 interface Warm { browser: Browser; page: Page; tockHeaders?: Record<string, string>; tockHeaderHits?: number; headerSource?: 'request' | 'page' | 'page-grab' | 'none' }
 
 /** Attach a request listener that keeps the latest x-tock-* header set the APP puts on its
@@ -301,6 +364,9 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** The Tock search-page URL for a date — both the pool's warm target and the poller's read
+ *  target. Any requested date works as the read target since the embedded offerings covers the
+ *  venue's whole ~3-month calendar (so one fetch per poll checks every requested date). */
 function searchUrlFor(req: BookingRequest, date: string): string {
   return `https://www.exploretock.com/${req.restaurant}/search?date=${date}&size=${req.partySize}&time=${encodeURIComponent(req.time)}`;
 }
@@ -395,7 +461,11 @@ async function fetchOfferingsFast(page: Page, url: string): Promise<any> {
   return extractOfferingsFromHtml(html) ?? { __noState: true };
 }
 
+/** Per-loop fast-path state: whether the fast in-page-fetch read is still enabled for this
+ *  loop, and the running count of consecutive misses that latches it off (readOfferings). */
 interface FastState { useFast: boolean; fastFails: number; }
+/** Per-run poll accounting by read path — fast hits, navigate fallbacks, and Cloudflare
+ *  challenges (a throttle signal) — surfaced in SniperResult.polls. */
 interface PathStats { fast: number; nav: number; challenges: number; }
 
 /** One availability read: try the FAST in-page-fetch path first; on any non-offerings result
@@ -492,6 +562,11 @@ async function verifyHoldStarted(page: Page): Promise<'held' | 'taken'> {
   return 'held'; // inconclusive — let the purchase flow's own gate decide
 }
 
+/** Result of one grab attempt (either the API or the reload+click path). Note the two
+ *  non-obvious cases: an `ok:true` with `heldNoCheckout` means the slot is genuinely LOCKED
+ *  but checkout wasn't auto-reached (freeze for manual completion — do NOT treat as failure);
+ *  and an `ok:false` with `slotTakenAtClick`+`failedTime12` is a RETRYABLE lost click race —
+ *  the caller retries the next surviving time with `failedTime12` excluded. */
 export type GrabResult =
   | { ok: true; time12?: string; heldNoCheckout?: boolean } // heldNoCheckout: locked but checkout page not auto-reached (rescue manually)
   | { ok: false; reason: string; slotTakenAtClick?: boolean; failedTime12?: string };
