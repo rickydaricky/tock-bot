@@ -49,6 +49,7 @@ const STORE_FILE = path.join(STORE_DIR, 'state.json');
  */
 interface StoreData {
   cookies?: any[];
+  opentableCookies?: any[];
   payment?: any;
   tockCredentials?: { email: string; password: string };
 }

@@ -3,7 +3,8 @@
   "name": "Tock & OpenTable Reservation Form Filler",
   "version": "1.0.0",
   "description": "Automatically fill in Tock and OpenTable reservation forms with preferred party size, date, and time",
-  "permissions": ["activeTab", "storage", "alarms"],
+  "permissions": ["activeTab", "storage", "alarms", "cookies"],
+  "host_permissions": ["*://*.opentable.com/*"],
   "action": {
     "default_popup": "popup.html"
   },

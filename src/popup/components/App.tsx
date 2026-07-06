@@ -7,6 +7,7 @@ import { TockPreferences, ActiveTimer, Platform } from '../../types';
 import { loadPreferences, savePreferences } from '../../utils/storage';
 import { sendFillFormMessage, sendCancelTimerMessage, sendGetTimerStatusMessage } from '../../utils/messaging';
 import { detectPlatform, getPlatformDisplayName } from '../../utils/platform';
+import { OpenTableSession } from './OpenTableSession';
 
 const App: React.FC = () => {
   const [preferences, setPreferences] = useState<TockPreferences>({
@@ -682,6 +683,8 @@ const App: React.FC = () => {
           </div>
         )}
       </div>
+
+      <OpenTableSession />
 
       {status && (
         <div className="mt-4 p-2 text-center text-sm font-medium rounded-md bg-blue-50 text-blue-700">

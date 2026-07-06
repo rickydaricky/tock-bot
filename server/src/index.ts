@@ -23,11 +23,12 @@
 import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
-import { runBooking, BookingRequest } from './booker';
-import { runBlitz, BlitzConfig } from './blitz';
+import { BookingRequest } from './booker';
+import { getBookingEngine } from './engines';
+import { BlitzConfig } from './blitz';
 import { runSniper, SniperConfig, validateSniperConfig } from './sniper';
 import { listSessions, sessionScreenshot, applyAction } from './sessions';
-import { loadCookiesFromEnv, updateCookies, getCookies } from './cookies';
+import { loadCookiesFromEnv, updateCookies, getCookies, Platform } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, deleteHistoryEntry, clearHistory, ScheduledBooking, schedulerEvents, BookingHistoryEntry } from './scheduler';
 import { getPayment, setPaymentOverride, PaymentDetails } from './stripe';
 import { notifyResult } from './notify';
@@ -103,6 +104,10 @@ app.get('/health', (_req, res) => {
     cookiesLoaded: cookies.length > 0,
     cookieCount: cookies.length,
     paymentConfigured: !!payment?.cardNumber,
+    cookieCounts: {
+      tock: getCookies('tock').length,
+      opentable: getCookies('opentable').length,
+    },
   });
 });
 
@@ -114,7 +119,7 @@ app.get('/health', (_req, res) => {
  * outcome to booking history tagged `source: 'manual'` so it shows in the dashboard.
  */
 app.post('/api/book', requireAuth, async (req, res) => {
-  const { restaurant, dates, partySize, time, autoPurchase, dryRun } = req.body as BookingRequest;
+  const { restaurant, dates, partySize, time, autoPurchase, dryRun, platform } = req.body as BookingRequest;
 
   if (!restaurant || !dates?.length || !partySize || !time) {
     res.status(400).json({ error: 'Missing required fields: restaurant, dates, partySize, time' });
@@ -122,7 +127,8 @@ app.post('/api/book', requireAuth, async (req, res) => {
   }
 
   console.log(`\n📨 Booking request: ${restaurant}`);
-  const result = await runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun });
+  const engine = getBookingEngine(platform);
+  const result = await engine.runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun, platform });
   await notifyResult(restaurant, result);
 
   addToHistory({
@@ -146,12 +152,13 @@ app.post('/api/book', requireAuth, async (req, res) => {
  */
 // Keep old /book endpoint for backward compat
 app.post('/book', requireAuth, async (req, res) => {
-  const { restaurant, dates, partySize, time, autoPurchase, dryRun } = req.body as BookingRequest;
+  const { restaurant, dates, partySize, time, autoPurchase, dryRun, platform } = req.body as BookingRequest;
   if (!restaurant || !dates?.length || !partySize || !time) {
     res.status(400).json({ error: 'Missing required fields' });
     return;
   }
-  const result = await runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun });
+  const engine = getBookingEngine(platform);
+  const result = await engine.runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun, platform });
   await notifyResult(restaurant, result);
   res.json(result);
 });
@@ -176,6 +183,10 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
 
   if (runAt && isNaN(new Date(runAt).getTime())) {
     return res.status(400).json({ success: false, error: 'Invalid runAt datetime' });
+  }
+
+  if (rest.platform === 'opentable' && sniper) {
+    return res.status(400).json({ success: false, error: 'OpenTable does not support sniper scheduling yet' });
   }
 
   // cron is only needed for recurring schedules (no runAt).
@@ -257,7 +268,8 @@ app.post('/api/blitz', requireAuth, async (req, res) => {
     staggerMs: blitz.staggerMs || 1000,
   };
   try {
-    const result = await runBlitz(bookingReq, config);
+    const engine = getBookingEngine(bookingReq.platform);
+    const result = await engine.runBlitz(bookingReq, config);
     const entry = {
       id: crypto.randomUUID(),
       restaurant: bookingReq.restaurant,
@@ -377,6 +389,9 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
   if (!bk.restaurant || !bk.dates?.length || !bk.time || !bk.partySize) {
     return res.status(400).json({ success: false, error: 'Missing required fields: restaurant, dates, time, partySize' });
   }
+  if (bk.platform === 'opentable') {
+    return res.status(400).json({ success: false, error: 'Sniper mode is Tock-only for now (OpenTable sniper is Phase 2). Use /api/book or /api/blitz.' });
+  }
   const cfg: SniperConfig = {
     pool: Math.min(Math.max(sniper?.pool ?? 5, 1), 6),
     pollIntervalMs: sniper?.pollIntervalMs ?? 200,
@@ -449,20 +464,22 @@ app.post('/api/sessions/:id/action', requireAuth, async (req, res) => {
 // These routes keep that cookie jar fresh from several sources (dashboard, bookmarklet,
 // auto-login), since a stale session is the most common cause of booking failure.
 
-/** Report how many Tock session cookies are currently loaded (drives the UI status pill). */
-app.get('/api/cookies/status', requireAuth, (_req, res) => {
-  const cookies = getCookies();
-  res.json({ count: cookies.length, loaded: cookies.length > 0 });
+/** Report how many session cookies are currently loaded for the given platform (drives the UI status pill). */
+app.get('/api/cookies/status', requireAuth, (req, res) => {
+  const platform = (req.query.platform as Platform) || 'tock';
+  const cookies = getCookies(platform);
+  res.json({ platform, count: cookies.length, loaded: cookies.length > 0 });
 });
 
-/** Replace the in-memory Tock cookie jar with a client-supplied array. */
+/** Replace the in-memory cookie jar for the given platform with a client-supplied array. */
 app.post('/api/cookies', requireAuth, (req, res) => {
+  const platform = (req.query.platform as Platform) || 'tock';
   const { cookies } = req.body;
   if (!Array.isArray(cookies)) {
     res.status(400).json({ error: 'Body must contain a "cookies" array' });
     return;
   }
-  updateCookies(cookies);
+  updateCookies(cookies, platform);
   res.json({ success: true, count: cookies.length });
 });
 
@@ -471,12 +488,11 @@ app.post('/api/cookies', requireAuth, (req, res) => {
  * cross-origin caller, so it needs an explicit OPTIONS 204 with permissive CORS headers
  * before the browser will send the POST.
  */
-// Bookmarklet endpoint — accepts cookies from exploretock.com via CORS
-// Auth via API_KEY in query string (since bookmarklet can't set cookies/headers easily)
+// Auth via X-Auth-Key header (preferred) or ?key= query param (back-compat). CORS-open for the extension/bookmarklet.
 app.options('/api/cookies/push', (_req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Key');
   res.status(204).end();
 });
 
@@ -489,21 +505,23 @@ app.options('/api/cookies/push', (_req, res) => {
 app.post('/api/cookies/push', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const key = req.query.key as string;
+  const headerKey = req.headers['x-auth-key'];
+  const key = (typeof headerKey === 'string' && headerKey) || (req.query.key as string);
   if (API_KEY && key !== API_KEY) {
     res.status(401).json({ error: 'Invalid key' });
     return;
   }
 
+  const platform = ((req.query.platform as string) === 'opentable' ? 'opentable' : 'tock') as Platform;
   const { cookies } = req.body;
   if (!Array.isArray(cookies)) {
     res.status(400).json({ error: 'Body must contain a "cookies" array' });
     return;
   }
 
-  updateCookies(cookies);
-  console.log(`🍪 Bookmarklet pushed ${cookies.length} cookies`);
-  res.json({ success: true, count: cookies.length });
+  updateCookies(cookies, platform);
+  console.log(`🍪 Pushed ${cookies.length} ${platform} cookies (header auth: ${!!headerKey})`);
+  res.json({ success: true, count: cookies.length, platform });
 });
 
 /**

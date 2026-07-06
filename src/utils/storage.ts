@@ -130,4 +130,24 @@ export const loadActiveTimer = async (): Promise<ActiveTimer | null> => {
  */
 export const clearActiveTimer = async (): Promise<void> => {
   return saveActiveTimer(null);
-}; 
+};
+
+/** Shape for the remote booking server config (URL + API key). */
+export interface ServerConfig { url: string; key: string; }
+
+/**
+ * Persist the server config (URL + API key) to `chrome.storage.local`.
+ * Device-local: the server URL is machine-specific, not worth roaming.
+ */
+export async function saveServerConfig(cfg: ServerConfig): Promise<void> {
+  await chrome.storage.local.set({ serverConfig: cfg });
+}
+
+/**
+ * Read the server config from `chrome.storage.local`.
+ * Returns null when no config has been saved yet.
+ */
+export async function loadServerConfig(): Promise<ServerConfig | null> {
+  const { serverConfig } = await chrome.storage.local.get('serverConfig');
+  return serverConfig ?? null;
+} 
