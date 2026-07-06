@@ -493,7 +493,7 @@ app.post('/api/cookies', requireAuth, (req, res) => {
 app.options('/api/cookies/push', (_req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Key');
   res.status(204).end();
 });
 
@@ -506,13 +506,14 @@ app.options('/api/cookies/push', (_req, res) => {
 app.post('/api/cookies/push', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const key = req.query.key as string;
+  const headerKey = req.headers['x-auth-key'];
+  const key = (typeof headerKey === 'string' && headerKey) || (req.query.key as string);
   if (API_KEY && key !== API_KEY) {
     res.status(401).json({ error: 'Invalid key' });
     return;
   }
 
-  const platform = (req.query.platform as Platform) || 'tock';
+  const platform = ((req.query.platform as string) === 'opentable' ? 'opentable' : 'tock') as Platform;
   const { cookies } = req.body;
   if (!Array.isArray(cookies)) {
     res.status(400).json({ error: 'Body must contain a "cookies" array' });
@@ -520,8 +521,8 @@ app.post('/api/cookies/push', (req, res) => {
   }
 
   updateCookies(cookies, platform);
-  console.log(`🍪 Bookmarklet pushed ${cookies.length} ${platform} cookies`);
-  res.json({ success: true, count: cookies.length });
+  console.log(`🍪 Pushed ${cookies.length} ${platform} cookies (header auth: ${!!headerKey})`);
+  res.json({ success: true, count: cookies.length, platform });
 });
 
 /**
