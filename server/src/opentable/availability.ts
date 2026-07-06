@@ -1,3 +1,5 @@
+import { to12Hour } from '../booker';
+
 export interface OpenTableSlot { time24: string; time12: string; testid: string; }
 
 /** Parse OpenTable slot button text like "6:00 PM*" into a normalized slot. */
@@ -12,7 +14,7 @@ export function parseSlots(raw: { testid: string; text: string }[]): OpenTableSl
     if (period === 'PM' && h !== 12) h += 12;
     if (period === 'AM' && h === 12) h = 0;
     const time24 = `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
-    out.push({ time24, time12: `${m[1]}:${m[2]} ${period}`, testid });
+    out.push({ time24, time12: to12Hour(time24), testid });
   }
   return out;
 }
