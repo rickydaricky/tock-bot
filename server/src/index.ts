@@ -24,6 +24,7 @@ import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
 import { runBooking, BookingRequest } from './booker';
+import { getBookingEngine } from './engines';
 import { runBlitz, BlitzConfig } from './blitz';
 import { runSniper, SniperConfig, validateSniperConfig } from './sniper';
 import { listSessions, sessionScreenshot, applyAction } from './sessions';
@@ -114,7 +115,7 @@ app.get('/health', (_req, res) => {
  * outcome to booking history tagged `source: 'manual'` so it shows in the dashboard.
  */
 app.post('/api/book', requireAuth, async (req, res) => {
-  const { restaurant, dates, partySize, time, autoPurchase, dryRun } = req.body as BookingRequest;
+  const { restaurant, dates, partySize, time, autoPurchase, dryRun, platform } = req.body as BookingRequest;
 
   if (!restaurant || !dates?.length || !partySize || !time) {
     res.status(400).json({ error: 'Missing required fields: restaurant, dates, partySize, time' });
@@ -122,7 +123,8 @@ app.post('/api/book', requireAuth, async (req, res) => {
   }
 
   console.log(`\n📨 Booking request: ${restaurant}`);
-  const result = await runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun });
+  const engine = getBookingEngine(platform);
+  const result = await engine.runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun, platform });
   await notifyResult(restaurant, result);
 
   addToHistory({
@@ -146,12 +148,13 @@ app.post('/api/book', requireAuth, async (req, res) => {
  */
 // Keep old /book endpoint for backward compat
 app.post('/book', requireAuth, async (req, res) => {
-  const { restaurant, dates, partySize, time, autoPurchase, dryRun } = req.body as BookingRequest;
+  const { restaurant, dates, partySize, time, autoPurchase, dryRun, platform } = req.body as BookingRequest;
   if (!restaurant || !dates?.length || !partySize || !time) {
     res.status(400).json({ error: 'Missing required fields' });
     return;
   }
-  const result = await runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun });
+  const engine = getBookingEngine(platform);
+  const result = await engine.runBooking({ restaurant, dates, partySize, time, autoPurchase, dryRun, platform });
   await notifyResult(restaurant, result);
   res.json(result);
 });
