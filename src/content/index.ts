@@ -22,9 +22,10 @@
  */
 import { Message, TockPreferences, Platform } from '../types';
 import { TockFormFiller } from './form-filler';
-import { OpenTableFormFiller } from './opentable-form-filler';
+import { OpenTableFormFiller, completeOpenTableBooking } from './opentable-form-filler';
 import { ResyFormFiller } from './resy-form-filler';
 import { detectPlatform, getPlatformDisplayName } from '../utils/platform';
+import { getOtBookingFlag, clearOtBookingFlag } from '../utils/storage';
 
 // Special handling for Resy widget iframe.
 // Resy renders its checkout inside a cross-origin `widgets.resy.com` iframe, so the
@@ -85,6 +86,17 @@ if (window.location.hostname === 'widgets.resy.com') {
   // `null` means the URL didn't match any known booking platform (unexpected host).
   const currentPlatform = detectPlatform(window.location.href);
   console.log(`Form Filler Content Script Loaded - Platform: ${currentPlatform ? getPlatformDisplayName(currentPlatform) : 'Unknown'}`);
+
+  // OpenTable's booking-details page is a fresh navigation after a slot click; if an auto-book is
+  // armed (flag set by the filler when autoPurchase is on), complete it here. Otherwise do nothing.
+  if (currentPlatform === 'opentable' && window.location.pathname.includes('/booking/details')) {
+    (async () => {
+      const flag = await getOtBookingFlag();
+      if (!flag || flag.until < Date.now()) { console.log('OT: booking-details page, no active auto-book flag — leaving to the user.'); return; }
+      await clearOtBookingFlag(); // one-shot
+      await completeOpenTableBooking(flag);
+    })();
+  }
 
   // Primary message bridge from the background service worker. The worker navigates the
   // tab to the search/checkout URL first, then sends AUTO_FILL_FORM to kick off filling.
