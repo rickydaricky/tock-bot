@@ -12,11 +12,23 @@ async function readOpenTableCookies(): Promise<any[]> {
   }));
 }
 
-export function OpenTableSession(): JSX.Element {
+/**
+ * Collapsible OpenTable session capture panel.
+ *
+ * Collapsed by default so it stays out of the way during normal Tock/Resy use; auto-expands when the
+ * popup is opened on an OpenTable page (`defaultOpen`, which the parent derives from the detected
+ * platform — detection is async, hence the effect below). "Copy JSON" grabs the opentable.com cookies
+ * (incl. HttpOnly, via chrome.cookies) for pasting into the dashboard; "Push" sends them to a
+ * configured server via an X-Auth-Key header (optional — the server URL/key are only used by Push).
+ */
+export function OpenTableSession({ defaultOpen = false }: { defaultOpen?: boolean }): JSX.Element {
+  const [open, setOpen] = useState(defaultOpen);
   const [cfg, setCfg] = useState<ServerConfig>({ url: '', key: '' });
   const [status, setStatus] = useState('');
 
   useEffect(() => { loadServerConfig().then((c) => c && setCfg(c)); }, []);
+  // Platform detection resolves after mount, so open the panel once we learn we're on OpenTable.
+  useEffect(() => { if (defaultOpen) setOpen(true); }, [defaultOpen]);
 
   const persist = (next: ServerConfig) => { setCfg(next); saveServerConfig(next); };
 
@@ -45,15 +57,25 @@ export function OpenTableSession(): JSX.Element {
   };
 
   return (
-    <div style={{ marginTop: 12, padding: 8, border: '1px solid #333', borderRadius: 6 }}>
-      <div style={{ fontWeight: 600, marginBottom: 6 }}>OpenTable session</div>
-      <input placeholder="Server URL (https://…railway.app)" value={cfg.url}
-        onChange={(e) => persist({ ...cfg, url: e.target.value })} style={{ width: '100%', marginBottom: 4 }} />
-      <input placeholder="Server API key" type="password" value={cfg.key}
-        onChange={(e) => persist({ ...cfg, key: e.target.value })} style={{ width: '100%', marginBottom: 6 }} />
-      <button onClick={push} style={{ marginRight: 6 }}>Push OpenTable session</button>
-      <button onClick={copy}>Copy JSON</button>
-      {status && <div style={{ marginTop: 6, fontSize: 12 }}>{status}</div>}
+    <div style={{ marginTop: 12, border: '1px solid #333', borderRadius: 6 }}>
+      <div
+        onClick={() => setOpen((o) => !o)}
+        style={{ fontWeight: 600, padding: 8, cursor: 'pointer', userSelect: 'none', display: 'flex', justifyContent: 'space-between' }}
+      >
+        <span>OpenTable session</span>
+        <span style={{ opacity: 0.6 }}>{open ? '▾' : '▸'}</span>
+      </div>
+      {open && (
+        <div style={{ padding: '0 8px 8px' }}>
+          <input placeholder="Server URL (optional — only for Push)" value={cfg.url}
+            onChange={(e) => persist({ ...cfg, url: e.target.value })} style={{ width: '100%', marginBottom: 4 }} />
+          <input placeholder="Server API key (optional — only for Push)" type="password" value={cfg.key}
+            onChange={(e) => persist({ ...cfg, key: e.target.value })} style={{ width: '100%', marginBottom: 6 }} />
+          <button onClick={push} style={{ marginRight: 6 }}>Push OpenTable session</button>
+          <button onClick={copy}>Copy JSON</button>
+          {status && <div style={{ marginTop: 6, fontSize: 12 }}>{status}</div>}
+        </div>
+      )}
     </div>
   );
 }
