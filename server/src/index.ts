@@ -488,8 +488,7 @@ app.post('/api/cookies', requireAuth, (req, res) => {
  * cross-origin caller, so it needs an explicit OPTIONS 204 with permissive CORS headers
  * before the browser will send the POST.
  */
-// Bookmarklet endpoint — accepts cookies from exploretock.com via CORS
-// Auth via API_KEY in query string (since bookmarklet can't set cookies/headers easily)
+// Auth via X-Auth-Key header (preferred) or ?key= query param (back-compat). CORS-open for the extension/bookmarklet.
 app.options('/api/cookies/push', (_req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');

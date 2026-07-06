@@ -25,6 +25,7 @@ export function OpenTableSession(): JSX.Element {
       const cookies = await readOpenTableCookies();
       if (cookies.length === 0) { setStatus('No opentable.com cookies found — are you logged in?'); return; }
       if (!cfg.url) { setStatus('Set the server URL first.'); return; }
+      if (!/^https:\/\//i.test(cfg.url.trim())) { setStatus('Server URL must start with https://'); return; }
       const res = await fetch(`${cfg.url.replace(/\/$/, '')}/api/cookies/push?platform=opentable`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Auth-Key': cfg.key },
@@ -36,9 +37,11 @@ export function OpenTableSession(): JSX.Element {
   };
 
   const copy = async () => {
-    const cookies = await readOpenTableCookies();
-    await navigator.clipboard.writeText(JSON.stringify(cookies));
-    setStatus(`Copied ${cookies.length} OpenTable cookies to clipboard`);
+    try {
+      const cookies = await readOpenTableCookies();
+      await navigator.clipboard.writeText(JSON.stringify(cookies));
+      setStatus(`Copied ${cookies.length} OpenTable cookies to clipboard`);
+    } catch (e) { setStatus(`Error: ${e instanceof Error ? e.message : String(e)}`); }
   };
 
   return (
