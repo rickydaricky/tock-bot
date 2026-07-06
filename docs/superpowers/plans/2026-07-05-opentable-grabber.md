@@ -1050,3 +1050,199 @@ git commit -m "feat(ext): OpenTable checkout continuation + cvc-server OpenTable
 **Type consistency:** `Platform` defined in `cookies.ts`, imported everywhere. `BookingRequest.platform?`/`.maxPriceCents?` added in Task 1 and used in Tasks 6, 7, 11. `getBookingEngine` return shape extended consistently (Task 6 adds `runBooking`, Task 7 adds `runBlitz`). `runOpenTableBookingWithContext` takes a `BrowserContext` (Task 5) and is called with `wb.page.context()` (Task 7). `handleOpenTableCheckout`/`CheckoutOutcome` defined in Task 5 stub, replaced in Task 11 with the same signature. `parseSlots`/`pickBestSlot`/`OpenTableSlot` consistent across Tasks 3 and 5.
 
 **Ordering:** Tasks 1–9 need no user cookies and are fully build/test-able now; Tasks 10–12 are gated on the user's OpenTable cookies + target. This lets ~75% of the work proceed immediately.
+
+---
+
+## Task 13: Server — accept cookie-push auth via header (secure, no key in URL)
+
+**Files:**
+- Modify: `server/src/index.ts` (the `OPTIONS /api/cookies/push` and `POST /api/cookies/push` handlers)
+
+**Interfaces:**
+- Produces: `POST /api/cookies/push` accepts the auth key from an `X-Auth-Key` request header (preferred) OR the legacy `?key=` query param (back-compat), and an optional `?platform=` (default `'tock'`). `OPTIONS` preflight allows the `X-Auth-Key` header so a `chrome-extension://` origin can send it.
+
+- [ ] **Step 1: Update the OPTIONS preflight to allow the header**
+
+In `server/src/index.ts`, the existing `app.options('/api/cookies/push', ...)` sets `Access-Control-Allow-Headers: Content-Type`. Change it to also allow the auth header:
+
+```ts
+res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Key');
+```
+
+- [ ] **Step 2: Accept the key from the header, and a platform, in the POST handler**
+
+In `POST /api/cookies/push`, replace the key + cookies handling so it reads the key from the header first, then the query, and routes to the right platform jar:
+
+```ts
+app.post('/api/cookies/push', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const headerKey = req.headers['x-auth-key'];
+  const key = (typeof headerKey === 'string' && headerKey) || (req.query.key as string);
+  if (API_KEY && key !== API_KEY) {
+    res.status(401).json({ error: 'Invalid key' });
+    return;
+  }
+
+  const platform = ((req.query.platform as string) === 'opentable' ? 'opentable' : 'tock') as Platform;
+  const { cookies } = req.body;
+  if (!Array.isArray(cookies)) {
+    res.status(400).json({ error: 'Body must contain a "cookies" array' });
+    return;
+  }
+
+  updateCookies(cookies, platform);
+  console.log(`🍪 Pushed ${cookies.length} ${platform} cookies (header auth: ${!!headerKey})`);
+  res.json({ success: true, count: cookies.length, platform });
+});
+```
+
+(Import `Platform` from `./cookies` if not already imported. Keep back-compat: an existing `?key=` caller with no header still works, and no `platform` still means tock.)
+
+- [ ] **Step 3: Typecheck**
+
+Run: `cd server && export PATH="$HOME/.nvm/versions/node/v22.22.2/bin:$PATH" && npx tsc --noEmit`
+Expected: no errors.
+
+- [ ] **Step 4: Smoke — header auth + platform routing**
+
+```bash
+cd server && export PATH="$HOME/.nvm/versions/node/v22.22.2/bin:$PATH" && (npx tsx src/index.ts >/tmp/ot-t13.log 2>&1 &); sleep 3
+# no API_KEY set locally => auth open; verify platform routing + response shape
+curl -s -XPOST 'localhost:3000/api/cookies/push?platform=opentable' -H 'content-type: application/json' -H 'X-Auth-Key: whatever' -d '{"cookies":[{"name":"ot","value":"1","domain":".opentable.com","path":"/"}]}'
+curl -s 'localhost:3000/api/cookies/status?platform=opentable'
+# preflight allows the header:
+curl -s -i -XOPTIONS 'localhost:3000/api/cookies/push' | grep -i 'access-control-allow-headers'
+pkill -f 'tsx src/index.ts' || true
+```
+Expected: push returns `{"success":true,"count":1,"platform":"opentable"}`; status shows count 1; the OPTIONS response's `Access-Control-Allow-Headers` includes `X-Auth-Key`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add server/src/index.ts
+git commit -m "feat(server): /api/cookies/push accepts X-Auth-Key header + platform (secure extension push)"
+```
+
+---
+
+## Task 14: Extension — OpenTable session capture via chrome.cookies (HttpOnly-capable)
+
+**Files:**
+- Modify: `public/manifest.json` (add `cookies` permission + `host_permissions` for OpenTable)
+- Modify: `src/utils/storage.ts` (persist the server config)
+- Create: `src/popup/components/OpenTableSession.tsx` (the capture UI)
+- Modify: `src/popup/components/App.tsx` (render the panel)
+
+**Interfaces:**
+- Produces: a popup panel that reads all OpenTable cookies (including HttpOnly) via `chrome.cookies.getAll`, and either pushes them to the configured server (`POST <serverUrl>/api/cookies/push?platform=opentable` with an `X-Auth-Key` header — Task 13) or copies them as JSON for the dashboard paste flow.
+- `saveServerConfig(cfg)/loadServerConfig()` in `storage.ts` (chrome.storage.local key `serverConfig` = `{ url: string; key: string }`).
+
+- [ ] **Step 1: manifest — add cookies + host permissions**
+
+In `public/manifest.json`, add `"cookies"` to `permissions` and add a `host_permissions` array for OpenTable (least-privilege: the primary US domain; extendable later):
+
+```json
+"permissions": ["activeTab", "storage", "alarms", "cookies"],
+"host_permissions": ["*://*.opentable.com/*"],
+```
+
+(Keep the existing content_scripts and other manifest fields unchanged.)
+
+- [ ] **Step 2: storage — persist server config**
+
+Add to `src/utils/storage.ts`:
+
+```ts
+export interface ServerConfig { url: string; key: string; }
+
+export async function saveServerConfig(cfg: ServerConfig): Promise<void> {
+  await chrome.storage.local.set({ serverConfig: cfg });
+}
+
+export async function loadServerConfig(): Promise<ServerConfig | null> {
+  const { serverConfig } = await chrome.storage.local.get('serverConfig');
+  return serverConfig ?? null;
+}
+```
+
+- [ ] **Step 3: capture component**
+
+Create `src/popup/components/OpenTableSession.tsx`:
+
+```tsx
+import React, { useEffect, useState } from 'react';
+import { saveServerConfig, loadServerConfig, ServerConfig } from '../../utils/storage';
+
+/** Read every opentable.com cookie (incl. HttpOnly) via chrome.cookies. */
+async function readOpenTableCookies(): Promise<any[]> {
+  const jars = await chrome.cookies.getAll({ domain: 'opentable.com' });
+  return jars.map((c) => ({
+    name: c.name, value: c.value, domain: c.domain, path: c.path,
+    secure: c.secure, httpOnly: c.httpOnly,
+    sameSite: c.sameSite === 'no_restriction' ? 'None' : c.sameSite === 'lax' ? 'Lax' : c.sameSite === 'strict' ? 'Strict' : undefined,
+    expires: c.expirationDate ? Math.floor(c.expirationDate) : undefined,
+  }));
+}
+
+export function OpenTableSession(): JSX.Element {
+  const [cfg, setCfg] = useState<ServerConfig>({ url: '', key: '' });
+  const [status, setStatus] = useState('');
+
+  useEffect(() => { loadServerConfig().then((c) => c && setCfg(c)); }, []);
+
+  const persist = (next: ServerConfig) => { setCfg(next); saveServerConfig(next); };
+
+  const push = async () => {
+    try {
+      const cookies = await readOpenTableCookies();
+      if (cookies.length === 0) { setStatus('No opentable.com cookies found — are you logged in?'); return; }
+      if (!cfg.url) { setStatus('Set the server URL first.'); return; }
+      const res = await fetch(`${cfg.url.replace(/\/$/, '')}/api/cookies/push?platform=opentable`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Auth-Key': cfg.key },
+        body: JSON.stringify({ cookies }),
+      });
+      const j = await res.json();
+      setStatus(res.ok ? `Pushed ${j.count} OpenTable cookies ✓` : `Push failed: ${j.error || res.status}`);
+    } catch (e) { setStatus(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+  };
+
+  const copy = async () => {
+    const cookies = await readOpenTableCookies();
+    await navigator.clipboard.writeText(JSON.stringify(cookies));
+    setStatus(`Copied ${cookies.length} OpenTable cookies to clipboard`);
+  };
+
+  return (
+    <div style={{ marginTop: 12, padding: 8, border: '1px solid #333', borderRadius: 6 }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>OpenTable session</div>
+      <input placeholder="Server URL (https://…railway.app)" value={cfg.url}
+        onChange={(e) => persist({ ...cfg, url: e.target.value })} style={{ width: '100%', marginBottom: 4 }} />
+      <input placeholder="Server API key" type="password" value={cfg.key}
+        onChange={(e) => persist({ ...cfg, key: e.target.value })} style={{ width: '100%', marginBottom: 6 }} />
+      <button onClick={push} style={{ marginRight: 6 }}>Push OpenTable session</button>
+      <button onClick={copy}>Copy JSON</button>
+      {status && <div style={{ marginTop: 6, fontSize: 12 }}>{status}</div>}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: render it in the popup**
+
+In `src/popup/components/App.tsx`, import and render `<OpenTableSession />` in a sensible spot (e.g. near the bottom of the settings/config area). Import: `import { OpenTableSession } from './OpenTableSession';`.
+
+- [ ] **Step 5: build**
+
+Run: `export PATH="$HOME/.nvm/versions/node/v22.22.2/bin:$PATH" && npm run build`
+Expected: webpack compiles with no errors. (`@types/chrome` provides `chrome.cookies` types; if the build complains `cookies` is missing on the chrome namespace, confirm `@types/chrome` is recent — it is `^0.0.260`, which includes cookies.)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add public/manifest.json src/utils/storage.ts src/popup/components/OpenTableSession.tsx src/popup/components/App.tsx
+git commit -m "feat(ext): capture OpenTable session (incl HttpOnly) via chrome.cookies; push to server or copy"
+```
+
+> Functional verification (reads real HttpOnly cookies + pushes to the live server) requires the user's browser + a running server, so it is done during the recon handoff, not in this task. The task's gate is a clean build.
