@@ -49,6 +49,23 @@ export interface FreezeInput {
   bookedDate?: string;
   bookedTime?: string;
   error?: string;
+  /**
+   * Fail-closed grand-total cap in cents carried over from the sniper run. The
+   * manual 'retry-purchase' action forwards this to handlePurchaseFlow so a
+   * human-triggered retry still enforces the same overspend guard the automated
+   * path uses — never leaving the exact page FHH lands on unguarded. Undefined
+   * means no cap (matches handlePurchaseFlow's optional-cap semantics), which is
+   * only ever the case for a dry run.
+   */
+  maxPriceCents?: number;
+  /**
+   * A *guessed* per-person price (cents) when this session was won via a
+   * speculative f6/price-fan candidate rather than the known-good price. Drives
+   * a RED "GUESSED PRICE — verify $X" banner on the dashboard so the operator
+   * double-checks the amount before completing checkout. Purely informational —
+   * the fail-closed maxPriceCents cap above still gates the actual spend.
+   */
+  guessedPriceCents?: number;
   /** Override the default hold window; primarily a test seam. */
   ttlMs?: number;
 }
@@ -108,6 +125,12 @@ export interface PublicSession {
   status: SessionStatus;
   ageMs: number;
   error?: string;
+  /**
+   * Present only when the slot was won on a speculative price fan; the dashboard
+   * renders a RED "GUESSED PRICE — verify $X" banner from it. Omitted (undefined)
+   * for the normal known-price path so no banner shows.
+   */
+  guessedPriceCents?: number;
 }
 
 /** Snapshot of all frozen sessions for the dashboard Live Sessions panel. */
@@ -121,6 +144,7 @@ export function listSessions(): PublicSession[] {
     status: e.status,
     ageMs: t - e.createdAt,
     error: e.error,
+    guessedPriceCents: e.guessedPriceCents,
   }));
 }
 
@@ -200,12 +224,16 @@ export async function applyAction(id: string, action: SessionAction, value?: str
     }
 
     if (action === 'retry-purchase') {
-      // Re-run the full booker checkout on the live page (no price-cap args here
-      // — this is a manual retry the operator already vetted).
-      const ok = await handlePurchaseFlow(page, false, []);
+      // Re-run the full booker checkout on the live page, threading the frozen
+      // session's maxPriceCents so a human-triggered retry STILL fail-closes on
+      // overspend. A manual retry lands on the exact checkout page FHH freezes
+      // into ($258×2), so dropping the cap here would make freeze-for-manual an
+      // unguarded-spend path — the very hole this closes. Undefined cap (dry-run
+      // origin only) preserves the prior no-cap behavior.
+      const ok = await handlePurchaseFlow(page, false, [], e.maxPriceCents);
       if (ok) { await abortSession(id); return { ok: true }; }   // success → release/close
       e.status = 'retry-failed';
-      return { ok: false, error: 'retry purchase did not complete (timeout or payment step failed) — check the live screenshot' };
+      return { ok: false, error: 'retry purchase did not complete (timeout, payment step failed, or price over cap) — check the live screenshot' };
     }
 
     return { ok: false, error: `unknown action: ${action}` };

@@ -239,7 +239,7 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
 
   if (booking.runAt) {
     // Use setTimeout for exact datetime scheduling.
-    // For blitz/sniper, fire early to allow browser pre-launch + warmup (~15s).
+    // For blitz/sniper, fire early to allow browser pre-launch + warmup.
     // Those engines use runAt for precise stagger/window timing internally.
     const targetTime = new Date(booking.runAt).getTime();
     // Reject clearly-past targets, but tolerate up to 5s of slack (clock skew / request
@@ -248,10 +248,25 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
     if (targetTime - Date.now() < -5000) {
       return { success: false, error: `Run time is in the past (${Math.round((Date.now() - targetTime) / 1000)}s ago)` };
     }
-    // Plain bookings fire exactly at target (earlyMs 0); sniper/blitz fire 15s early to cover
-    // browser pre-launch + warmup so the engine is hot and ready to strike at the true `runAt`.
-    const needsWarmup = booking.sniper || (booking.blitz && booking.blitz.attempts > 1);
-    const earlyMs = needsWarmup ? 15_000 : 0;
+    // How far ahead of the true `runAt` we fire the timer, to give the engine time to get hot:
+    //  - plain booking → 0 (fire exactly at target).
+    //  - blitz         → 15s (browser pre-launch + warmup only).
+    //  - sniper        → ~120s. The volley engine must warm the pool AND calibrate its clock
+    //    AND reconcile experience/price AND arm the renderer fire loop BEFORE T0 — a 15s lead
+    //    isn't enough for that pipeline (see win-fhh-design §2.2 firing schedule). We still hand
+    //    the ORIGINAL `runAt` to executeBooking → runSniper below; the engine derives the true
+    //    drop instant + its own send lead internally, so a longer timer lead only means it warms
+    //    earlier, never that it fires early. Config-driven via the SNIPER_WARM_LEAD_MS env var
+    //    when present (clamped to a 15s floor so it can't be tuned below usable warmup).
+    const SNIPER_WARM_LEAD_MS = Math.max(Number(process.env.SNIPER_WARM_LEAD_MS) || 120_000, 15_000);
+    let earlyMs: number;
+    if (booking.sniper) {
+      earlyMs = SNIPER_WARM_LEAD_MS;
+    } else if (booking.blitz && booking.blitz.attempts > 1) {
+      earlyMs = 15_000;
+    } else {
+      earlyMs = 0;
+    }
     const delayMs = Math.max(0, targetTime - earlyMs - Date.now());
 
     const timer = setTimeout(() => {

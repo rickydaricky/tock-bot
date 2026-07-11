@@ -27,6 +27,7 @@ import { BookingRequest } from './booker';
 import { getBookingEngine } from './engines';
 import { BlitzConfig } from './blitz';
 import { runSniper, SniperConfig, validateSniperConfig } from './sniper';
+import { normalizeVolleyFields } from './sniper-config';
 import { listSessions, sessionScreenshot, applyAction } from './sessions';
 import { loadCookiesFromEnv, updateCookies, getCookies, Platform } from './cookies';
 import { startScheduler, addScheduledBooking, removeScheduledBooking, getScheduledBookings, getHistory, addToHistory, deleteHistoryEntry, clearHistory, ScheduledBooking, schedulerEvents, BookingHistoryEntry } from './scheduler';
@@ -215,6 +216,8 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
       maxPriceCents: sniper.maxPriceCents,
       fastPoll: sniper.fastPoll !== false,
       apiGrab: sniper.apiGrab !== false,
+      // T0-Volley-Fire fields (win-fhh-design): pass-through to runSniper, off unless opted in.
+      ...normalizeVolleyFields(sniper),
     };
     const cfgError = validateSniperConfig(sniperCfg);
     if (cfgError) {
@@ -403,6 +406,8 @@ app.post('/api/sniper', requireAuth, async (req, res) => {
     maxPriceCents: sniper?.maxPriceCents,
     fastPoll: sniper?.fastPoll !== false,
     apiGrab: sniper?.apiGrab !== false,
+    // T0-Volley-Fire fields (win-fhh-design): pass-through to runSniper, off unless opted in.
+    ...normalizeVolleyFields(sniper),
   };
   const cfgError = validateSniperConfig(cfg);
   if (cfgError) {
