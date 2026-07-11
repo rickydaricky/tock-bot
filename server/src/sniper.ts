@@ -1121,6 +1121,7 @@ async function fireVolley(
   headers: Record<string, string>,
   ignition: Ignition,
   stop: Ignition,
+  gridLive: Ignition,
   opts: { reFireMs: number; deadlineMs: number; maxInFlight?: number },
 ): Promise<VolleyResult> {
   const maxInFlight = Math.max(1, Math.min(opts.maxInFlight ?? 5, 5));
@@ -1129,16 +1130,21 @@ async function fireVolley(
   // one renderer with no CDP callback, and survives the caller resolving from either trigger.
   // STOP_FLAG is the cross-page halt (§I3): the caller flips it once ANY page holds so the losing
   // pages abandon their loops (no stranded holds, no post-win anti-WAF traffic).
+  // GRIDLIVE_FLAG (§pre-open guard): the caller flips it when the target grid actually POPULATES.
+  // Until then, a conflict-shaped reply is a NOT-YET-OPEN response, not a lost slot — verified live
+  // that Tock returns a "no longer available"-family body for a not-yet-bookable/invalid lock — so
+  // pruning on it before the drop would wipe out every cell seconds before inventory exists.
   const IGNITE_FLAG = '__tockVolleyIgnite';
   const STOP_FLAG = '__tockVolleyStop';
-  try { await page.evaluate((fs) => { for (const f of fs) (globalThis as any)[f] = false; }, [IGNITE_FLAG, STOP_FLAG]); } catch { /* page may be dying; the evaluate below will surface it */ }
+  const GRIDLIVE_FLAG = '__tockVolleyGridLive';
+  try { await page.evaluate((fs) => { for (const f of fs) (globalThis as any)[f] = false; }, [IGNITE_FLAG, STOP_FLAG, GRIDLIVE_FLAG]); } catch { /* page may be dying; the evaluate below will surface it */ }
 
   // Fire-and-arm the long-lived renderer loop. It self-contains classifyLock's logic (no outer
   // refs cross into evaluate) so the entire fire + classify + re-fire loop lives in-page.
   const runInPage = page.evaluate(async (args) => {
-    const { cells, hdrs, igniteFlag, stopFlag, reFireMs, deadlineMs, maxInFlight } = args as {
+    const { cells, hdrs, igniteFlag, stopFlag, gridLiveFlag, reFireMs, deadlineMs, maxInFlight } = args as {
       cells: Array<{ key: string; date: string; time24: string; experienceId: number; f6: number; b64: string; primary: boolean }>;
-      hdrs: Record<string, string>; igniteFlag: string; stopFlag: string; reFireMs: number; deadlineMs: number; maxInFlight: number;
+      hdrs: Record<string, string>; igniteFlag: string; stopFlag: string; gridLiveFlag: string; reFireMs: number; deadlineMs: number; maxInFlight: number;
     };
     const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
     const b64ToBytes = (b64: string) => { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
@@ -1205,7 +1211,7 @@ async function fireVolley(
                                (echo.experienceId != null && echo.experienceId !== c.experienceId);
           if (echoMismatch) tally['held-mismatch']++;
           winbox.v = { date: c.date, time24: c.time24, experienceId: c.experienceId, f6: c.f6, bodyLen: buf.length, echoDt: echo.dateTime, echoId: echo.experienceId, echoMismatch };
-        } else if (v === 'conflict') pruned.add(c.key); // the ONLY pruning verdict (fail-open, §3.3.4)
+        } else if (v === 'conflict' && (globalThis as any)[gridLiveFlag]) pruned.add(c.key); // prune a confirmed conflict — but ONLY once the grid is live (pre-open conflicts are not-yet-open, not lost)
         // rejected / blocked: keep the cell live and re-fire.
       } catch { tally.error++; /* network throw: keep the cell live and retry next wave */ }
       finally { inFlight.delete(c.key); }
@@ -1235,7 +1241,7 @@ async function fireVolley(
     return { held: false, diag };
   }, {
     cells: candidates.map(c => ({ key: c.key, date: c.date, time24: c.time24, experienceId: c.experienceId, f6: c.f6, b64: c.b64, primary: c.primary })),
-    hdrs: headers, igniteFlag: IGNITE_FLAG, stopFlag: STOP_FLAG, reFireMs: opts.reFireMs, deadlineMs: opts.deadlineMs, maxInFlight,
+    hdrs: headers, igniteFlag: IGNITE_FLAG, stopFlag: STOP_FLAG, gridLiveFlag: GRIDLIVE_FLAG, reFireMs: opts.reFireMs, deadlineMs: opts.deadlineMs, maxInFlight,
   }).catch((err): VolleyResult => ({ held: false, diag: `evaluate threw: ${errMsg(err)}` }));
 
   // Bridge the shared Ignition into this page's window flag the instant ignition fires. The
@@ -1245,6 +1251,10 @@ async function fireVolley(
   // Bridge the shared STOP into this page's halt flag: once any page holds (caller fires stop), this
   // page's loop sees the flag and abandons its remaining cells rather than firing to the deadline.
   stop.ready.then(() => page.evaluate((f) => { (globalThis as any)[f] = true; }, STOP_FLAG).catch(() => { /* page dead → its loop already resolved */ }));
+
+  // Bridge GRID-LIVE: once the caller observes the target grid populate, enable conflict-pruning
+  // (before that, a conflict is a not-yet-open reply and must NOT prune the cell — §pre-open guard).
+  gridLive.ready.then(() => page.evaluate((f) => { (globalThis as any)[f] = true; }, GRIDLIVE_FLAG).catch(() => { /* page dead → its loop already resolved */ }));
 
   return runInPage as Promise<VolleyResult>;
 }
@@ -1467,9 +1477,10 @@ async function runVolleyMode(
   // --- 5. Arm fireVolley on every partitioned page (awaiting a shared Ignition) + watchPopulateEdge. ---
   const ignition = new Ignition();
   const stopAll = new Ignition();     // cross-page halt: fired the instant ANY page holds (§I3)
+  const gridLive = new Ignition();    // fired when the target grid POPULATES → enables conflict-pruning (§pre-open guard)
   const claim = new SingleWinnerLock();
   const armed = live.slice(0, partitions.length);
-  const volleys = armed.map((w, i) => fireVolley(w.page, partitions[i], headers!, ignition, stopAll, { reFireMs, deadlineMs, maxInFlight: 5 }));
+  const volleys = armed.map((w, i) => fireVolley(w.page, partitions[i], headers!, ignition, stopAll, gridLive, { reFireMs, deadlineMs, maxInFlight: 5 }));
   // The instant any page resolves HELD, halt the others so they abandon their partitions rather than
   // firing to the deadline (no stranded holds on the shared account, no post-win anti-WAF traffic).
   volleys.forEach(p => p.then(v => { if (v?.held) stopAll.fire(); }).catch(() => { /* a rejected volley can't be the winner */ }));
@@ -1479,7 +1490,13 @@ async function runVolleyMode(
   // now and, in parallel, schedule the clock-computed fire; whichever fires first wins the race. ---
   const watchDeadlineMs = computedFireAt != null ? Math.max(0, computedFireAt - Date.now()) + deadlineMs + 3000 : deadlineMs + 3000;
   const populateWatch = watchPopulateEdge(live[0].page, req, watchDeadlineMs).then((edge) => {
-    if (edge.populated && !ignition.armed) { console.log('   🟢 populate edge observed — igniting'); ignition.fire(); }
+    if (edge.populated) {
+      // The grid is now LIVE — enable conflict-pruning across every page (a conflict from here is a
+      // genuinely-taken slot, not a not-yet-open reply). Also ignite if the clock hasn't already.
+      gridLive.fire();
+      if (!ignition.armed) { console.log('   🟢 populate edge observed — igniting'); ignition.fire(); }
+      else console.log('   🟢 populate edge observed — grid live (pruning enabled)');
+    }
     return edge;
   });
   if (computedFireAt != null) {
@@ -1506,7 +1523,7 @@ async function runVolleyMode(
 
   if (!won || won.r.status !== 'fulfilled') {
     console.log(`\n❌ Volley: no HELD across ${armed.length} pages`);
-    return { success: false, error: `Volley fired but no HELD — ${clockDiag} · recon exp=${recon.experienceId} f6=${recon.prepaidCents}${recon.drifted ? ' (DRIFTED)' : ''} · ${diagTrail}`, durationMs: durationMs(), polls: noPolls };
+    return { success: false, error: `Volley fired but no HELD — ${clockDiag} · recon exp=${recon.experienceId} f6=${recon.prepaidCents}${recon.seatingAreaId != null ? ` seat=${recon.seatingAreaId}` : ''}${recon.drifted ? ' (DRIFTED)' : ''} · ${diagTrail}`, durationMs: durationMs(), polls: noPolls };
   }
   const winResult = won.r.value as VolleyResult;
   const winner = won.w;
