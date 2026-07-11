@@ -1287,7 +1287,7 @@ async function preDropRecon(
   page: Page,
   req: BookingRequest,
   cfg: SniperConfig,
-): Promise<{ experienceId: number; prepaidCents: number; openTime?: string[]; drifted: boolean; source: 'live' | 'fallback' }> {
+): Promise<{ experienceId: number; prepaidCents: number; seatingAreaId?: number; openTime?: string[]; drifted: boolean; source: 'live' | 'fallback' }> {
   const FHH_EXPERIENCE_ID = 559289;
   const FHH_PREPAID_CENTS = 25800;
   const fallbackExp = cfg.fixedExperienceId ?? FHH_EXPERIENCE_ID;
@@ -1308,10 +1308,17 @@ async function preDropRecon(
   const liveF6 = experiencePriceCents(bookable[0]) ?? fallbackF6;
   const experienceId = Number.isFinite(liveExp) ? liveExp : fallbackExp;
   const prepaidCents = liveF6;
+  // First seating-area id (f13), read the SAME way normalizeSlots does — a multi-seating venue
+  // (JouJou) requires it in the lock, and the volley's preDropRecon is the only live read before
+  // buildCandidateBodies. Absent/[] for direct-book venues (FHH) → undefined → no f13. cfg.
+  // fixedSeatingAreaId stays an explicit override for when the live read can't see it.
+  const rawSeat = bookable[0].seatingArea?.[0];
+  const rawSeatId = rawSeat == null ? undefined : Number(typeof rawSeat === 'object' ? (rawSeat as { id?: number | string }).id : rawSeat);
+  const seatingAreaId = Number.isFinite(rawSeatId as number) ? (rawSeatId as number) : undefined;
   // Drift = the live current-week experience/price differs from the known-good constants. The
   // menu is assumed continuous into next week, so a mismatch here is the pre-drop alarm (§3.3.1).
   const drifted = experienceId !== fallbackExp || prepaidCents !== fallbackF6;
-  return { experienceId, prepaidCents, openTime: Array.isArray(o.openTime) ? o.openTime : undefined, drifted, source: 'live' };
+  return { experienceId, prepaidCents, seatingAreaId, openTime: Array.isArray(o.openTime) ? o.openTime : undefined, drifted, source: 'live' };
 }
 
 /** Split the best-first candidate list into `n` DISJOINT partitions (§5.2 "partition, don't pile"):
@@ -1423,7 +1430,7 @@ async function runVolleyMode(
   if (recon.drifted) {
     console.warn(`   🚨 PRICE/EXPERIENCE DRIFT: live current-week exp=${recon.experienceId} f6=${recon.prepaidCents} differs from constants (${cfg.fixedExperienceId ?? 559289}/${cfg.fixedPrepaidCents ?? 25800}) — firing reconciled values`);
   }
-  console.log(`   recon: exp=${recon.experienceId} f6=${recon.prepaidCents} (${recon.source})`);
+  console.log(`   recon: exp=${recon.experienceId} f6=${recon.prepaidCents}${recon.seatingAreaId != null ? ` seat=${recon.seatingAreaId}` : ''} (${recon.source})`);
 
   // --- 3. Freeze headers (HARD-GATE non-null, §3.2). Prefer the header set already captured/
   // reconstructed during warm-up; re-read once as a freshness check. If NO page yields headers,
@@ -1446,8 +1453,9 @@ async function runVolleyMode(
     prepaidCents: recon.prepaidCents,
     wantedDates,
     wantedTimes24,
-    // FHH is direct-book ([] seatingArea) so no f13; a multi-seating rehearsal venue passes one.
-    seatingAreaId: cfg.fixedSeatingAreaId,
+    // FHH is direct-book ([] seatingArea) so no f13; a multi-seating venue (JouJou) gets its seating
+    // id from the live recon, with cfg.fixedSeatingAreaId as an explicit override/fallback.
+    seatingAreaId: recon.seatingAreaId ?? cfg.fixedSeatingAreaId,
     f6Candidates: cfg.f6Candidates,
   });
   if (!candidates.length) {
@@ -1543,7 +1551,7 @@ async function runVolleyMode(
   // On a modal venue this may return heldNoCheckout → freeze-for-manual. ---
   const grab = await grabViaApi(
     winner.page, req.restaurant, bookedDate, bookedTime24, req.partySize,
-    winResult.experienceId!, cfg.fixedSeatingAreaId, headers, winResult.f6 ?? 0,
+    winResult.experienceId!, recon.seatingAreaId ?? cfg.fixedSeatingAreaId, headers, winResult.f6 ?? 0,
     { skipLock: true }, // the volley already holds this cell in winner.page's cart — don't re-lock (§C1)
   ).catch((err): GrabResult => ({ ok: false, reason: `checkout tail threw: ${errMsg(err)}` }));
 
