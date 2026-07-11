@@ -41,6 +41,8 @@ import { BookingRequest, STEALTH_ARGS, to12Hour, handlePurchaseFlow } from './bo
 import { injectCookies } from './cookies';
 import { getFingerprint, summarizeFailures, safeShot, AttemptOutcome } from './blitz';
 import { freezeSession } from './sessions';
+import { calibrateClock, t0Epoch, computeFireAt } from './clock';
+import { notifyHeld } from './notify';
 
 /** One bookable slot, normalized from Tock's raw availability into the single shape the
  *  sniper matches, grabs, and price-caps against. Both time formats are carried on purpose:
@@ -247,6 +249,29 @@ export interface SniperConfig {
                               // to force the slower navigate path (A/B or if fast is throttled).
   apiGrab?: boolean;          // grab via the direct-API lock (default true) — Cloudflare-proof,
                               // no reload. Set false to force the legacy reload+click grab.
+  // --- T0 Volley Fire (§1,§3,§4,§6): pre-fired authenticated lock volley for sub-second drops ---
+  volleyFire?: boolean;       // engage the T0 Volley engine (default false → legacy poll path).
+                              // When true: pre-encode the wanted cells during warm-up, calibrate
+                              // to Tock's clock, and at the observed drop edge fire an in-page burst
+                              // of PUT /lock across the drop window until one returns HELD.
+  wantedTimes24?: string[];   // the operator's target seating times (24h "HH:MM"), best-time-first
+                              // is derived from closeness to req.time. Absent ⇒ fall back to req.time.
+  wantedDates?: string[];     // the operator's target dates (priority order); a backup date's cells
+                              // never sort ahead of any primary-date cell. Absent ⇒ fall back to req.dates.
+  fireLeadMs?: number;        // ms to fire BEFORE the edge so the packet ARRIVES at the origin at
+                              // the open instant (computeFireAt subtracts min(RTT, leadMs)). Default 0.
+  reFireMs?: number;          // per-cell re-fire cadence during the sustain window (~50–80ms). Bounded
+                              // aggregate rate is the anti-WAF lever (§5). Default 60.
+  volleyDeadlineMs?: number;  // how long (ms after ignition) to sustain the barrage before giving up
+                              // (~30s per §2.2). Default 30_000.
+  fixedExperienceId?: number; // fallback experienceId when the T−3s recon reads nothing (SOLD/empty
+                              // next-week grid). FHH: 559289.
+  fixedPrepaidCents?: number; // fallback per-person prepaid price (f6) for the same case. FHH: 25800.
+  fixedSeatingAreaId?: number;// f13 seating-area id for MULTI-SEATING volley venues (e.g. a JouJou
+                              // rehearsal). Omit for direct-book venues like FHH — the lock carries no f13.
+  f6Candidates?: number[];    // optional low-priority price-fan: extra plausible season prices to fire
+                              // as a secondary wave against price drift (§3.3.2). Never wins over the
+                              // primary f6; a speculative HELD still hits the cap + attribution guard.
 }
 
 /** Validate a sniper config's money/time fields BEFORE warming any browser. Returns an
@@ -268,6 +293,40 @@ export function validateSniperConfig(cfg: SniperConfig): string | null {
   for (const [k, v] of [['timeWindowStart24', cfg.timeWindowStart24], ['timeWindowEnd24', cfg.timeWindowEnd24]] as const) {
     if (v != null && !/^\d{1,2}:\d{2}$/.test(v)) {
       return `${k} must be 24h "HH:MM" (got ${JSON.stringify(v)})`;
+    }
+  }
+  // --- Volley-mode bounds. A malformed cadence/deadline could spin a zero-interval barrage
+  // (WAF suicide, §5) or a negative deadline (fires zero times), so gate them at the same
+  // fail-closed boundary the cap uses. The time lists must be well-formed 24h strings; the
+  // ids/prices must be positive finite numbers. Volley mode itself doesn't relax the cap —
+  // maxPriceCents is still required above unless dryRun (the manual freeze path FHH lands on). ---
+  for (const [k, v] of [['wantedTimes24', cfg.wantedTimes24], ['wantedDates', cfg.wantedDates]] as const) {
+    if (v != null && !Array.isArray(v)) return `${k} must be an array of strings (got ${JSON.stringify(v)})`;
+  }
+  for (const t of cfg.wantedTimes24 ?? []) {
+    if (typeof t !== 'string' || !/^\d{1,2}:\d{2}$/.test(t)) return `wantedTimes24 entries must be 24h "HH:MM" (got ${JSON.stringify(t)})`;
+  }
+  for (const d of cfg.wantedDates ?? []) {
+    if (typeof d !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return `wantedDates entries must be "YYYY-MM-DD" (got ${JSON.stringify(d)})`;
+  }
+  // fireLeadMs may be 0 (fire exactly at the edge); the rest must be strictly positive so a
+  // stray 0/NaN can't collapse the sustain loop into a busy-spin or a no-op.
+  for (const [k, v, minInclusive] of [
+    ['fireLeadMs', cfg.fireLeadMs, 0],
+    ['reFireMs', cfg.reFireMs, 1],
+    ['volleyDeadlineMs', cfg.volleyDeadlineMs, 1],
+    ['fixedExperienceId', cfg.fixedExperienceId, 1],
+    ['fixedPrepaidCents', cfg.fixedPrepaidCents, 0],
+  ] as const) {
+    if (v == null) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < minInclusive) {
+      return `${k} must be a ${minInclusive === 0 ? 'non-negative' : 'positive'} finite number (got ${JSON.stringify(v)})`;
+    }
+  }
+  if (cfg.f6Candidates != null) {
+    if (!Array.isArray(cfg.f6Candidates)) return `f6Candidates must be an array of positive cent amounts (got ${JSON.stringify(cfg.f6Candidates)})`;
+    for (const c of cfg.f6Candidates) {
+      if (typeof c !== 'number' || !Number.isFinite(c) || c < 0) return `f6Candidates entries must be non-negative finite cent amounts (got ${JSON.stringify(c)})`;
     }
   }
   return null;
@@ -667,6 +726,163 @@ export function encodeTockLock(partySize: number, dateTime: string, experienceId
   return Buffer.from(outer);
 }
 
+/** One pre-encoded lock candidate: a wanted (date × time) cell with the experience/price it
+ *  will PUT, plus the base64 protobuf body ready to fire in-page. `key` is a stable per-cell
+ *  identity ("date|time24|experienceId|f6") used by the volley for the at-most-one-in-flight
+ *  and re-fire-non-held bookkeeping. `f6` is the per-person prepaid price (cents) baked into
+ *  the body; `primary` marks the intended (expId,f6) so a speculative f6-fan hit never wins
+ *  over the real one. Bodies sort best-first: primary dates before backup dates, then time
+ *  closeness, then primary price before the fan. */
+export interface LockCandidate {
+  key: string;
+  date: string;         // YYYY-MM-DD
+  time24: string;       // zero-padded 24h "HH:MM" (matches the lock datetime format exactly)
+  experienceId: number;
+  f6: number;           // per-person prepaid price in cents baked into the body
+  b64: string;          // base64-encoded PUT /lock protobuf, ready for in-page atob()+fetch
+  primary: boolean;     // true = the intended (expId,f6); false = a low-priority f6-fan body
+}
+
+/** Inputs that a candidate set is built AGAINST — the reconciled/known experience+price and
+ *  the operator's wanted grid. Kept separate from SniperConfig so the builder stays pure and
+ *  unit-testable: everything drift-sensitive (experienceId/prepaidCents) is passed in, having
+ *  been resolved by preDropRecon or the FHH constants at call time. */
+export interface CandidateConstants {
+  experienceId: number;      // reconciled/known experience id for the drop (FHH: 559289)
+  prepaidCents: number;      // reconciled/known per-person prepaid price (f6) (FHH: 25800)
+  wantedDates: string[];     // target dates, priority order (primary first)
+  wantedTimes24: string[];   // target seating times, 24h (in-window subset resolved by caller)
+  seatingAreaId?: number;    // multi-seating venues only (f13); omitted for direct-book (FHH)
+  f6Candidates?: number[];   // extra plausible prices for the low-priority fan (§3.3.2)
+}
+
+/** Zero-pad a 24h "H:MM"/"HH:MM" to "HH:MM" — the lock datetime must match Tock's format
+ *  exactly (a stray "9:00" builds a body the server rejects with a 200 "no longer available",
+ *  which would look like a conflict rather than our own bug). Non-parsing input is returned
+ *  trimmed so the caller's own validation surfaces it, not a silently-mangled time. */
+function padTime24(t24: string): string {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(t24).trim());
+  return m ? `${m[1].padStart(2, '0')}:${m[2]}` : String(t24).trim();
+}
+
+/** PURE. Pre-encode the lock bodies for the operator's WANTED cells (wantedDates × wantedTimes),
+ *  best-first, for the T0 volley to fire. This is the "delete the detect→build gap" step (§1.1):
+ *  every body here is ready to leave the wire the instant ignition fires, so no work happens on
+ *  the hot path but the fetch itself.
+ *
+ *  Ordering contract (§4.1 "narrow, serialized claim" + priority): candidates are sorted
+ *    1. by DATE priority — a backup date's cell NEVER sorts ahead of any primary-date cell;
+ *    2. within a date, by TIME closeness to `req.time` (ties → earlier time);
+ *    3. within a cell, PRIMARY (expId,prepaidCents) before any low-priority f6-fan price,
+ *  so the volley fires the most-wanted cell first and a speculative price can't out-race the
+ *  intended one. The f6-fan (constants.f6Candidates, minus the primary price) is appended per
+ *  primary cell as trailing low-priority bodies — never as its own high-priority wave.
+ *
+ *  Reuses encodeTockLock (byte-verified) so every body is identical to a real click-generated
+ *  lock. De-dupes identical (date,time24,experienceId,f6) keys so a wantedTimes list that
+ *  repeats or a fan price that equals the primary doesn't fire the same cell twice. */
+export function buildCandidateBodies(req: BookingRequest, constants: CandidateConstants): LockCandidate[] {
+  const target = timeToMin(req.time);
+  const dates = constants.wantedDates.length ? constants.wantedDates : req.dates;
+  const times = (constants.wantedTimes24.length ? constants.wantedTimes24 : [req.time]).map(padTime24);
+  const seat = constants.seatingAreaId;
+  // Primary price first, then any distinct fan prices (fan never contains the primary twice).
+  const fan = (constants.f6Candidates ?? []).filter(c => c !== constants.prepaidCents);
+  const prices: Array<{ f6: number; primary: boolean }> = [
+    { f6: constants.prepaidCents, primary: true },
+    ...fan.map(f6 => ({ f6, primary: false })),
+  ];
+
+  const out: LockCandidate[] = [];
+  const seen = new Set<string>();
+  // dates OUTER (index carries priority so a backup date sorts after every primary cell),
+  // times INNER sorted by closeness to the target, prices INNERMOST (primary before fan).
+  dates.forEach((date, di) => {
+    const sortedTimes = [...times].sort((a, b) => {
+      const da = Math.abs(timeToMin(a) - target), db = Math.abs(timeToMin(b) - target);
+      return da !== db ? da - db : timeToMin(a) - timeToMin(b); // tie → earlier time
+    });
+    sortedTimes.forEach((time24, ti) => {
+      prices.forEach(({ f6, primary }, pi) => {
+        const key = `${date}|${time24}|${constants.experienceId}|${f6}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const dateTime = `${date}T${time24}`;
+        const b64 = encodeTockLock(req.partySize, dateTime, constants.experienceId, seat, f6).toString('base64');
+        // Encode the priority into the array order directly (dates outer, times mid, price inner).
+        out.push({ key, date, time24, experienceId: constants.experienceId, f6, b64, primary });
+        void di; void ti; void pi; // (indices are implicit in the nested-iteration order)
+      });
+    });
+  });
+  return out;
+}
+
+/** The four outcomes a lock PUT can resolve to (§3.3.4). FAIL-OPEN on wins: a large non-conflict
+ *  200 is 'held' — we never downgrade a real lock on an echo comparison, because a held slot we
+ *  fail to drive is a silent loss of a slot we actually hold (§C1), and every cell we fire is a
+ *  WANTED cell anyway. Attribution is enforced later at checkout (the confirm-page date guard).
+ *   - 'rejected' → an ambiguous non-conflict rejection (rate-limit / lock-state / wrong-f6):
+ *     NOT the confirmed ~89-byte "no longer available" shape, so it may still be winnable →
+ *     KEEP RETRYING, rather than pruning a possibly-open cell.
+ *  Only the confirmed conflict shape prunes a cell — this is the fail-open pruning rule. */
+export type LockVerdict = 'held' | 'conflict' | 'rejected' | 'blocked';
+
+/** The confirmed conflict phrasing — the ONLY body shape that prunes a cell (fail-open, §3.3.4).
+ *  Narrower than the historical `lockResponseVerdict` regex so an ambiguous rejection (which we
+ *  want to keep retrying) isn't mistaken for the definitive "someone took it" conflict. */
+const CONFLICT_RE = /no longer available|already (taken|selected|booked|reserved|held)|sold\s*out/i;
+
+/** Classify a `PUT /api/ticket/group/lock` response for the VOLLEY (the reference the in-page
+ *  fireVolley loop mirrors verbatim). FAIL-OPEN: any large non-conflict 200 is 'held'; the echo is
+ *  never used to downgrade a win (§C1). Attribution is a later, authoritative checkout-page guard.
+ *
+ *  Verdict order (widest-prune-last so we never over-prune):
+ *   - non-200 or HTML interstitial             → 'blocked'
+ *   - confirmed "no longer available" phrasing → 'conflict'  (the ONLY pruning verdict)
+ *   - large body (≥150B)                       → 'held'
+ *   - anything else (small non-conflict 200)   → 'rejected' (ambiguous → keep retrying) */
+export function classifyLock(
+  status: number,
+  contentType: string,
+  len: number,
+  text: string,
+): LockVerdict {
+  if (status !== 200 || /html/i.test(contentType || '')) return 'blocked';
+  // Only the CONFIRMED conflict phrasing prunes — an ambiguous rejection stays retryable.
+  if (CONFLICT_RE.test(text || '')) return 'conflict';
+  // A real lock: any large non-conflict body is a win. We do NOT inspect the echo here — the
+  // response echoes the offering base time, not our slot, so an echo check false-rejects wins.
+  if (len >= 150) return 'held';
+  // Small, 200, no confirmed-conflict marker: rate-limit / lock-state / wrong-f6 → keep trying.
+  return 'rejected';
+}
+
+/** Parse the datetime + experienceId a lock RESPONSE echoes — DIAGNOSTIC ONLY (§C1). It never
+ *  gates a win; fireVolley logs a disagreement so we can finally learn the real response wire
+ *  layout against a live drop (the response is believed to echo the offering BASE time, not our
+ *  slot, and a field layout unlike the request). A real lock echoes a "YYYY-MM-DDTHH:MM" (…:SS
+ *  optional) datetime and an id; we read the datetime from the printable text and the id from the
+ *  field-3 varint encodeTockLock writes (tag 0x18). `bytes` is optional — text-only echoes still
+ *  yield the datetime. Returns whatever it could read; absent fields mean "not readable". */
+export function parseLockEcho(text: string, bytes?: Uint8Array | number[]): { dateTime?: string; experienceId?: number } {
+  const out: { dateTime?: string; experienceId?: number } = {};
+  // Datetime: the echoed reservation stamp; keep just the minute precision we lock at.
+  const dt = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/.exec(text || '');
+  if (dt) out.dateTime = dt[1];
+  // Experience id: field 3 varint (tag byte 0x18) — same wire shape encodeTockLock writes.
+  if (bytes) {
+    const b = Array.from(bytes);
+    const i = b.indexOf(0x18);
+    if (i >= 0 && i + 1 < b.length) {
+      let v = 0, shift = 0, j = i + 1;
+      while (j < b.length && (b[j] & 0x80)) { v |= (b[j] & 0x7f) << shift; shift += 7; j++; }
+      if (j < b.length) { v |= b[j] << shift; out.experienceId = v >>> 0; }
+    }
+  }
+  return out;
+}
+
 /** Classify a `PUT /api/ticket/group/lock` response. The endpoint returns HTTP 200 for BOTH
  *  a real hold and a conflict (the conflict body is a short human-readable error like
  *  "someone else just selected this and it is no longer available" — confirmed live on
@@ -675,7 +891,9 @@ export function encodeTockLock(partySize: number, dateTime: string, experienceId
  *  fallback. `text` is the response body's printable chars.
  *   - 'blocked'  → not even a lock response (HTML interstitial / network error) → fall back
  *   - 'conflict' → 200 but the slot was taken → retry another time / fall back
- *   - 'held'     → a genuine lock */
+ *   - 'held'     → a genuine lock
+ *  NOTE: the legacy poll/grab path (grabViaApi) keeps using this three-way verdict; the volley
+ *  path uses classifyLock (four-way) so it can also keep an ambiguous 'rejected' cell retryable. */
 export function lockResponseVerdict(status: number, contentType: string, len: number, text: string): 'held' | 'conflict' | 'blocked' {
   if (status !== 200 || /html/i.test(contentType || '')) return 'blocked';
   // Human-readable failure phrases never appear in a genuine lock (which echoes the
@@ -695,39 +913,47 @@ export function lockResponseVerdict(status: number, contentType: string, len: nu
 async function grabViaApi(
   page: Page, restaurant: string, date: string, time24: string, partySize: number,
   experienceId: number, seatingAreaId: number | undefined, headers: Record<string, string>,
-  prepaidCents = 0,
+  prepaidCents = 0, opts: { skipLock?: boolean } = {},
 ): Promise<GrabResult> {
   // Normalize the time to zero-padded 24h "HH:MM" — the lock datetime must match Tock's format
   // exactly (a stray "9:00" would build a lock the server rejects).
   const tm = /^(\d{1,2}):(\d{2})$/.exec(time24.trim());
   const normTime = tm ? `${tm[1].padStart(2, '0')}:${tm[2]}` : time24.trim();
   const dateTime = `${date}T${normTime}`;
-  const bodyB64 = encodeTockLock(partySize, dateTime, experienceId, seatingAreaId, prepaidCents).toString('base64');
-  const lock = await page.evaluate(async ({ b64, hdrs }) => {
-    const bin = atob(b64); const body = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) body[i] = bin.charCodeAt(i);
-    try {
-      const r = await fetch('/api/ticket/group/lock', {
-        method: 'PUT', credentials: 'include',
-        headers: { 'content-type': 'application/octet-stream', ...hdrs, 'x-tock-stream-format': 'proto2' },
-        body,
-      });
-      const buf = new Uint8Array(await r.arrayBuffer());
-      // Decode printable text from the protobuf body — a real lock echoes reservation
-      // details; a conflict returns a short human-readable error ("no longer available").
-      const text = new TextDecoder().decode(buf).replace(/[^\x20-\x7e]/g, ' ');
-      return { status: r.status, len: buf.length, contentType: r.headers.get('content-type') || '', text: text.slice(0, 400) };
-    } catch (e) { return { status: 0, len: 0, contentType: '', text: '', err: String(e) }; }
-  }, { b64: bodyB64, hdrs: headers });
+  // skipLock: the VOLLEY already holds this cell in THIS page's server-side cart, so re-issuing the
+  // PUT would be redundant and — worse — can return a self-conflict ("someone else just selected
+  // this") against our own hold, false-freezing a genuine win. When set, jump straight to checkout
+  // navigation and let the confirm-purchase page load the existing hold (§C1 checkout tail).
+  if (!opts.skipLock) {
+    const bodyB64 = encodeTockLock(partySize, dateTime, experienceId, seatingAreaId, prepaidCents).toString('base64');
+    const lock = await page.evaluate(async ({ b64, hdrs }) => {
+      const bin = atob(b64); const body = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) body[i] = bin.charCodeAt(i);
+      try {
+        const r = await fetch('/api/ticket/group/lock', {
+          method: 'PUT', credentials: 'include',
+          headers: { 'content-type': 'application/octet-stream', ...hdrs, 'x-tock-stream-format': 'proto2' },
+          body,
+        });
+        const buf = new Uint8Array(await r.arrayBuffer());
+        // Decode printable text from the protobuf body — a real lock echoes reservation
+        // details; a conflict returns a short human-readable error ("no longer available").
+        const text = new TextDecoder().decode(buf).replace(/[^\x20-\x7e]/g, ' ');
+        return { status: r.status, len: buf.length, contentType: r.headers.get('content-type') || '', text: text.slice(0, 400) };
+      } catch (e) { return { status: 0, len: 0, contentType: '', text: '', err: String(e) }; }
+    }, { b64: bodyB64, hdrs: headers });
 
-  // Reject anything that isn't a genuine lock so we correctly fall back / retry instead of
-  // treating a conflict as a win (the endpoint returns HTTP 200 with an ERROR body — e.g.
-  // "no longer available" — for a taken slot; confirmed live on n/naka 2026-07-05).
-  const verdict = lockResponseVerdict(lock.status, lock.contentType, lock.len, lock.text);
-  if (verdict !== 'held') {
-    return { ok: false, reason: `API lock not confirmed (${verdict}: HTTP ${lock.status}, ${lock.len}B${lock.err ? ', ' + lock.err : ''}${lock.text.trim() ? ', "' + lock.text.trim().slice(0, 60) + '"' : ''}) — falling back`, slotTakenAtClick: verdict === 'conflict', failedTime12: to12Hour(time24) };
+    // Reject anything that isn't a genuine lock so we correctly fall back / retry instead of
+    // treating a conflict as a win (the endpoint returns HTTP 200 with an ERROR body — e.g.
+    // "no longer available" — for a taken slot; confirmed live on n/naka 2026-07-05).
+    const verdict = lockResponseVerdict(lock.status, lock.contentType, lock.len, lock.text);
+    if (verdict !== 'held') {
+      return { ok: false, reason: `API lock not confirmed (${verdict}: HTTP ${lock.status}, ${lock.len}B${lock.err ? ', ' + lock.err : ''}${lock.text.trim() ? ', "' + lock.text.trim().slice(0, 60) + '"' : ''}) — falling back`, slotTakenAtClick: verdict === 'conflict', failedTime12: to12Hour(time24) };
+    }
+    console.log(`   🔒 API lock held ${date} ${to12Hour(time24)} (exp ${experienceId}${seatingAreaId != null ? `, seating ${seatingAreaId}` : ''}, ${lock.len}B)`);
+  } else {
+    console.log(`   🔒 reusing volley-held ${date} ${to12Hour(time24)} — navigating to checkout (no re-lock)`);
   }
-  console.log(`   🔒 API lock held ${date} ${to12Hour(time24)} (exp ${experienceId}${seatingAreaId != null ? `, seating ${seatingAreaId}` : ''}, ${lock.len}B)`);
 
   // Slot is held — reach checkout so handlePurchaseFlow can drive add-ons → confirm. The
   // confirm-purchase page loads the current lock when authenticated (redirects only if the
@@ -837,12 +1063,543 @@ async function grabViaDom(page: Page, date: string, time24: string, winStart24?:
   return { ok: true, time12: pick.time12 };
 }
 
+// ===========================================================================================
+// T0 VOLLEY FIRE ENGINE (§1,§3,§4,§6) — pre-fired authenticated lock volley for sub-second drops
+// ===========================================================================================
+
+/** The resolved outcome of one page's fire loop. `held` is the ONLY success; every other field
+ *  is diagnostic. `echoedCell` is what the winning lock echoed (for the attribution guard), and
+ *  `diag` is a short human-readable trail (verdict tally, fire count) surfaced in SniperResult. */
+export interface VolleyResult {
+  held: boolean;
+  date?: string;
+  time24?: string;
+  experienceId?: number;
+  f6?: number;
+  bodyLen?: number;
+  echoedCell?: { dateTime?: string; experienceId?: number; mismatch?: boolean };
+  diag?: string;
+}
+
+/** A cross-page ignition signal. The volley loops `await` the same promise so ONE resolve()
+ *  (from watchPopulateEdge's populate edge OR the computed fire clock, whichever comes first)
+ *  ignites every page's burst at once — no per-page CDP hop at the drop instant. `fire()` is
+ *  idempotent (first caller wins); `armed` lets a late watcher skip a redundant resolve. */
+export class Ignition {
+  private resolve!: () => void;
+  private fired = false;
+  readonly ready: Promise<void>;
+  constructor() { this.ready = new Promise<void>(r => { this.resolve = r; }); }
+  fire(): void { if (!this.fired) { this.fired = true; this.resolve(); } }
+  get armed(): boolean { return this.fired; }
+}
+
+/** Fire ONE page's pre-encoded lock volley (§1.1, §4.1, Task 4). This is the hot path: a single
+ *  long-lived page.evaluate — injected at arm time (~T−2s) so the CDP hop is paid ONCE, not per
+ *  PUT — that (a) awaits ignition via a polled window flag, (b) busy-spins the final few ms on
+ *  performance.now(), (c) fires the wanted cells as a bounded-concurrency (≤maxInFlight) in-page
+ *  fetch('/api/ticket/group/lock', PUT, credentials:'include') burst, (d) classifies each reply
+ *  INLINE (ported classifyLock, fail-open: conflict prunes; any large non-conflict 200 wins;
+ *  rejected/blocked keep the cell live), (e) re-fires only NON-held, non-conflict cells every
+ *  reFireMs until a HELD, a cross-page STOP, or the deadline, with an at-most-one-in-flight-PER-CELL
+ *  guard, and (f) resolves the winning cell + its (diagnostic-only) echo.
+ *
+ *  The busy-spin AND the fetch run in the SAME renderer that owns cf_clearance — no CDP round-trip
+ *  in the hot path (§1.1). The ignition is delivered as a window flag the caller flips via
+ *  page.evaluate at the drop edge; the loop polls it on a tight rAF-free `setTimeout(0)` cadence so
+ *  it reacts within a frame. Bounded aggregate rate (≤maxInFlight in flight, reFireMs between waves)
+ *  is the anti-WAF lever (§5): 1–3 cells × ≤5 in flight × reFireMs stays far below a blind fusillade.
+ *
+ *  @param page         a warmed page (past Cloudflare, carrying cf_clearance + login cookies)
+ *  @param candidates   this page's DISJOINT cell partition (best-first) — no cell fired by two pages
+ *  @param headers      the frozen x-tock-* set (from readTockHeadersFromPage / capture)
+ *  @param ignition     shared cross-page ignition; the loop is armed early and awaits its flag
+ *  @param opts         reFireMs (re-fire cadence), deadlineMs (sustain window), maxInFlight (≤5) */
+async function fireVolley(
+  page: Page,
+  candidates: LockCandidate[],
+  headers: Record<string, string>,
+  ignition: Ignition,
+  stop: Ignition,
+  opts: { reFireMs: number; deadlineMs: number; maxInFlight?: number },
+): Promise<VolleyResult> {
+  const maxInFlight = Math.max(1, Math.min(opts.maxInFlight ?? 5, 5));
+  // A per-page window flag is the ignition channel: the caller flips it via page.evaluate at the
+  // edge; the in-page loop polls it. Using a flag (vs exposeFunction) keeps the whole hot path in
+  // one renderer with no CDP callback, and survives the caller resolving from either trigger.
+  // STOP_FLAG is the cross-page halt (§I3): the caller flips it once ANY page holds so the losing
+  // pages abandon their loops (no stranded holds, no post-win anti-WAF traffic).
+  const IGNITE_FLAG = '__tockVolleyIgnite';
+  const STOP_FLAG = '__tockVolleyStop';
+  try { await page.evaluate((fs) => { for (const f of fs) (globalThis as any)[f] = false; }, [IGNITE_FLAG, STOP_FLAG]); } catch { /* page may be dying; the evaluate below will surface it */ }
+
+  // Fire-and-arm the long-lived renderer loop. It self-contains classifyLock's logic (no outer
+  // refs cross into evaluate) so the entire fire + classify + re-fire loop lives in-page.
+  const runInPage = page.evaluate(async (args) => {
+    const { cells, hdrs, igniteFlag, stopFlag, reFireMs, deadlineMs, maxInFlight } = args as {
+      cells: Array<{ key: string; date: string; time24: string; experienceId: number; f6: number; b64: string; primary: boolean }>;
+      hdrs: Record<string, string>; igniteFlag: string; stopFlag: string; reFireMs: number; deadlineMs: number; maxInFlight: number;
+    };
+    const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+    const b64ToBytes = (b64: string) => { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+
+    // Inline verdict classifier — FAIL-OPEN on wins: any large (≥150B) 200 body that is NOT the
+    // confirmed conflict shape is a real lock → 'held'. The echo (parsed below) is DIAGNOSTIC ONLY;
+    // it must never downgrade a win, because the lock RESPONSE is a different protobuf message than
+    // the REQUEST — it echoes the offering's base time (not our slot) and its field layout differs,
+    // so an echo "mismatch" is usually a parse artifact, not a wrong slot. Blocking a win on it
+    // silently loses a slot we actually hold (§C1). The checkout-side date guard + price cap are the
+    // real attribution/spend backstops; every candidate we fire is already a WANTED cell.
+    const CONFLICT_RE = /no longer available|already (taken|selected|booked|reserved|held)|sold\s*out/i;
+    const classify = (status: number, ct: string, len: number, text: string) => {
+      if (status !== 200 || /html/i.test(ct || '')) return 'blocked';
+      if (CONFLICT_RE.test(text || '')) return 'conflict';
+      if (len >= 150) return 'held';
+      return 'rejected';
+    };
+    // Inline echo parse (datetime from printable text; experienceId from the field-3 varint, tag 0x18).
+    const parseEcho = (text: string, bytes: Uint8Array): { dateTime?: string; experienceId?: number } => {
+      const o: { dateTime?: string; experienceId?: number } = {};
+      const m = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/.exec(text || '');
+      if (m) o.dateTime = m[1];
+      const i = bytes.indexOf(0x18);
+      if (i >= 0 && i + 1 < bytes.length) { let v = 0, s = 0, j = i + 1; while (j < bytes.length && (bytes[j] & 0x80)) { v |= (bytes[j] & 0x7f) << s; s += 7; j++; } if (j < bytes.length) { v |= bytes[j] << s; o.experienceId = v >>> 0; } }
+      return o;
+    };
+
+    // Await ignition, then busy-spin the final <5ms on performance.now() so the first PUT leaves
+    // the wire as close to the edge as the renderer allows (no setTimeout jitter on the last ms).
+    while (!(globalThis as any)[igniteFlag]) await sleep(0);
+    const spinStart = performance.now();
+    while (performance.now() - spinStart < 3) { /* tight spin: last few ms, in-renderer */ }
+
+    // Per-cell state: pruned (confirmed conflict), inFlight (the one-per-cell guard), and a running
+    // verdict tally for diagnostics. Live cells are everything not pruned.
+    const pruned = new Set<string>();
+    const inFlight = new Set<string>();
+    const tally: Record<string, number> = { held: 0, 'held-mismatch': 0, conflict: 0, rejected: 0, blocked: 0, error: 0 };
+    type Won = { date: string; time24: string; experienceId: number; f6: number; bodyLen: number; echoDt?: string; echoId?: number; echoMismatch?: boolean };
+    const winbox: { v: Won | null } = { v: null }; // boxed so the async closure's mutation isn't narrowed away
+    let fires = 0;
+
+    // Fire one cell (guarded to at-most-one-in-flight). Resolves after classifying its reply.
+    const fireCell = async (c: typeof cells[number]) => {
+      if (winbox.v || (globalThis as any)[stopFlag] || pruned.has(c.key) || inFlight.has(c.key)) return;
+      inFlight.add(c.key); fires++;
+      const intendedDt = `${c.date}T${c.time24}`;
+      try {
+        const r = await fetch('/api/ticket/group/lock', {
+          method: 'PUT', credentials: 'include',
+          headers: { 'content-type': 'application/octet-stream', ...hdrs, 'x-tock-stream-format': 'proto2' },
+          body: b64ToBytes(c.b64),
+        });
+        const buf = new Uint8Array(await r.arrayBuffer());
+        const text = new TextDecoder().decode(buf).replace(/[^\x20-\x7e]/g, ' ').slice(0, 400);
+        const echo = parseEcho(text, buf);
+        const v = classify(r.status, r.headers.get('content-type') || '', buf.length, text);
+        tally[v] = (tally[v] || 0) + 1;
+        if (v === 'held' && !winbox.v) {
+          // DIAGNOSTIC ONLY: record whether the echo looked like a different cell (never blocks the
+          // win — see classify). This surfaces the real wire layout the first time we see a live drop.
+          const echoMismatch = (echo.dateTime != null && echo.dateTime !== intendedDt) ||
+                               (echo.experienceId != null && echo.experienceId !== c.experienceId);
+          if (echoMismatch) tally['held-mismatch']++;
+          winbox.v = { date: c.date, time24: c.time24, experienceId: c.experienceId, f6: c.f6, bodyLen: buf.length, echoDt: echo.dateTime, echoId: echo.experienceId, echoMismatch };
+        } else if (v === 'conflict') pruned.add(c.key); // the ONLY pruning verdict (fail-open, §3.3.4)
+        // rejected / blocked: keep the cell live and re-fire.
+      } catch { tally.error++; /* network throw: keep the cell live and retry next wave */ }
+      finally { inFlight.delete(c.key); }
+    };
+
+    // Sustain loop: fire live cells in best-first order, ≤maxInFlight concurrent, re-firing every
+    // reFireMs until a HELD or the deadline. Best-first + the in-flight cap keeps the aggregate
+    // bounded (anti-WAF) while still blanketing the drop window.
+    const deadline = performance.now() + deadlineMs;
+    while (!winbox.v && !(globalThis as any)[stopFlag] && performance.now() < deadline) {
+      let launched = 0;
+      for (const c of cells) {
+        if (winbox.v || (globalThis as any)[stopFlag]) break;
+        if (pruned.has(c.key) || inFlight.has(c.key)) continue;
+        if (inFlight.size >= maxInFlight) break;
+        void fireCell(c);
+        launched++;
+      }
+      // If every live cell is already in flight (or all pruned), just wait a wave; else pace at reFireMs.
+      await sleep(reFireMs);
+      if (launched === 0 && pruned.size >= cells.length) break; // all cells confirmed-conflict → nothing left to try
+    }
+    const stopped = !winbox.v && (globalThis as any)[stopFlag] ? ' stopped' : '';
+    const diag = `fires=${fires} held=${tally.held} mism=${tally['held-mismatch']} conf=${tally.conflict} rej=${tally.rejected} blk=${tally.blocked} err=${tally.error}${stopped}`;
+    const won = winbox.v;
+    if (won) return { held: true, date: won.date, time24: won.time24, experienceId: won.experienceId, f6: won.f6, bodyLen: won.bodyLen, echoedCell: { dateTime: won.echoDt, experienceId: won.echoId, mismatch: won.echoMismatch }, diag };
+    return { held: false, diag };
+  }, {
+    cells: candidates.map(c => ({ key: c.key, date: c.date, time24: c.time24, experienceId: c.experienceId, f6: c.f6, b64: c.b64, primary: c.primary })),
+    hdrs: headers, igniteFlag: IGNITE_FLAG, stopFlag: STOP_FLAG, reFireMs: opts.reFireMs, deadlineMs: opts.deadlineMs, maxInFlight,
+  }).catch((err): VolleyResult => ({ held: false, diag: `evaluate threw: ${errMsg(err)}` }));
+
+  // Bridge the shared Ignition into this page's window flag the instant ignition fires. The
+  // renderer loop is already armed and spinning on the flag; flipping it releases the busy-spin.
+  ignition.ready.then(() => page.evaluate((f) => { (globalThis as any)[f] = true; }, IGNITE_FLAG).catch(() => { /* page dead → its loop resolves not-held */ }));
+
+  // Bridge the shared STOP into this page's halt flag: once any page holds (caller fires stop), this
+  // page's loop sees the flag and abandons its remaining cells rather than firing to the deadline.
+  stop.ready.then(() => page.evaluate((f) => { (globalThis as any)[f] = true; }, STOP_FLAG).catch(() => { /* page dead → its loop already resolved */ }));
+
+  return runInPage as Promise<VolleyResult>;
+}
+
+/** REACT-TO-POPULATE detector (§2.1 Layer B, Task 6): from ~T0−2s, low-rate poll fetchOfferingsFast
+ *  on the target week and resolve the INSTANT the grid populates (any bookable slot for the party
+ *  size on a wanted date appears). The observed populate edge is the server-authoritative T0 —
+ *  more accurate than any Date-header math and immune to the late-release problem (§0.3) — so it
+ *  drives ignition. Resolves { populated:true, offerings } on the edge, or { populated:false } at
+ *  deadline. Low rate (~150–250ms) by design: we react, we don't hammer pre-drop (§5.3). */
+async function watchPopulateEdge(
+  page: Page,
+  req: BookingRequest,
+  deadlineMs: number,
+  pollMs = 200,
+): Promise<{ populated: boolean; offerings?: any }> {
+  const wantedDates = new Set(req.dates);
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    const offerings = await fetchOfferingsFast(page, searchUrlFor(req, req.dates[0]));
+    if (offerings && !offerings.__challenge && !offerings.__noState) {
+      const slots = parseAvailability(offerings, req.partySize);
+      // The edge = any bookable slot on a wanted date. (A slot on a non-wanted date means the
+      // venue's calendar populated but not our target week — keep watching.)
+      if (slots.some(s => wantedDates.has(s.date))) return { populated: true, offerings };
+    }
+    await sleep(pollMs);
+  }
+  return { populated: false };
+}
+
+/** Live experience/price/openTime read for the CURRENTLY-bookable week, ~T−3s (§3.3.1, Task 3).
+ *  Next week's grid is EMPTY until the drop, so we read the current live week and assume menu
+ *  continuity into next week, reconciling against the known FHH constants. Returns the values the
+ *  volley should build bodies against: the live experienceId/prepaidCents/openTime when readable,
+ *  else the config fallback (fixedExperienceId/fixedPrepaidCents) or the FHH constants. `drifted`
+ *  flags when the live current-week values differ from the known constants — the caller alerts
+ *  loudly (§3.3.1) before firing hardcoded bodies. */
+async function preDropRecon(
+  page: Page,
+  req: BookingRequest,
+  cfg: SniperConfig,
+): Promise<{ experienceId: number; prepaidCents: number; openTime?: string[]; drifted: boolean; source: 'live' | 'fallback' }> {
+  const FHH_EXPERIENCE_ID = 559289;
+  const FHH_PREPAID_CENTS = 25800;
+  const fallbackExp = cfg.fixedExperienceId ?? FHH_EXPERIENCE_ID;
+  const fallbackF6 = cfg.fixedPrepaidCents ?? FHH_PREPAID_CENTS;
+
+  const offerings = await fetchOfferingsFast(page, searchUrlFor(req, req.dates[0]));
+  if (!offerings || offerings.__challenge || offerings.__noState) {
+    return { experienceId: fallbackExp, prepaidCents: fallbackF6, drifted: false, source: 'fallback' };
+  }
+  const o = offerings as TockOfferings;
+  const bookable = (Array.isArray(o.experience) ? o.experience : [])
+    .filter(e => e?.state === 'AVAILABLE' && Array.isArray(e?.partySize) && e.partySize!.includes(req.partySize));
+  if (!bookable.length) {
+    // Empty/SOLD current week (the common FHH pre-drop state) → trust the fallback constants.
+    return { experienceId: fallbackExp, prepaidCents: fallbackF6, openTime: Array.isArray(o.openTime) ? o.openTime : undefined, drifted: false, source: 'fallback' };
+  }
+  const liveExp = Number(bookable[0].id);
+  const liveF6 = experiencePriceCents(bookable[0]) ?? fallbackF6;
+  const experienceId = Number.isFinite(liveExp) ? liveExp : fallbackExp;
+  const prepaidCents = liveF6;
+  // Drift = the live current-week experience/price differs from the known-good constants. The
+  // menu is assumed continuous into next week, so a mismatch here is the pre-drop alarm (§3.3.1).
+  const drifted = experienceId !== fallbackExp || prepaidCents !== fallbackF6;
+  return { experienceId, prepaidCents, openTime: Array.isArray(o.openTime) ? o.openTime : undefined, drifted, source: 'live' };
+}
+
+/** Split the best-first candidate list into `n` DISJOINT partitions (§5.2 "partition, don't pile"):
+ *  round-robin so each page owns a distinct subset (no cell fired by two pages) and the highest-
+ *  priority cells are spread across pages rather than all landing on page 0. Empty partitions are
+ *  dropped so a large pool with few cells doesn't arm idle loops. PURE (unit-testable). */
+export function partitionCandidates(candidates: LockCandidate[], n: number): LockCandidate[][] {
+  const parts: LockCandidate[][] = Array.from({ length: Math.max(1, n) }, () => []);
+  candidates.forEach((c, i) => parts[i % parts.length].push(c));
+  return parts.filter(p => p.length > 0);
+}
+
+/** PURE. Resolve the wanted (dates × times) the volley builds bodies for, from cfg + req: prefer
+ *  the operator's explicit wantedDates/wantedTimes24, else fall back to req.dates / [req.time],
+ *  and clamp the times to the accept window (§4.1 "in-window times, best-time-first"). Kept pure
+ *  so the cell selection is unit-testable independent of the browser plumbing. */
+export function resolveWantedCells(req: BookingRequest, cfg: SniperConfig): { wantedDates: string[]; wantedTimes24: string[] } {
+  const wantedDates = (cfg.wantedDates?.length ? cfg.wantedDates : req.dates).slice();
+  const rawTimes = cfg.wantedTimes24?.length ? cfg.wantedTimes24 : [req.time];
+  const lo = cfg.timeWindowStart24 ? timeToMin(cfg.timeWindowStart24) : -Infinity;
+  const hi = cfg.timeWindowEnd24 ? timeToMin(cfg.timeWindowEnd24) : Infinity;
+  const wantedTimes24 = rawTimes.filter(t => { const m = timeToMin(t); return m >= lo && m <= hi; });
+  // If the window excluded every requested time (misconfig), fall back to the raw times rather
+  // than arming an empty volley — the checkout-side cap still guards the actual spend.
+  return { wantedDates, wantedTimes24: wantedTimes24.length ? wantedTimes24 : rawTimes };
+}
+
+/** Options threaded from runSniper into the volley sub-engine — the shared clock base, the
+ *  normalized cap, and a hook to hand a winning browser to a frozen session (so runSniper's
+ *  finally block spares it from close). */
+interface VolleyModeOpts {
+  base: number;                 // epoch ms of runAt (or now) — the coarse drop anchor
+  runAt?: string;               // the scheduled drop instant (ISO), if any → t0Epoch/clock lead
+  startTime: number;            // runSniper's start, for durationMs
+  maxPriceCents?: number;       // normalized fail-closed cap
+  setFrozen: (b: Browser) => void; // register the handed-off browser so finally doesn't close it
+}
+
+/**
+ * T0 Volley Fire sub-engine (§1,§3,§4, Task 7). Called by runSniper when cfg.volleyFire is set,
+ * with an already-warmed pool. Sequence:
+ *   1. calibrateClock on the freshest page (hard-gate confidence; fall back gracefully to the
+ *      react-to-populate edge alone if the clock is untrustworthy).
+ *   2. preDropRecon (T−3s): read live experienceId/prepaidCents; alert on drift vs FHH constants.
+ *   3. Freeze the x-tock-* headers (readTockHeadersFromPage; HARD-GATE non-null — never fire
+ *      authless locks that all 401 and burn the window silently).
+ *   4. buildCandidateBodies for the wanted cells → partition disjointly across warm pages (§5.2).
+ *   5. Arm fireVolley on every page (awaiting a shared Ignition) + watchPopulateEdge.
+ *   6. Ignite off min(computed fireAt from the clock, observed populate edge) under SingleWinnerLock.
+ *   7. First HELD wins → ATTRIBUTION GUARD (echoed date/experience must match intent) → reuse the
+ *      existing grabViaApi checkout tail / handlePurchaseFlow(maxPriceCents) → freeze fallback
+ *      (with the cap) + notifyHeld.
+ * Preserves SniperResult shape; surfaces volley diagnostics in the error/result.
+ */
+
+/** The coarse drop-anchor epoch (ms) for the volley's fallback/watch schedule. Uses t0Epoch — the
+ *  same DST-correct America/Los_Angeles parse the clock's computedFireAt uses — so `base` and the
+ *  clock schedule share ONE timebase (§I2). `new Date(runAt)` was wrong for a BARE wall-time runAt:
+ *  it reads it in the server's zone (UTC on Railway), landing the fallback hours off. Falls back to
+ *  Date.now() when there's no runAt or it's unparseable (validateSniperConfig gates real configs). */
+function dropAnchorEpoch(runAt?: string): number {
+  if (!runAt) return Date.now();
+  try { return t0Epoch(runAt); } catch { return Date.now(); }
+}
+
+async function runVolleyMode(
+  req: BookingRequest,
+  cfg: SniperConfig,
+  live: Warm[],
+  opts: VolleyModeOpts,
+): Promise<SniperResult> {
+  const { base, runAt, startTime, maxPriceCents, setFrozen } = opts;
+  const durationMs = () => Date.now() - startTime;
+  const noPolls = { total: 0, matched: 0 };
+  const reFireMs = cfg.reFireMs ?? 60;
+  const deadlineMs = cfg.volleyDeadlineMs ?? 30_000;
+  const fireLeadMs = cfg.fireLeadMs ?? 0;
+
+  console.log(`\n🔫 VOLLEY MODE: pages=${live.length}, reFire=${reFireMs}ms, deadline=${deadlineMs}ms, lead=${fireLeadMs}ms`);
+
+  // --- 1. Clock calibration (Layer A, coarse window). Hard-gate confidence per §2.1: if the clock
+  // is untrustworthy we do NOT predict T0 from it — we lean entirely on the react-to-populate edge
+  // (which is authoritative anyway). A bad clock degrades gracefully, it doesn't abort the drop. ---
+  let computedFireAt: number | undefined;
+  let clockDiag = 'clock: skipped (no runAt)';
+  if (runAt) {
+    try {
+      const cal = await calibrateClock(live[0].page);
+      const edgeEpoch = t0Epoch(runAt);         // DST-correct drop instant (America/Los_Angeles)
+      const CONFIDENCE_GATE_MS = 500;           // §2.1: refuse to predict on worse than ±500ms
+      if (cal.confidenceMs <= CONFIDENCE_GATE_MS) {
+        // Correct the local wall clock by the measured offset, then fire lead ms early so the
+        // packet ARRIVES at the origin at the open instant (computeFireAt clamps lead to RTT).
+        computedFireAt = computeFireAt(edgeEpoch - cal.offsetMs, cal.minRttMs, fireLeadMs);
+        clockDiag = `clock: offset=${cal.offsetMs}ms conf=±${cal.confidenceMs}ms rtt=${cal.minRttMs}ms fireAt=+${computedFireAt - Date.now()}ms`;
+      } else {
+        clockDiag = `clock: LOW-CONFIDENCE ±${cal.confidenceMs}ms > ${CONFIDENCE_GATE_MS}ms — react-to-populate only`;
+        console.warn(`   ⚠️ ${clockDiag}`);
+      }
+    } catch (err) {
+      clockDiag = `clock: calibrate failed (${errMsg(err)}) — react-to-populate only`;
+      console.warn(`   ⚠️ ${clockDiag}`);
+    }
+  }
+  console.log(`   ${clockDiag}`);
+
+  // --- 2. Pre-drop reconcile (T−3s): live experienceId/prepaidCents, drift alarm vs constants. ---
+  const recon = await preDropRecon(live[0].page, req, cfg);
+  if (recon.drifted) {
+    console.warn(`   🚨 PRICE/EXPERIENCE DRIFT: live current-week exp=${recon.experienceId} f6=${recon.prepaidCents} differs from constants (${cfg.fixedExperienceId ?? 559289}/${cfg.fixedPrepaidCents ?? 25800}) — firing reconciled values`);
+  }
+  console.log(`   recon: exp=${recon.experienceId} f6=${recon.prepaidCents} (${recon.source})`);
+
+  // --- 3. Freeze headers (HARD-GATE non-null, §3.2). Prefer the header set already captured/
+  // reconstructed during warm-up; re-read once as a freshness check. If NO page yields headers,
+  // abort loudly — every authless lock would 401 and silently burn the window. ---
+  let headers: Record<string, string> | undefined;
+  let headerPage: Warm | undefined;
+  for (const w of live) {
+    const h = w.tockHeaders ?? (await readTockHeadersFromPage(w.page).catch(() => null)) ?? undefined;
+    if (h) { headers = h; headerPage = w; if (!w.tockHeaders) { w.tockHeaders = h; w.headerSource = 'page-grab'; } break; }
+  }
+  if (!headers) {
+    return { success: false, error: `Volley aborted: x-tock-* headers unreconstructable on every warm page — refusing to fire authless locks (${clockDiag})`, durationMs: durationMs(), polls: noPolls };
+  }
+  console.log(`   headers frozen (src=${headerPage?.headerSource ?? 'unknown'})`);
+
+  // --- 4. Build the candidate bodies for the wanted cells, then partition disjointly across pages. ---
+  const { wantedDates, wantedTimes24 } = resolveWantedCells(req, cfg);
+  const candidates = buildCandidateBodies(req, {
+    experienceId: recon.experienceId,
+    prepaidCents: recon.prepaidCents,
+    wantedDates,
+    wantedTimes24,
+    // FHH is direct-book ([] seatingArea) so no f13; a multi-seating rehearsal venue passes one.
+    seatingAreaId: cfg.fixedSeatingAreaId,
+    f6Candidates: cfg.f6Candidates,
+  });
+  if (!candidates.length) {
+    return { success: false, error: `Volley aborted: no candidate cells (dates=[${wantedDates.join(',')}] times=[${wantedTimes24.join(',')}])`, durationMs: durationMs(), polls: noPolls };
+  }
+  const partitions = partitionCandidates(candidates, live.length);
+  console.log(`   ${candidates.length} candidate cells over ${partitions.length} pages (best-first, disjoint)`);
+
+  // --- 5. Arm fireVolley on every partitioned page (awaiting a shared Ignition) + watchPopulateEdge. ---
+  const ignition = new Ignition();
+  const stopAll = new Ignition();     // cross-page halt: fired the instant ANY page holds (§I3)
+  const claim = new SingleWinnerLock();
+  const armed = live.slice(0, partitions.length);
+  const volleys = armed.map((w, i) => fireVolley(w.page, partitions[i], headers!, ignition, stopAll, { reFireMs, deadlineMs, maxInFlight: 5 }));
+  // The instant any page resolves HELD, halt the others so they abandon their partitions rather than
+  // firing to the deadline (no stranded holds on the shared account, no post-win anti-WAF traffic).
+  volleys.forEach(p => p.then(v => { if (v?.held) stopAll.fire(); }).catch(() => { /* a rejected volley can't be the winner */ }));
+
+  // --- 6. Ignite off min(computed fireAt, populate edge). Firing a hair early is free (early PUTs
+  // conflict/not-yet-open and simply retry); firing late loses (§2.1). We start the populate watch
+  // now and, in parallel, schedule the clock-computed fire; whichever fires first wins the race. ---
+  const watchDeadlineMs = computedFireAt != null ? Math.max(0, computedFireAt - Date.now()) + deadlineMs + 3000 : deadlineMs + 3000;
+  const populateWatch = watchPopulateEdge(live[0].page, req, watchDeadlineMs).then((edge) => {
+    if (edge.populated && !ignition.armed) { console.log('   🟢 populate edge observed — igniting'); ignition.fire(); }
+    return edge;
+  });
+  if (computedFireAt != null) {
+    const wait = computedFireAt - Date.now();
+    if (wait > 0) await sleep(wait);
+    if (!ignition.armed) { console.log(`   ⏱️ computed fireAt reached — igniting`); ignition.fire(); }
+  }
+  // If no clock fire scheduled, the populate watch is the sole trigger; also arm a hard fallback so
+  // a venue that populates without our detector seeing it (or a missed edge) still fires by base+lead.
+  if (!ignition.armed) {
+    const fallbackWait = Math.max(0, (base) - Date.now());
+    if (fallbackWait > 0) await Promise.race([populateWatch, sleep(fallbackWait)]);
+    if (!ignition.armed) { console.log('   ⏱️ fallback ignition (base time reached)'); ignition.fire(); }
+  }
+
+  // --- 7. Settle every page volley and pick the winner. A winning page resolves HELD promptly (its
+  // in-page loop exits on winbox); that same resolution fires stopAll (armed above), so the losing
+  // pages halt and settle quickly rather than running to the deadline. ---
+  const results = await Promise.allSettled(volleys);
+  const won = results
+    .map((r, i) => ({ r, w: armed[i] }))
+    .find(({ r }) => r.status === 'fulfilled' && (r.value as VolleyResult).held);
+  const diagTrail = results.map((r, i) => `p${i}:${r.status === 'fulfilled' ? (r.value as VolleyResult).diag : 'rej'}`).join(' | ');
+
+  if (!won || won.r.status !== 'fulfilled') {
+    console.log(`\n❌ Volley: no HELD across ${armed.length} pages`);
+    return { success: false, error: `Volley fired but no HELD — ${clockDiag} · recon exp=${recon.experienceId} f6=${recon.prepaidCents}${recon.drifted ? ' (DRIFTED)' : ''} · ${diagTrail}`, durationMs: durationMs(), polls: noPolls };
+  }
+  const winResult = won.r.value as VolleyResult;
+  const winner = won.w;
+  const bookedDate = winResult.date!;
+  const bookedTime24 = winResult.time24!;
+  const bookedTime = to12Hour(bookedTime24);
+  console.log(`\n🔒 VOLLEY HELD: ${bookedDate} ${bookedTime} (exp ${winResult.experienceId}, f6 ${winResult.f6}, ${winResult.bodyLen}B) — ${winResult.diag}`);
+
+  // Claim gate: exactly one winner drives checkout even if two pages held (defense in depth — the
+  // per-cell partition already prevents two pages firing the same cell, §4.1).
+  if (!claim.tryAcquire()) {
+    return { success: false, error: `Volley HELD but claim already taken (concurrent winner) — ${diagTrail}`, durationMs: durationMs(), polls: noPolls };
+  }
+
+  // --- ATTRIBUTION (§4.2): the echo is DIAGNOSTIC ONLY — it must NEVER abort a held slot, because a
+  // held slot un-driven is a silent loss of a slot we actually hold (§C1). The lock RESPONSE echoes
+  // the offering's base time (not our slot) and uses a different field layout than the request, so an
+  // echo disagreement is usually a parse artifact. Every candidate we fired is a WANTED cell, and the
+  // grabViaApi checkout tail re-asserts the DATE on the live confirm page (freezing for manual review
+  // if it's wrong) before any spend. So here we only LOG a disagreement to surface the wire layout. ---
+  const intendedDt = `${bookedDate}T${bookedTime24}`;
+  const echoDt = winResult.echoedCell?.dateTime;
+  const echoId = winResult.echoedCell?.experienceId;
+  if (winResult.echoedCell?.mismatch) {
+    console.warn(`   ⚠️ echo disagreed with intent (echoed ${echoDt ?? '?'}/${echoId ?? '?'} vs intended ${intendedDt}/${winResult.experienceId}) — proceeding; checkout date guard + cap are the backstop`);
+  }
+
+  // A speculative f6-fan win carries a guessed price → surface it so the frozen-session banner
+  // flags "GUESSED PRICE" (§4.4). The primary price is the reconciled/known one.
+  const guessedPriceCents = winResult.f6 !== recon.prepaidCents ? winResult.f6 : undefined;
+
+  // --- Fire the HELD notification immediately (§4.5 Tier 3): a human may need to finish the modal
+  // checkout inside the ~10-min hold, so alert BEFORE the (possibly-failing) auto-checkout attempt. ---
+  await notifyHeld(req.restaurant, bookedDate, bookedTime).catch(() => { /* notify never blocks the claim */ });
+
+  const dryRun = cfg.dryRun ?? false;
+  const screenshots: string[] = [];
+
+  // --- Reuse grabViaApi's checkout-navigation tail with skipLock: the slot is already HELD in this
+  // page's server-side cart, so we navigate straight to confirm-purchase (NO re-lock — a second PUT
+  // could self-conflict against our own hold) and let its wrong-slot date guard re-assert the date.
+  // On a modal venue this may return heldNoCheckout → freeze-for-manual. ---
+  const grab = await grabViaApi(
+    winner.page, req.restaurant, bookedDate, bookedTime24, req.partySize,
+    winResult.experienceId!, cfg.fixedSeatingAreaId, headers, winResult.f6 ?? 0,
+    { skipLock: true }, // the volley already holds this cell in winner.page's cart — don't re-lock (§C1)
+  ).catch((err): GrabResult => ({ ok: false, reason: `checkout tail threw: ${errMsg(err)}` }));
+
+  // Held-but-no-checkout (modal redirect / persistent challenge / wrong-date guard): freeze the
+  // winning live browser so a human completes it under the cap within the hold window.
+  if (!grab.ok || (grab.ok && grab.heldNoCheckout)) {
+    const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
+    const reason = grab.ok
+      ? `Volley HELD ${bookedDate} ${bookedTime} but checkout not auto-reached — open the frozen session and complete manually (verify the date + price)`
+      : `Volley HELD ${bookedDate} ${bookedTime} but checkout tail failed (${(grab as { reason?: string }).reason}) — frozen for manual completion`;
+    if (dryRun) {
+      return { success: false, bookedDate, bookedTime, dryRun: true, error: `Dry run: ${reason}`, screenshots, durationMs: durationMs(), polls: noPolls };
+    }
+    setFrozen(winner.browser);
+    const pausedSessionId = freezeSession({ handle: { browser: winner.browser, page: winner.page }, restaurant: req.restaurant, bookedDate, bookedTime, error: reason, maxPriceCents, guessedPriceCents });
+    console.log(`\n⚠️ ${reason} — session frozen (${pausedSessionId})`);
+    return { success: false, bookedDate, bookedTime, error: reason, screenshots, pausedSessionId, durationMs: durationMs(), polls: noPolls };
+  }
+
+  // Reached a matching checkout → drive the purchase flow with the fail-closed cap.
+  let purchased = false;
+  let purchaseErr = '';
+  try {
+    purchased = await handlePurchaseFlow(winner.page, dryRun, screenshots, maxPriceCents);
+  } catch (err) {
+    purchaseErr = errMsg(err);
+    console.error(`   ❌ purchase flow threw: ${purchaseErr}`);
+  }
+  if (purchased) {
+    console.log(dryRun
+      ? `\n🧪 Volley DRY RUN reached checkout (no purchase): ${bookedDate} ${bookedTime}`
+      : `\n🎉 Volley purchased: ${bookedDate} ${bookedTime}`);
+    return { success: true, bookedDate, bookedTime, dryRun, screenshots, durationMs: durationMs(), polls: noPolls };
+  }
+
+  // Purchase didn't complete (cap-abort, dry run, or checkout failure) → freeze for recovery.
+  const shot = await safeShot(winner.page); if (shot) screenshots.push(shot);
+  if (dryRun) {
+    return { success: false, bookedDate, bookedTime, dryRun: true, error: `Dry run: volley HELD but checkout did not complete${purchaseErr ? ' — ' + purchaseErr : ''}`, screenshots, durationMs: durationMs(), polls: noPolls };
+  }
+  setFrozen(winner.browser);
+  const pausedSessionId = freezeSession({ handle: { browser: winner.browser, page: winner.page }, restaurant: req.restaurant, bookedDate, bookedTime, error: 'volley HELD but purchase failed', maxPriceCents, guessedPriceCents });
+  console.log(`\n⚠️ Volley HELD but purchase failed — session frozen (${pausedSessionId})`);
+  return { success: false, bookedDate, bookedTime, error: `Volley HELD but purchase failed — session frozen for recovery${purchaseErr ? ' — ' + purchaseErr : ''}`, screenshots, pausedSessionId, durationMs: durationMs(), polls: noPolls };
+}
+
 /**
  * Sniper engine: warm a small browser pool on the search page, densely poll the
  * search page's embedded availability ($REDUX_STATE) across the drop window, and let the
  * first loop to find a matching slot (EXACT date, closest in-window time, price-capped)
  * win an atomic lock, grab it (reload-on-hit DOM-click), and auto-purchase. Records what
  * it saw for diagnosis. On purchase failure the winning browser is frozen for recovery.
+ *
+ * When `cfg.volleyFire` is set, the T0 Volley engine (runVolleyMode) replaces the poll→lock
+ * critical path with a pre-fired, pre-authenticated in-page lock burst (§1); the legacy poll
+ * path below is preserved verbatim for `volleyFire` false.
  */
 export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: string): Promise<SniperResult> {
   const startTime = Date.now();
@@ -929,6 +1686,22 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     if (live.length === 0) {
       const why = warmFailures[0]?.reason;
       return { success: false, error: `No browsers warmed: ${why instanceof Error ? why.message : why ?? 'unknown'}`, durationMs: Date.now() - startTime, polls: { total: 0, matched: 0 } };
+    }
+
+    // --- T0 VOLLEY FIRE (§1, Task 7): pre-fired lock volley path. Behind cfg.volleyFire so the
+    // legacy poll path below is untouched when false. The volley owns the drop from here: it
+    // calibrates the clock, reconciles experience/price, freezes headers, arms fireVolley on all
+    // pages (disjoint partitions) + watchPopulateEdge, ignites off min(computed fireAt, populate
+    // edge) under the SingleWinnerLock, and hands the first HELD to the existing checkout tail /
+    // freeze fallback. It sets frozenBrowser (so the finally block spares a handed-off session). ---
+    if (cfg.volleyFire) {
+      return await runVolleyMode(req, cfg, live, {
+        base: dropAnchorEpoch(runAt),
+        runAt,
+        startTime,
+        maxPriceCents,
+        setFrozen: (b) => { frozenBrowser = b; },
+      });
     }
 
     // --- Phase 2: wait for the window, then poll ---
@@ -1127,7 +1900,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
         return { success: false, bookedDate, bookedTime, dryRun: true, error: `Dry run: ${reason}`, screenshots, durationMs: durationMs(), polls: pollStats(), seen };
       }
       frozenBrowser = winner.browser;
-      const pausedSessionId = freezeSession({ handle: { browser: winner.browser, page: winner.page }, restaurant: req.restaurant, bookedDate, bookedTime, error: reason });
+      const pausedSessionId = freezeSession({ handle: { browser: winner.browser, page: winner.page }, restaurant: req.restaurant, bookedDate, bookedTime, error: reason, maxPriceCents });
       console.log(`\n⚠️ ${reason} — session frozen (${pausedSessionId})`);
       return { success: false, bookedDate, bookedTime, error: reason, screenshots, pausedSessionId, durationMs: durationMs(), polls: pollStats(), seen };
     }
@@ -1165,7 +1938,7 @@ export async function runSniper(req: BookingRequest, cfg: SniperConfig, runAt?: 
     const pausedSessionId = freezeSession({
       handle: { browser: winner.browser, page: winner.page },
       restaurant: req.restaurant, bookedDate, bookedTime,
-      error: 'purchase failed after grab',
+      error: 'purchase failed after grab', maxPriceCents,
     });
     console.log(`\n⚠️ Sniper grabbed but purchase failed — session frozen (${pausedSessionId})`);
     return { success: false, bookedDate, bookedTime, error: `Grabbed the slot but purchase failed — session frozen for recovery${purchaseErr ? ' — ' + purchaseErr : ''}`, screenshots, pausedSessionId, durationMs: durationMs(), polls: pollStats(), seen };

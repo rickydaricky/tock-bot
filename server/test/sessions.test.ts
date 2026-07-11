@@ -80,6 +80,38 @@ test('applyAction: missing session and unknown action return clear errors', asyn
   assert.deepEqual(await applyAction(id, 'bogus' as any), { ok: false, error: 'unknown action: bogus' });
 });
 
+test('freezeSession stores maxPriceCents so retry-purchase can fail-close on the cap', () => {
+  const { handle } = fakeHandle();
+  // The manual retry path reads e.maxPriceCents and threads it into
+  // handlePurchaseFlow(page, false, [], cap); storing it here is the whole
+  // fix — without it, a human-triggered retry spends uncapped.
+  const id = freezeSession({ handle: handle as any, restaurant: 'fhh', maxPriceCents: 51600 });
+  assert.equal(getSession(id)?.maxPriceCents, 51600);
+});
+
+test('freezeSession without a cap stores undefined (dry-run origin, no-cap semantics preserved)', () => {
+  const { handle } = fakeHandle();
+  const id = freezeSession({ handle: handle as any, restaurant: 'fhh' });
+  assert.equal(getSession(id)?.maxPriceCents, undefined);
+});
+
+test('guessedPriceCents is stored and surfaced on the public session for the dashboard banner', () => {
+  const { handle } = fakeHandle();
+  const id = freezeSession({ handle: handle as any, restaurant: 'fhh', maxPriceCents: 59000, guessedPriceCents: 29500 });
+  // Not leaked to the public view? It must be, so the RED banner can render.
+  const pub = listSessions().find(e => e.id === id)!;
+  assert.equal(pub.guessedPriceCents, 29500);
+  // And the internal record keeps it too.
+  assert.equal(getSession(id)?.guessedPriceCents, 29500);
+});
+
+test('public session omits guessedPriceCents when the price was not guessed', () => {
+  const { handle } = fakeHandle();
+  const id = freezeSession({ handle: handle as any, restaurant: 'fhh', maxPriceCents: 51600 });
+  const pub = listSessions().find(e => e.id === id)!;
+  assert.equal(pub.guessedPriceCents, undefined); // no banner for the known-price path
+});
+
 test('applyAction: refresh-screenshot is a no-op ok; abort closes + drops', async () => {
   const { handle, state } = fakeHandle();
   const id = freezeSession({ handle: handle as any, restaurant: 'x' });

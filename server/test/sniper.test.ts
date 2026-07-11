@@ -18,7 +18,14 @@ import {
   encodeTockLock,
   checkoutDateString,
   lockResponseVerdict,
+  buildCandidateBodies,
+  classifyLock,
+  parseLockEcho,
+  resolveWantedCells,
+  partitionCandidates,
+  LockCandidate,
 } from '../src/sniper';
+import { BookingRequest } from '../src/booker';
 
 // Compare only the date/time12/offerId of slots (ignore time24/priceCents) where those are the focus.
 const core = (arr: NormalizedSlot[]) => arr.map(s => ({ date: s.date, time12: s.time12, offerId: s.offerId }));
@@ -486,4 +493,265 @@ test('encodeTockLock sets f6 to the prepaid price (strict restaurants require it
   assert.equal(prepaid.length, noPrepay.length + 2);
   // Byte-identical to the real Lazy Bear lock captured 2026-07-05 (size 2, 17:00, exp 612271, $420).
   assert.equal(prepaid.toString('base64'), encodeTockLock(2, '2026-07-29T17:00', 612271, undefined, 42000).toString('base64'));
+});
+
+// ===========================================================================================
+// T0 VOLLEY FIRE — pure logic (buildCandidateBodies, classifyLock, parseLockEcho, wanted-cell
+// resolution, partitioning). The volley's hot path is an in-page evaluate, but every DECISION
+// (which cells, in what order, which verdicts prune/win) is pure and tested here.
+// ===========================================================================================
+
+const REQ: BookingRequest = { restaurant: 'fui-hui-hua-san-francisco', dates: ['2026-07-17'], partySize: 2, time: '20:00' };
+
+// --- buildCandidateBodies: cross-product, shape, priority ordering, byte-sanity ---
+
+test('buildCandidateBodies builds one primary cell per wanted date × time (shape + count)', () => {
+  const cands = buildCandidateBodies(REQ, {
+    experienceId: 559289, prepaidCents: 25800,
+    wantedDates: ['2026-07-17'], wantedTimes24: ['20:00', '20:30'],
+  });
+  assert.equal(cands.length, 2); // 1 date × 2 times × 1 price
+  for (const c of cands) {
+    assert.equal(c.experienceId, 559289);
+    assert.equal(c.f6, 25800);
+    assert.equal(c.primary, true);
+    assert.ok(/^[A-Za-z0-9+/]+=*$/.test(c.b64), 'b64 is base64');
+    assert.equal(c.key, `2026-07-17|${c.time24}|559289|25800`);
+    // Byte-sanity: the b64 decodes to exactly the encodeTockLock body for this cell.
+    assert.equal(c.b64, encodeTockLock(2, `${c.date}T${c.time24}`, 559289, undefined, 25800).toString('base64'));
+  }
+});
+
+test('buildCandidateBodies threads seatingAreaId into the lock body (multi-seating rehearsal f13)', () => {
+  // Direct-book (FHH): no seatingAreaId → the body carries no f13.
+  const direct = buildCandidateBodies(REQ, {
+    experienceId: 559289, prepaidCents: 25800, wantedDates: ['2026-07-17'], wantedTimes24: ['20:00'],
+  });
+  assert.equal(direct[0].b64, encodeTockLock(2, '2026-07-17T20:00', 559289, undefined, 25800).toString('base64'));
+  // Multi-seating (e.g. JouJou): seatingAreaId present → the body must include that exact f13, so the
+  // rehearsal lock isn't a direct-book body the venue would reject.
+  const seated = buildCandidateBodies(REQ, {
+    experienceId: 559289, prepaidCents: 25800, wantedDates: ['2026-07-17'], wantedTimes24: ['20:00'],
+    seatingAreaId: 40034,
+  });
+  assert.equal(seated[0].b64, encodeTockLock(2, '2026-07-17T20:00', 559289, 40034, 25800).toString('base64'));
+  assert.notEqual(seated[0].b64, direct[0].b64); // f13 genuinely changes the encoded bytes
+});
+
+test('buildCandidateBodies orders times best-first by closeness to req.time', () => {
+  // target 20:00 → 20:00 (0), 19:45 (15), 20:30 (30), 21:00 (60)
+  const cands = buildCandidateBodies({ ...REQ, time: '20:00' }, {
+    experienceId: 1, prepaidCents: 100,
+    wantedDates: ['2026-07-17'], wantedTimes24: ['21:00', '19:45', '20:30', '20:00'],
+  });
+  assert.deepEqual(cands.map(c => c.time24), ['20:00', '19:45', '20:30', '21:00']);
+});
+
+test('buildCandidateBodies: a backup date cell never sorts ahead of any primary-date cell', () => {
+  const cands = buildCandidateBodies({ ...REQ, time: '20:00' }, {
+    experienceId: 1, prepaidCents: 100,
+    wantedDates: ['2026-07-17', '2026-07-24'], // primary, backup
+    wantedTimes24: ['20:00', '21:00'],
+  });
+  const firstBackupIdx = cands.findIndex(c => c.date === '2026-07-24');
+  const lastPrimaryIdx = cands.map(c => c.date).lastIndexOf('2026-07-17');
+  // EVERY primary-date cell precedes the FIRST backup-date cell.
+  assert.ok(lastPrimaryIdx < firstBackupIdx, 'all primary-date cells sort before any backup-date cell');
+  // And within the primary date, the exact time leads.
+  assert.equal(cands[0].date, '2026-07-17');
+  assert.equal(cands[0].time24, '20:00');
+});
+
+test('buildCandidateBodies appends the f6-fan as LOW-priority trailing bodies (never over primary)', () => {
+  const cands = buildCandidateBodies({ ...REQ, time: '20:00' }, {
+    experienceId: 559289, prepaidCents: 25800,
+    wantedDates: ['2026-07-17'], wantedTimes24: ['20:00'],
+    f6Candidates: [25800, 29500], // 25800 == primary → deduped; 29500 is the fan
+  });
+  assert.equal(cands.length, 2); // primary + one distinct fan price
+  assert.equal(cands[0].f6, 25800);
+  assert.equal(cands[0].primary, true);
+  assert.equal(cands[1].f6, 29500);
+  assert.equal(cands[1].primary, false); // a guessed price can never win over the intended one
+});
+
+test('buildCandidateBodies de-dupes repeated cells (repeated time / fan == primary)', () => {
+  const cands = buildCandidateBodies({ ...REQ, time: '20:00' }, {
+    experienceId: 1, prepaidCents: 100,
+    wantedDates: ['2026-07-17'], wantedTimes24: ['20:00', '20:00'], // repeated
+    f6Candidates: [100], // == primary → no extra
+  });
+  assert.equal(cands.length, 1);
+});
+
+test('buildCandidateBodies zero-pads single-digit hours in the lock datetime', () => {
+  const cands = buildCandidateBodies({ ...REQ, time: '9:00' }, {
+    experienceId: 1, prepaidCents: 0, wantedDates: ['2026-07-17'], wantedTimes24: ['9:00'],
+  });
+  assert.equal(cands[0].time24, '09:00');
+  assert.ok(Buffer.from(cands[0].b64, 'base64').toString('latin1').includes('2026-07-17T09:00'));
+});
+
+test('buildCandidateBodies falls back to req.dates / [req.time] when wanted lists are empty', () => {
+  const cands = buildCandidateBodies({ ...REQ, dates: ['2026-08-01'], time: '18:30' }, {
+    experienceId: 7, prepaidCents: 0, wantedDates: [], wantedTimes24: [],
+  });
+  assert.equal(cands.length, 1);
+  assert.equal(cands[0].date, '2026-08-01');
+  assert.equal(cands[0].time24, '18:30');
+});
+
+test('buildCandidateBodies bakes the seatingAreaId (f13) into multi-seating bodies', () => {
+  const withSeat = buildCandidateBodies(REQ, { experienceId: 583810, prepaidCents: 0, wantedDates: ['2026-07-17'], wantedTimes24: ['20:00'], seatingAreaId: 40034 });
+  const noSeat = buildCandidateBodies(REQ, { experienceId: 583810, prepaidCents: 0, wantedDates: ['2026-07-17'], wantedTimes24: ['20:00'] });
+  assert.equal(withSeat[0].b64, encodeTockLock(2, '2026-07-17T20:00', 583810, 40034, 0).toString('base64'));
+  assert.notEqual(withSeat[0].b64, noSeat[0].b64); // f13 present only with seating
+});
+
+// --- classifyLock: the four-way verdict (held / conflict / rejected / blocked), FAIL-OPEN on wins ---
+
+test('classifyLock: large body, no conflict text = held', () => {
+  const text = 'FHH Reservation 2026-07-17T20:00 ' + 'x'.repeat(1200);
+  assert.equal(classifyLock(200, 'application/octet-stream', 1233, text), 'held');
+});
+
+test('classifyLock: FAIL-OPEN — a large body is HELD even if it echoes a different slot (§C1)', () => {
+  // The lock RESPONSE echoes the offering base time, not our slot, so an echo "mismatch" must
+  // NEVER downgrade a win — a held slot we fail to recognize is a silent loss. Any large non-conflict
+  // 200 is held; attribution is enforced later at the checkout-page date guard.
+  const neighborTime = 'FHH Reservation 2026-07-17T19:30 ' + 'x'.repeat(1200); // echoes a neighbor time
+  assert.equal(classifyLock(200, 'application/octet-stream', 1233, neighborTime), 'held');
+  // ...and a body carrying an unrelated experience id is still held.
+  assert.equal(classifyLock(200, 'application/octet-stream', 1233, 'x'.repeat(1200)), 'held');
+});
+
+test('classifyLock: confirmed "no longer available" = conflict (the ONLY pruning verdict)', () => {
+  assert.equal(classifyLock(200, 'application/octet-stream', 89, 'someone else just selected this and it is no longer available'), 'conflict');
+  assert.equal(classifyLock(200, 'application/octet-stream', 60, 'this slot is already taken'), 'conflict');
+  assert.equal(classifyLock(200, 'application/octet-stream', 40, 'sold out'), 'conflict');
+});
+
+test('classifyLock: small non-conflict 200 = rejected (ambiguous → keep retrying, do NOT prune)', () => {
+  // Rate-limit / lock-state / wrong-f6 shapes that are NOT the confirmed conflict phrasing.
+  assert.equal(classifyLock(200, 'application/octet-stream', 30, ''), 'rejected');
+  assert.equal(classifyLock(200, 'application/octet-stream', 45, 'rate limit exceeded'), 'rejected');
+  assert.equal(classifyLock(200, 'application/octet-stream', 50, 'lock unavailable, try again'), 'rejected');
+  // "invalid"/"error" phrasings are NOT the confirmed conflict shape → keep retrying, not pruned.
+  assert.equal(classifyLock(200, 'application/octet-stream', 40, 'invalid request'), 'rejected');
+});
+
+test('classifyLock: non-200 or HTML interstitial = blocked', () => {
+  assert.equal(classifyLock(403, 'text/html', 5000, 'verify you are human'), 'blocked');
+  assert.equal(classifyLock(200, 'text/html', 5000, 'just a moment'), 'blocked');
+  assert.equal(classifyLock(0, '', 0, ''), 'blocked');
+});
+
+// --- parseLockEcho: reads the echoed datetime (text) + experience id (field-3 varint) ---
+
+test('parseLockEcho reads the datetime from the printable body text', () => {
+  assert.deepEqual(parseLockEcho('FHH 2026-07-17T20:00 held'), { dateTime: '2026-07-17T20:00' });
+  assert.deepEqual(parseLockEcho('no datetime here'), {});
+});
+
+test('parseLockEcho reads the experience id from the field-3 varint (tag 0x18)', () => {
+  // A real lock body carries f3 (experienceId). Round-trip through encodeTockLock's own bytes.
+  const buf = encodeTockLock(2, '2026-07-17T20:00', 559289, undefined, 25800);
+  const echo = parseLockEcho(buf.toString('latin1'), buf);
+  assert.equal(echo.dateTime, '2026-07-17T20:00');
+  assert.equal(echo.experienceId, 559289);
+});
+
+test('parseLockEcho tolerates a missing byte buffer (text-only echo)', () => {
+  assert.deepEqual(parseLockEcho('2026-07-17T20:00'), { dateTime: '2026-07-17T20:00' });
+});
+
+// --- resolveWantedCells: cfg → wanted grid, window-clamped ---
+
+test('resolveWantedCells prefers explicit cfg wanted lists', () => {
+  const r = resolveWantedCells(REQ, { pool: 6, pollIntervalMs: 60, windowStartMs: -1000, windowEndMs: 30000, dryRun: true, wantedDates: ['2026-07-17', '2026-07-24'], wantedTimes24: ['20:00', '20:30'] });
+  assert.deepEqual(r.wantedDates, ['2026-07-17', '2026-07-24']);
+  assert.deepEqual(r.wantedTimes24, ['20:00', '20:30']);
+});
+
+test('resolveWantedCells falls back to req.dates / [req.time] when cfg omits them', () => {
+  const r = resolveWantedCells(REQ, { pool: 6, pollIntervalMs: 60, windowStartMs: -1000, windowEndMs: 30000, dryRun: true });
+  assert.deepEqual(r.wantedDates, ['2026-07-17']);
+  assert.deepEqual(r.wantedTimes24, ['20:00']);
+});
+
+test('resolveWantedCells clamps wanted times to the accept window', () => {
+  const r = resolveWantedCells(REQ, { pool: 6, pollIntervalMs: 60, windowStartMs: -1000, windowEndMs: 30000, dryRun: true, wantedTimes24: ['18:00', '20:00', '22:00'], timeWindowStart24: '19:00', timeWindowEnd24: '21:00' });
+  assert.deepEqual(r.wantedTimes24, ['20:00']); // 18:00 and 22:00 excluded
+});
+
+test('resolveWantedCells: if the window excludes every time, keep the raw times (arm anyway)', () => {
+  const r = resolveWantedCells(REQ, { pool: 6, pollIntervalMs: 60, windowStartMs: -1000, windowEndMs: 30000, dryRun: true, wantedTimes24: ['20:00'], timeWindowStart24: '21:00', timeWindowEnd24: '22:00' });
+  assert.deepEqual(r.wantedTimes24, ['20:00']); // fall back rather than arm an empty volley
+});
+
+// --- partitionCandidates: disjoint, round-robin, no idle partitions ---
+
+const mkCand = (i: number): LockCandidate => ({ key: `k${i}`, date: '2026-07-17', time24: '20:00', experienceId: 1, f6: 0, b64: '', primary: true });
+
+test('partitionCandidates spreads cells round-robin across pages (disjoint, priority-spread)', () => {
+  const cands = [mkCand(0), mkCand(1), mkCand(2), mkCand(3), mkCand(4)];
+  const parts = partitionCandidates(cands, 3);
+  assert.equal(parts.length, 3);
+  // Round-robin: page0=[0,3], page1=[1,4], page2=[2]
+  assert.deepEqual(parts[0].map(c => c.key), ['k0', 'k3']);
+  assert.deepEqual(parts[1].map(c => c.key), ['k1', 'k4']);
+  assert.deepEqual(parts[2].map(c => c.key), ['k2']);
+  // Disjoint: every cell appears exactly once across partitions.
+  const flat = parts.flat().map(c => c.key).sort();
+  assert.deepEqual(flat, ['k0', 'k1', 'k2', 'k3', 'k4']);
+});
+
+test('partitionCandidates drops idle partitions when pages exceed cells', () => {
+  const parts = partitionCandidates([mkCand(0), mkCand(1)], 6);
+  assert.equal(parts.length, 2); // only 2 non-empty partitions, not 6 idle loops
+  assert.deepEqual(parts.map(p => p.length), [1, 1]);
+});
+
+test('partitionCandidates handles a single page (all cells on one partition)', () => {
+  const parts = partitionCandidates([mkCand(0), mkCand(1), mkCand(2)], 1);
+  assert.equal(parts.length, 1);
+  assert.deepEqual(parts[0].map(c => c.key), ['k0', 'k1', 'k2']);
+});
+
+// --- validateSniperConfig: volley-field bounds (still requires the cap unless dryRun) ---
+
+test('validateSniperConfig accepts a well-formed volley config', () => {
+  assert.equal(validateSniperConfig({
+    ...baseCfg, volleyFire: true, maxPriceCents: 60000,
+    wantedDates: ['2026-07-17'], wantedTimes24: ['20:00', '20:30'],
+    fireLeadMs: 0, reFireMs: 60, volleyDeadlineMs: 30000,
+    fixedExperienceId: 559289, fixedPrepaidCents: 25800, f6Candidates: [29500],
+  }), null);
+});
+
+test('validateSniperConfig still requires the cap for a real volley run', () => {
+  assert.match(validateSniperConfig({ ...baseCfg, dryRun: false, volleyFire: true }) ?? '', /maxPriceCents is required/);
+});
+
+test('validateSniperConfig rejects malformed volley time/date lists', () => {
+  assert.ok(validateSniperConfig({ ...baseCfg, wantedTimes24: ['8pm'] }));
+  assert.ok(validateSniperConfig({ ...baseCfg, wantedDates: ['07/17/2026'] }));
+  assert.ok(validateSniperConfig({ ...baseCfg, wantedTimes24: 'nope' as any }));
+});
+
+test('validateSniperConfig rejects non-positive / non-finite volley cadence + deadline', () => {
+  assert.ok(validateSniperConfig({ ...baseCfg, reFireMs: 0 }));       // would busy-spin
+  assert.ok(validateSniperConfig({ ...baseCfg, volleyDeadlineMs: -1 })); // fires zero times
+  assert.ok(validateSniperConfig({ ...baseCfg, reFireMs: NaN }));
+  // fireLeadMs is allowed to be 0 (fire exactly at the edge), but not negative/NaN.
+  assert.equal(validateSniperConfig({ ...baseCfg, fireLeadMs: 0 }), null);
+  assert.ok(validateSniperConfig({ ...baseCfg, fireLeadMs: -50 }));
+});
+
+test('validateSniperConfig rejects a non-positive experience id and malformed f6 fan', () => {
+  assert.ok(validateSniperConfig({ ...baseCfg, fixedExperienceId: 0 }));
+  assert.ok(validateSniperConfig({ ...baseCfg, f6Candidates: [25800, -1] }));
+  assert.ok(validateSniperConfig({ ...baseCfg, f6Candidates: 'x' as any }));
+  // A non-negative prepaid (0 is valid = free/JouJou-shape) passes.
+  assert.equal(validateSniperConfig({ ...baseCfg, fixedPrepaidCents: 0 }), null);
 });
