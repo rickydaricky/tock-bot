@@ -39,6 +39,25 @@ try {
 /** Full path to the single JSON blob that backs the entire store. */
 const STORE_FILE = path.join(STORE_DIR, 'state.json');
 
+// Quarantine a CORRUPT state.json at boot (§audit I3). Without this, an unparseable file reads as
+// `{}` → the scheduler treats it as a fresh volume, re-seeds from env, and the next write REWRITES
+// state.json from that empty base — permanently destroying any recoverable cookies/payment/creds +
+// armed jobs. Renaming it aside instead preserves the bytes for manual recovery and makes the
+// corruption LOUD rather than a silent cold-start. The atomic writer below makes self-corruption
+// unlikely; this guards against external truncation.
+try {
+  if (fs.existsSync(STORE_FILE)) {
+    try { JSON.parse(fs.readFileSync(STORE_FILE, 'utf-8')); }
+    catch {
+      const quarantine = `${STORE_FILE}.corrupt.${Date.now()}`;
+      fs.renameSync(STORE_FILE, quarantine);
+      console.error(`❌ state.json is CORRUPT — quarantined to ${quarantine}. Starting cold; restore secrets (cookies/payment) from that file manually if needed.`);
+    }
+  }
+} catch (err) {
+  console.error('store corruption check failed:', err);
+}
+
 /**
  * Shape of the persisted blob. Every field is optional because the file starts empty
  * (cold start) and is populated incrementally as secrets are captured.
@@ -52,6 +71,11 @@ interface StoreData {
   opentableCookies?: any[];
   payment?: any;
   tockCredentials?: { email: string; password: string };
+  // Durable scheduler state — added so armed jobs + run history survive redeploys (which wipe
+  // all in-memory scheduler state). `scheduledBookings` carries an optional `firedAt` marker per
+  // one-shot for exactly-once reload; `bookingHistory` is capped + screenshots-stripped on write.
+  scheduledBookings?: any[];
+  bookingHistory?: any[];
 }
 
 /**
@@ -73,11 +97,22 @@ function readStore(): StoreData {
 /**
  * Overwrite the entire state blob on disk. Best-effort: a write failure (e.g. volume
  * unmounted or read-only) is logged, not thrown, so a persistence outage never takes
- * down an in-flight booking. Not atomic — the whole file is rewritten each call.
+ * down an in-flight booking.
+ *
+ * ATOMIC replace: write to a sibling temp file, then `renameSync` over the real file.
+ * A POSIX rename on the same filesystem is atomic, so a crash/OOM-kill mid-write can never
+ * leave a truncated `state.json` — which would otherwise zero cookies + credentials +
+ * schedules together (readStore swallows a parse error to `{}`). Mandatory now that the
+ * scheduler also writes here at fire time (§design flaw #3).
  */
 function writeStore(data: StoreData): void {
   try {
-    fs.writeFileSync(STORE_FILE, JSON.stringify(data));
+    const tmp = `${STORE_FILE}.tmp`;
+    // fsync the temp file's bytes to disk BEFORE the rename (§audit I4) — rename-without-fsync can,
+    // on a host/power crash, leave the rename pointing at a tmp whose contents never reached disk.
+    const fd = fs.openSync(tmp, 'w');
+    try { fs.writeSync(fd, JSON.stringify(data)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, STORE_FILE);
   } catch (err) {
     console.error('Failed to write store:', err);
   }

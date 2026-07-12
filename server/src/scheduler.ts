@@ -34,6 +34,7 @@ import { BlitzConfig, AttemptOutcome } from './blitz';
 import { runSniper, SniperConfig, SniperResult, SniperSeen } from './sniper';
 import { notifyResult } from './notify';
 import { getBookingEngine } from './engines';
+import { saveToDisk, loadFromDisk } from './store';
 
 /**
  * Process-wide bus for run outcomes. `executeBooking` emits 'booking-result' with the
@@ -56,6 +57,10 @@ export interface ScheduledBooking extends BookingRequest {
   runAt?: string;        // ISO datetime — one-shot; when set, takes precedence over `cron`
   blitz?: BlitzConfig;   // optional blitz mode config (only engaged when attempts > 1)
   sniper?: SniperConfig; // optional sniper mode config (takes precedence over blitz)
+  firedAt?: string;      // set the instant a one-shot fires, persisted BEFORE the run so a reload
+                         // can tell "never fired" from "interrupted mid-run" (exactly-once, §design Q2)
+  resumeCount?: number;  // times a firedAt job has been re-fired on reload — capped at 1 so a
+                         // crash-loop can't re-charge repeatedly inside the grace window (§audit C2)
   label?: string;        // human-friendly label
   createdAt: string;     // ISO timestamp
 }
@@ -76,6 +81,8 @@ export interface BookingHistoryEntry {
   screenshots?: string[];
   ranAt: string;         // ISO timestamp
   source: 'manual' | 'scheduled';
+  scheduleId?: string;   // the ScheduledBooking.id this run came from — lets a reload tell that a
+                         // firedAt job already COMPLETED (don't re-fire → no double-charge, §audit C1)
   blitzMeta?: BlitzMeta;
   sniperMeta?: SniperMeta;
 }
@@ -108,24 +115,128 @@ interface Stoppable { stop(): void; }
 // Live schedules keyed by booking id. Storing the `task` alongside the booking lets us stop
 // the underlying cron/timeout when the schedule is replaced or removed. In-memory only.
 const scheduledBookings: Map<string, { booking: ScheduledBooking; task: Stoppable }> = new Map();
-// Run history, newest-first (entries are unshift'd). Bounded to 50 via addToHistory(); note
-// executeBooking() unshifts directly and does NOT trim, so scheduled runs can exceed 50.
+// Run history, newest-first (entries are unshift'd). Bounded to 50 everywhere now (executeBooking,
+// addToHistory, and the reload path all trim), so scheduled runs no longer grow it unbounded.
 const bookingHistory: BookingHistoryEntry[] = [];
 
+// ================================================================================================
+// Durable persistence: armed jobs + run history are mirrored to the /data volume via store.ts so a
+// redeploy (which wipes all in-memory scheduler state) can't lose an armed FHH job. Disk is the
+// source of truth for the next boot; the SCHEDULED_BOOKINGS env is bootstrap-only.
+// ================================================================================================
+
+/** setTimeout fires IMMEDIATELY for a delay > 2^31−1 ms (~24.86 days). A job armed weeks out
+ *  (now normal once schedules persist across deploys) would otherwise fire ~24 days early and poll
+ *  Tock for weeks. Chain timeouts in ≤MAX_TIMEOUT_MS hops so any delay is honoured. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+function scheduleAt(delayMs: number, fn: () => void): Stoppable {
+  let timer: ReturnType<typeof setTimeout>;
+  const arm = (remaining: number): void => {
+    timer = remaining > MAX_TIMEOUT_MS
+      ? setTimeout(() => arm(remaining - MAX_TIMEOUT_MS), MAX_TIMEOUT_MS)
+      : setTimeout(fn, Math.max(0, remaining));
+  };
+  arm(delayMs);
+  return { stop: () => clearTimeout(timer) };
+}
+
+/** Mirror the live schedule registry (incl. each one-shot's firedAt marker) to disk. Called after
+ *  every mutation so the disk copy is always the source of truth for the next boot. Best-effort. */
+function persistSchedules(): void {
+  try {
+    saveToDisk('scheduledBookings', Array.from(scheduledBookings.values()).map(e => e.booking));
+  } catch (err) {
+    console.error('Failed to persist schedules:', err);
+  }
+}
+
+/** Mirror run history to disk — screenshots STRIPPED (base64 PNGs would bloat state.json by MB and
+ *  slow every unrelated saveToDisk, incl. cookie writes) and capped to the newest 50. */
+function persistHistory(): void {
+  try {
+    saveToDisk('bookingHistory', bookingHistory.slice(0, 50).map(e => ({ ...e, screenshots: undefined })));
+  } catch (err) {
+    console.error('Failed to persist history:', err);
+  }
+}
+
+/** Emit a booking-result without letting a throwing/slow SSE listener break the caller (§audit I1):
+ *  a listener that throws must not abort executeBooking's success path (which would append a
+ *  contradictory failure entry) or skip a fireNow cleanup. */
+function safeEmit(entry: BookingHistoryEntry): void {
+  try { schedulerEvents.emit('booking-result', entry); }
+  catch (err) { console.error('booking-result emit failed:', err); }
+}
+
+/** Record a run that could NOT be re-armed on reload (downtime straddled its runAt, or it was
+ *  interrupted mid-run) as a persisted history entry + notification, so a miss is never silent. */
+async function recordSkipped(booking: ScheduledBooking, reason: string): Promise<void> {
+  const entry: BookingHistoryEntry = {
+    id: crypto.randomUUID(),
+    restaurant: booking.restaurant,
+    success: false,
+    error: `MISSED (${booking.label || booking.restaurant}): ${reason}`,
+    ranAt: new Date().toISOString(),
+    source: 'scheduled',
+    scheduleId: booking.id,
+  };
+  bookingHistory.unshift(entry);
+  if (bookingHistory.length > 50) bookingHistory.length = 50;
+  persistHistory();
+  safeEmit(entry);
+  await notifyResult(booking.restaurant, { success: false, error: entry.error } as import('./booker').BookingResult).catch(() => {});
+}
+
+/** Fire a one-shot NOW (grace-fire a just-missed job on reload, or resume an interrupted run).
+ *  Two-phase exactly-once: stamp+persist firedAt BEFORE running (so an interrupted retry is
+ *  distinguishable), keep it in the Map (dashboard shows it running), then remove+persist on
+ *  completion via `finally` (so an unexpected reject still cleans up + doesn't leave firedAt stuck
+ *  → a spurious resume next boot, §audit I1). Non-blocking so a minutes-long run doesn't hold boot. */
+function fireNow(booking: ScheduledBooking): void {
+  booking.firedAt = booking.firedAt || new Date().toISOString();
+  scheduledBookings.set(booking.id, { booking, task: { stop: () => {} } });
+  persistSchedules();
+  void (async () => {
+    try { await executeBooking(booking); }
+    finally { scheduledBookings.delete(booking.id); persistSchedules(); }
+  })();
+}
+
 /**
- * Seed schedules at boot from the SCHEDULED_BOOKINGS env var.
+ * Bootstrap the scheduler at boot. DISK-FIRST so armed jobs survive redeploys:
+ *  - Restore run history from disk (screenshots were stripped on write).
+ *  - If the schedules key exists on disk (even `[]`) it is AUTHORITATIVE — reload it via the
+ *    decision table in reloadPersistedSchedules. SCHEDULED_BOOKINGS env is bootstrap-only: seeded
+ *    only when the disk key is absent (`null`), then immediately persisted — otherwise an env job
+ *    would resurrect a dashboard-deleted schedule or double-fire alongside its persisted copy.
  *
- * The var holds a base64-encoded JSON array of ScheduledBooking — base64 so a multi-line
- * JSON blob survives being stored as a single Railway env value. A parse failure is logged
- * and swallowed (server still starts with zero schedules) rather than crashing boot.
+ * MUST run after loadCookiesFromEnv() (index.ts boot order) because a job inside its warm window
+ * fires within milliseconds of boot and needs cookies loaded or the warm dies "signed out".
  */
 export function startScheduler(): void {
-  const raw = process.env.SCHEDULED_BOOKINGS;
-  if (!raw) {
-    console.log('📅 No scheduled bookings configured');
-    return;
+  const persistedHistory = loadFromDisk('bookingHistory');
+  if (Array.isArray(persistedHistory)) {
+    bookingHistory.push(...persistedHistory);
+    console.log(`📖 Restored ${persistedHistory.length} history entr(ies) from disk`);
   }
 
+  const persisted = loadFromDisk('scheduledBookings');
+  if (persisted == null) {
+    seedSchedulesFromEnv();  // fresh volume, never persisted → one-time env bootstrap
+    persistSchedules();
+    return;
+  }
+  reloadPersistedSchedules(Array.isArray(persisted) ? persisted : []);
+}
+
+/** One-time bootstrap: seed schedules from the base64 SCHEDULED_BOOKINGS env var. Only runs on the
+ *  very first boot (disk has no schedules key). A parse failure is logged + swallowed, never fatal. */
+function seedSchedulesFromEnv(): void {
+  const raw = process.env.SCHEDULED_BOOKINGS;
+  if (!raw) {
+    console.log('📅 No scheduled bookings configured (no disk state, no env)');
+    return;
+  }
   let bookings: ScheduledBooking[];
   try {
     bookings = JSON.parse(Buffer.from(raw, 'base64').toString('utf-8'));
@@ -133,11 +244,69 @@ export function startScheduler(): void {
     console.error('Failed to parse SCHEDULED_BOOKINGS:', err);
     return;
   }
+  console.log(`📅 Seeding ${bookings.length} scheduled booking(s) from env (first boot)`);
+  for (const booking of bookings) addScheduledBooking(booking);
+}
 
-  console.log(`📅 Starting ${bookings.length} scheduled booking(s)`);
-  for (const booking of bookings) {
-    addScheduledBooking(booking);
+/** What to do with a persisted one-shot on reload (§design decision table). PURE + exported so the
+ *  FHH-critical timing logic is unit-testable without the scheduler's browser/timer machinery:
+ *   - future runAt                        → 'rearm'
+ *   - just-missed (≤ grace)               → 'fire-now'          (deploy/crash straddled the drop)
+ *   - long-missed (> grace)               → 'skip-missed'       (stale; record + notify, don't fire)
+ *   - firedAt set, ≤ grace past runAt     → 'resume-interrupted'(re-fire an interrupted run)
+ *   - firedAt set, > grace past runAt     → 'skip-unknown'      (possible partial charge; notify) */
+export type ReloadAction = 'rearm' | 'fire-now' | 'resume-interrupted' | 'skip-missed' | 'skip-unknown';
+export function reloadAction(runAtMs: number, firedAt: string | undefined, nowMs: number, graceMs = 10 * 60_000): ReloadAction {
+  const pastMs = nowMs - runAtMs;
+  if (firedAt) return pastMs <= graceMs ? 'resume-interrupted' : 'skip-unknown';
+  if (pastMs < 0) return 'rearm';
+  return pastMs <= graceMs ? 'fire-now' : 'skip-missed';
+}
+
+/** Reload persisted schedules on boot via the exactly-once + grace-fire decision table. Per-item
+ *  fault isolation: one corrupt record is skipped+logged, never aborting the loop (a bad neighbour
+ *  can't stop FHH re-arming). Reconciles disk to the live Map at the end. */
+function reloadPersistedSchedules(jobs: ScheduledBooking[]): void {
+  console.log(`📅 Reloading ${jobs.length} persisted schedule(s) from disk`);
+  for (const job of jobs) {
+    try {
+      if (!job.runAt) { addScheduledBooking(job); continue; } // cron → re-register (missed ticks dropped, as before)
+      const pastMs = Date.now() - new Date(job.runAt).getTime();
+      switch (reloadAction(new Date(job.runAt).getTime(), job.firedAt, Date.now())) {
+        case 'rearm':
+          addScheduledBooking(job); break;
+        case 'fire-now':
+          console.log(`   ⏱️ grace-firing (runAt ${Math.round(pastMs / 1000)}s ago): ${job.label || job.restaurant}`);
+          fireNow(job); break;
+        case 'resume-interrupted': {
+          // Only re-fire if the run did NOT already complete — otherwise resuming re-runs a booking
+          // that may have already charged the card (§audit C1). The restored history (loaded above,
+          // before this) is the cross-restart idempotency record: a completed run left an entry
+          // tagged with this schedule's id at/after firedAt.
+          const completed = job.firedAt != null &&
+            bookingHistory.some(h => h.scheduleId === job.id && h.ranAt >= job.firedAt!);
+          if (completed) {
+            console.log(`   ✓ interrupted run already completed (history present) — not re-firing: ${job.label || job.restaurant}`);
+            break; // drop (reconcile persist removes it from disk)
+          }
+          if ((job.resumeCount ?? 0) >= 1) { // cap re-fires so a crash-loop can't re-charge repeatedly (§audit C2)
+            void recordSkipped(job, 'interrupted run already resumed once, outcome unknown — check the Tock account'); break;
+          }
+          console.log(`   ↻ resuming interrupted run: ${job.label || job.restaurant}`);
+          job.resumeCount = (job.resumeCount ?? 0) + 1;
+          fireNow(job);
+          break;
+        }
+        case 'skip-missed':
+          void recordSkipped(job, `runAt was ${Math.round(pastMs / 60000)}min ago (downtime straddled the drop)`); break;
+        case 'skip-unknown':
+          void recordSkipped(job, 'interrupted run, unknown outcome — check the Tock account'); break;
+      }
+    } catch (err) {
+      console.error(`   ⚠️ skipping corrupt persisted schedule (${job?.id || '?'}):`, err);
+    }
   }
+  persistSchedules(); // reconcile: fired/dropped jobs are gone from the Map → removed from disk
 }
 
 /**
@@ -195,11 +364,14 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       screenshots: result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'scheduled',
+      scheduleId: booking.id,   // link the run to its schedule so a reload can detect completion (§audit C1)
       blitzMeta,
       sniperMeta,
     };
     bookingHistory.unshift(entry);
-    schedulerEvents.emit('booking-result', entry);
+    if (bookingHistory.length > 50) bookingHistory.length = 50;
+    persistHistory();
+    safeEmit(entry);
     await notifyResult(booking.restaurant, result, blitzMeta);
   } catch (err) {
     console.error(`❌ Scheduled booking crashed: ${booking.label || booking.restaurant}`, err);
@@ -210,9 +382,12 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       error: err instanceof Error ? err.message : String(err),
       ranAt: new Date().toISOString(),
       source: 'scheduled',
+      scheduleId: booking.id,
     };
     bookingHistory.unshift(entry);
-    schedulerEvents.emit('booking-result', entry);
+    if (bookingHistory.length > 50) bookingHistory.length = 50;
+    persistHistory();
+    safeEmit(entry);
   }
 }
 
@@ -225,7 +400,7 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
  *  - `runAt` present → one-shot setTimeout that self-removes from the registry after firing.
  *  - otherwise       → recurring node-cron task.
  */
-export function addScheduledBooking(booking: ScheduledBooking): { success: boolean; error?: string } {
+export function addScheduledBooking(booking: ScheduledBooking): { success: boolean; error?: string; persisted?: boolean } {
   if (!booking.id) booking.id = crypto.randomUUID();
   if (!booking.createdAt) booking.createdAt = new Date().toISOString();
 
@@ -269,14 +444,20 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
     }
     const delayMs = Math.max(0, targetTime - earlyMs - Date.now());
 
-    const timer = setTimeout(() => {
-      executeBooking(booking);
-      // One-shot: remove from the registry after firing so it can't be re-triggered and
-      // doesn't linger in getScheduledBookings(). (No trim of bookingHistory happens here.)
-      scheduledBookings.delete(booking.id);
-    }, delayMs);
-
-    task = { stop: () => clearTimeout(timer) };
+    // scheduleAt (not raw setTimeout) so a >24.86-day delay doesn't overflow and fire immediately.
+    // Two-phase exactly-once: stamp+persist firedAt BEFORE the run so a reload can tell a never-fired
+    // job from one interrupted mid-run; await the run; then remove from the registry + persist so a
+    // completed one-shot can't reload and re-fire on the next boot (§design Q2).
+    task = scheduleAt(delayMs, () => {
+      booking.firedAt = new Date().toISOString();
+      persistSchedules();
+      void (async () => {
+        // finally (not a bare sequence) so an unexpected reject still removes the job + persists —
+        // otherwise firedAt stays on disk and next boot spuriously resumes/flags it (§audit I1).
+        try { await executeBooking(booking); }
+        finally { scheduledBookings.delete(booking.id); persistSchedules(); }
+      })();
+    });
 
     const blitzLabel = booking.blitz && booking.blitz.attempts > 1
       ? ` [blitz: ${booking.blitz.attempts}x @ ${booking.blitz.staggerMs}ms]`
@@ -297,7 +478,13 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
   }
 
   scheduledBookings.set(booking.id, { booking, task });
-  return { success: true };
+  persistSchedules();
+  // Read back so the HTTP layer can surface silent persistence degradation (e.g. /data volume not
+  // mounted → saveToDisk logs + continues): an armed-but-not-durable job would otherwise vanish on
+  // the next redeploy with no warning. `persisted:false` lets the dashboard show "ARMED (NOT DURABLE)".
+  const persistedJobs = loadFromDisk('scheduledBookings');
+  const persisted = Array.isArray(persistedJobs) && persistedJobs.some((j: { id?: string }) => j.id === booking.id);
+  return { success: true, persisted };
 }
 
 /** Cancel and unregister a schedule by id. Stops its underlying cron/timeout so it can't fire
@@ -307,6 +494,7 @@ export function removeScheduledBooking(id: string): boolean {
   if (!entry) return false;
   entry.task.stop();
   scheduledBookings.delete(id);
+  persistSchedules(); // durable delete: a cancelled job must not resurrect from disk on the next boot
   return true;
 }
 
@@ -325,6 +513,7 @@ export function addToHistory(entry: BookingHistoryEntry): void {
   bookingHistory.unshift(entry);
   // Keep last 50 entries (drop the oldest by truncating the tail)
   if (bookingHistory.length > 50) bookingHistory.length = 50;
+  persistHistory();
 }
 
 /** Get the full run history, newest-first. Returns the live array (not a copy) — callers
@@ -338,10 +527,12 @@ export function deleteHistoryEntry(id: string): boolean {
   const idx = bookingHistory.findIndex(e => e.id === id);
   if (idx < 0) return false;
   bookingHistory.splice(idx, 1);
+  persistHistory();
   return true;
 }
 
 /** Wipe all run history in place (keeps the same array reference held by getHistory callers). */
 export function clearHistory(): void {
   bookingHistory.length = 0;
+  persistHistory();
 }
