@@ -238,7 +238,10 @@ app.post('/api/scheduled', requireAuth, (req, res) => {
   };
   const result = addScheduledBooking(booking);
   if (result.success) {
-    res.json({ success: true, booking });
+    // `persisted` surfaces whether the job was durably written to the /data volume. false means the
+    // job is armed in memory but would NOT survive a redeploy (volume unmounted) — the dashboard
+    // should warn rather than imply durability.
+    res.json({ success: true, booking, persisted: result.persisted ?? false });
   } else {
     res.status(400).json(result);
   }

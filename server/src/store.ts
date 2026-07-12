@@ -52,6 +52,11 @@ interface StoreData {
   opentableCookies?: any[];
   payment?: any;
   tockCredentials?: { email: string; password: string };
+  // Durable scheduler state — added so armed jobs + run history survive redeploys (which wipe
+  // all in-memory scheduler state). `scheduledBookings` carries an optional `firedAt` marker per
+  // one-shot for exactly-once reload; `bookingHistory` is capped + screenshots-stripped on write.
+  scheduledBookings?: any[];
+  bookingHistory?: any[];
 }
 
 /**
@@ -73,11 +78,19 @@ function readStore(): StoreData {
 /**
  * Overwrite the entire state blob on disk. Best-effort: a write failure (e.g. volume
  * unmounted or read-only) is logged, not thrown, so a persistence outage never takes
- * down an in-flight booking. Not atomic — the whole file is rewritten each call.
+ * down an in-flight booking.
+ *
+ * ATOMIC replace: write to a sibling temp file, then `renameSync` over the real file.
+ * A POSIX rename on the same filesystem is atomic, so a crash/OOM-kill mid-write can never
+ * leave a truncated `state.json` — which would otherwise zero cookies + credentials +
+ * schedules together (readStore swallows a parse error to `{}`). Mandatory now that the
+ * scheduler also writes here at fire time (§design flaw #3).
  */
 function writeStore(data: StoreData): void {
   try {
-    fs.writeFileSync(STORE_FILE, JSON.stringify(data));
+    const tmp = `${STORE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, STORE_FILE);
   } catch (err) {
     console.error('Failed to write store:', err);
   }
