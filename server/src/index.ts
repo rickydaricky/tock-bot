@@ -614,6 +614,12 @@ app.get('/', (_req, res) => {
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
+// Last-resort logging so a stray async rejection/exception is recorded, not silently fatal. A hard
+// crash → Railway restart → the scheduler's reload path re-evaluates armed jobs, so we want the
+// cause in the logs (and we prefer staying up over crashing mid-run). (§audit I1)
+process.on('unhandledRejection', (reason) => console.error('⚠️ unhandledRejection:', reason));
+process.on('uncaughtException', (err) => console.error('⚠️ uncaughtException:', err));
+
 // Boot order matters: hydrate the cookie jar from env, then start the scheduler (which may
 // fire runAt/cron jobs) and the background session-refresh loop, all BEFORE we accept
 // traffic — so an early request never races an unwarmed session or an unstarted scheduler.

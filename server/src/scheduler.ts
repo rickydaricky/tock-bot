@@ -59,6 +59,8 @@ export interface ScheduledBooking extends BookingRequest {
   sniper?: SniperConfig; // optional sniper mode config (takes precedence over blitz)
   firedAt?: string;      // set the instant a one-shot fires, persisted BEFORE the run so a reload
                          // can tell "never fired" from "interrupted mid-run" (exactly-once, §design Q2)
+  resumeCount?: number;  // times a firedAt job has been re-fired on reload — capped at 1 so a
+                         // crash-loop can't re-charge repeatedly inside the grace window (§audit C2)
   label?: string;        // human-friendly label
   createdAt: string;     // ISO timestamp
 }
@@ -79,6 +81,8 @@ export interface BookingHistoryEntry {
   screenshots?: string[];
   ranAt: string;         // ISO timestamp
   source: 'manual' | 'scheduled';
+  scheduleId?: string;   // the ScheduledBooking.id this run came from — lets a reload tell that a
+                         // firedAt job already COMPLETED (don't re-fire → no double-charge, §audit C1)
   blitzMeta?: BlitzMeta;
   sniperMeta?: SniperMeta;
 }
@@ -156,6 +160,14 @@ function persistHistory(): void {
   }
 }
 
+/** Emit a booking-result without letting a throwing/slow SSE listener break the caller (§audit I1):
+ *  a listener that throws must not abort executeBooking's success path (which would append a
+ *  contradictory failure entry) or skip a fireNow cleanup. */
+function safeEmit(entry: BookingHistoryEntry): void {
+  try { schedulerEvents.emit('booking-result', entry); }
+  catch (err) { console.error('booking-result emit failed:', err); }
+}
+
 /** Record a run that could NOT be re-armed on reload (downtime straddled its runAt, or it was
  *  interrupted mid-run) as a persisted history entry + notification, so a miss is never silent. */
 async function recordSkipped(booking: ScheduledBooking, reason: string): Promise<void> {
@@ -166,26 +178,27 @@ async function recordSkipped(booking: ScheduledBooking, reason: string): Promise
     error: `MISSED (${booking.label || booking.restaurant}): ${reason}`,
     ranAt: new Date().toISOString(),
     source: 'scheduled',
+    scheduleId: booking.id,
   };
   bookingHistory.unshift(entry);
   if (bookingHistory.length > 50) bookingHistory.length = 50;
   persistHistory();
-  schedulerEvents.emit('booking-result', entry);
+  safeEmit(entry);
   await notifyResult(booking.restaurant, { success: false, error: entry.error } as import('./booker').BookingResult).catch(() => {});
 }
 
 /** Fire a one-shot NOW (grace-fire a just-missed job on reload, or resume an interrupted run).
  *  Two-phase exactly-once: stamp+persist firedAt BEFORE running (so an interrupted retry is
  *  distinguishable), keep it in the Map (dashboard shows it running), then remove+persist on
- *  completion. Non-blocking so a minutes-long run doesn't hold up boot. */
+ *  completion via `finally` (so an unexpected reject still cleans up + doesn't leave firedAt stuck
+ *  → a spurious resume next boot, §audit I1). Non-blocking so a minutes-long run doesn't hold boot. */
 function fireNow(booking: ScheduledBooking): void {
   booking.firedAt = booking.firedAt || new Date().toISOString();
   scheduledBookings.set(booking.id, { booking, task: { stop: () => {} } });
   persistSchedules();
   void (async () => {
-    await executeBooking(booking);
-    scheduledBookings.delete(booking.id);
-    persistSchedules();
+    try { await executeBooking(booking); }
+    finally { scheduledBookings.delete(booking.id); persistSchedules(); }
   })();
 }
 
@@ -265,9 +278,25 @@ function reloadPersistedSchedules(jobs: ScheduledBooking[]): void {
         case 'fire-now':
           console.log(`   ⏱️ grace-firing (runAt ${Math.round(pastMs / 1000)}s ago): ${job.label || job.restaurant}`);
           fireNow(job); break;
-        case 'resume-interrupted':
+        case 'resume-interrupted': {
+          // Only re-fire if the run did NOT already complete — otherwise resuming re-runs a booking
+          // that may have already charged the card (§audit C1). The restored history (loaded above,
+          // before this) is the cross-restart idempotency record: a completed run left an entry
+          // tagged with this schedule's id at/after firedAt.
+          const completed = job.firedAt != null &&
+            bookingHistory.some(h => h.scheduleId === job.id && h.ranAt >= job.firedAt!);
+          if (completed) {
+            console.log(`   ✓ interrupted run already completed (history present) — not re-firing: ${job.label || job.restaurant}`);
+            break; // drop (reconcile persist removes it from disk)
+          }
+          if ((job.resumeCount ?? 0) >= 1) { // cap re-fires so a crash-loop can't re-charge repeatedly (§audit C2)
+            void recordSkipped(job, 'interrupted run already resumed once, outcome unknown — check the Tock account'); break;
+          }
           console.log(`   ↻ resuming interrupted run: ${job.label || job.restaurant}`);
-          fireNow(job); break;
+          job.resumeCount = (job.resumeCount ?? 0) + 1;
+          fireNow(job);
+          break;
+        }
         case 'skip-missed':
           void recordSkipped(job, `runAt was ${Math.round(pastMs / 60000)}min ago (downtime straddled the drop)`); break;
         case 'skip-unknown':
@@ -335,13 +364,14 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       screenshots: result.screenshots,
       ranAt: new Date().toISOString(),
       source: 'scheduled',
+      scheduleId: booking.id,   // link the run to its schedule so a reload can detect completion (§audit C1)
       blitzMeta,
       sniperMeta,
     };
     bookingHistory.unshift(entry);
     if (bookingHistory.length > 50) bookingHistory.length = 50;
     persistHistory();
-    schedulerEvents.emit('booking-result', entry);
+    safeEmit(entry);
     await notifyResult(booking.restaurant, result, blitzMeta);
   } catch (err) {
     console.error(`❌ Scheduled booking crashed: ${booking.label || booking.restaurant}`, err);
@@ -352,11 +382,12 @@ async function executeBooking(booking: ScheduledBooking): Promise<void> {
       error: err instanceof Error ? err.message : String(err),
       ranAt: new Date().toISOString(),
       source: 'scheduled',
+      scheduleId: booking.id,
     };
     bookingHistory.unshift(entry);
     if (bookingHistory.length > 50) bookingHistory.length = 50;
     persistHistory();
-    schedulerEvents.emit('booking-result', entry);
+    safeEmit(entry);
   }
 }
 
@@ -421,9 +452,10 @@ export function addScheduledBooking(booking: ScheduledBooking): { success: boole
       booking.firedAt = new Date().toISOString();
       persistSchedules();
       void (async () => {
-        await executeBooking(booking); // never throws (both paths caught internally)
-        scheduledBookings.delete(booking.id);
-        persistSchedules();
+        // finally (not a bare sequence) so an unexpected reject still removes the job + persists —
+        // otherwise firedAt stays on disk and next boot spuriously resumes/flags it (§audit I1).
+        try { await executeBooking(booking); }
+        finally { scheduledBookings.delete(booking.id); persistSchedules(); }
       })();
     });
 
